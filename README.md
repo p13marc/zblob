@@ -1,4 +1,4 @@
-# zenoh-blob
+# zblob
 
 Generic, resumable, chunked **blob and directory transfer over [Zenoh]** — with
 progress, SHA-256 integrity, range resume that survives reconnect *and* restart,
@@ -7,11 +7,15 @@ the Zenoh ecosystem is otherwise missing.
 
 [Zenoh]: https://zenoh.io
 
+> Formerly incubated in the [ZenSight](https://github.com/p13marc/zensight)
+> monorepo as `zenoh-blob`; renamed on graduation — this crate is a community
+> project, not an Eclipse Zenoh deliverable.
+
 ## Why
 
 Zenoh is excellent at pub/sub and query, but has no turnkey way to pull a large
 artifact (a debug bundle, a pcap, a dataset, a directory tree) from one peer to
-another with progress and resume. `zenoh-blob` builds that on the primitives
+another with progress and resume. `zblob` builds that on the primitives
 Zenoh already gives you — multi-reply queryables, a reliable transport, and
 `CongestionControl::Block` backpressure — so you don't fork a file-sync tool to
 get it.
@@ -28,12 +32,12 @@ final whole-blob SHA-256 is verified before the file is renamed into place.
 
 ```rust
 // Server
-let server = zenoh_blob::BlobServer::new(session.clone(), "demo/blobs", Format::Json);
-server.register(manifest, Arc::new(zenoh_blob::FileBlobSource::new(&path))).await;
+let server = zblob::BlobServer::new(session.clone(), "demo/blobs", Format::Json);
+server.register(manifest, Arc::new(zblob::FileBlobSource::new(&path))).await;
 tokio::spawn(server.run());
 
 // Client
-let client = zenoh_blob::BlobClient::new(session, "demo/blobs", Format::Json);
+let client = zblob::BlobClient::new(session, "demo/blobs", Format::Json);
 let path = client.download("blob-1", &dest_dir, &()).await?;
 ```
 
@@ -51,15 +55,15 @@ into a Zenoh storage so the producer can exit.
 [FastCDC]: https://www.usenix.org/conference/atc16/technical-sessions/presentation/xia
 
 ```rust
-let (index, chunks) = zenoh_blob::build_tree(dir, "snap-1", &chunker)?;
+let (index, chunks) = zblob::build_tree(dir, "snap-1", &chunker)?;
 // serve live...
-let server = zenoh_blob::TreeServer::new(session, "demo/store", "demo/tree", Format::Cbor, store);
+let server = zblob::TreeServer::new(session, "demo/store", "demo/tree", Format::Cbor, store);
 server.register(index).await;
 // ...or publish into a router storage and exit:
-zenoh_blob::publish_snapshot(&session, "demo/store", "demo/tree", &index, chunks, Format::Cbor).await?;
+zblob::publish_snapshot(&session, "demo/store", "demo/tree", &index, chunks, Format::Cbor).await?;
 
 // client
-let client = zenoh_blob::TreeClient::new(session, "demo/store", "demo/tree", Format::Cbor);
+let client = zblob::TreeClient::new(session, "demo/store", "demo/tree", Format::Cbor);
 client.download_tree("snap-1", &dest, &content_store).await?;
 ```
 
@@ -86,7 +90,7 @@ client.download_tree("snap-1", &dest, &content_store).await?;
 
 The design borrows ideas from prior art in the space: [casync] (content-addressed
 trees + chunk stores), [desync], [`zenoh-fs`] and [sendit] (file transfer over
-Zenoh), and the [FastCDC] paper (content-defined chunking). `zenoh-blob` is an
+Zenoh), and the [FastCDC] paper (content-defined chunking). `zblob` is an
 independent implementation, not a fork of any of them.
 
 [desync]: https://github.com/folbricht/desync

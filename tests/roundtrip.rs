@@ -9,7 +9,7 @@ use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use tokio::io::AsyncReadExt;
-use zenoh_blob::{
+use zblob::{
     BlobClient, BlobServer, FileBlobSource, FixedSizeChunker, Format, MIN_CHUNK_SIZE, Manifest,
     Sha256Digest,
 };
@@ -47,8 +47,8 @@ fn pseudo_random(len: usize, seed: u64) -> Vec<u8> {
     out
 }
 
-async fn sha256(bytes: &[u8]) -> zenoh_blob::Hash {
-    use zenoh_blob::Digest;
+async fn sha256(bytes: &[u8]) -> zblob::Hash {
+    use zblob::Digest;
     let mut d = Sha256Digest::default();
     d.update(bytes);
     d.finalize()

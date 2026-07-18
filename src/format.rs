@@ -1,6 +1,6 @@
 //! Wire serialization for blob control messages (the manifest).
 //!
-//! Self-contained on purpose: `zenoh-blob` carries no ZenSight dependency, so it
+//! Self-contained on purpose: `zblob` carries no ZenSight dependency, so it
 //! keeps its own copy of the JSON/CBOR `Format` helper rather than reusing
 //! `zensight-common::serialization`. Chunk payloads are raw bytes and never pass
 //! through here — only the manifest does.

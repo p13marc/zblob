@@ -7,7 +7,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use common::{BytesSource, open_session, pseudo_random, unique_prefix};
-use zenoh_blob::{
+use zblob::{
     BlobClient, BlobError, BlobServer, Chunker, FixedSizeChunker, Format, MIN_CHUNK_SIZE, Manifest,
     Sha256Digest, chunk_key, encode, manifest_key,
 };

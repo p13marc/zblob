@@ -10,7 +10,7 @@ use std::sync::Arc;
 use common::{isolated_config, unique_prefix};
 use std::sync::Mutex;
 
-use zenoh_blob::{
+use zblob::{
     BlobError, CancelToken, ContentStore, DirStore, Entry, FastCdcChunker, FixedSizeChunker,
     Format, MIN_CHUNK_SIZE, MemoryStore, Progress, ProgressSink, TreeClient, TreeServer,
     build_tree,
@@ -69,7 +69,7 @@ async fn serve(
     store_prefix: String,
     tree_prefix: String,
     store: Arc<dyn ContentStore>,
-    index: zenoh_blob::TreeIndex,
+    index: zblob::TreeIndex,
 ) -> tokio::task::JoinHandle<()> {
     let server = TreeServer::new(session, store_prefix, tree_prefix, Format::Json, store);
     server.register(index).await;

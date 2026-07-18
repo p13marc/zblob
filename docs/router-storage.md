@@ -1,6 +1,6 @@
 # Router-hosted Tier-2 chunk store
 
-How to run a Zenoh **router** as the fleet-wide content store for `zenoh-blob`
+How to run a Zenoh **router** as the fleet-wide content store for `zblob`
 Tier-2 directory sync. It complements the design rationale in
 [`../../docs/design/large-data-transfer.md`](../../docs/design/large-data-transfer.md)
 and the keyspace contract in [`../../docs/KEYSPACE.md`](../../docs/KEYSPACE.md).
@@ -58,7 +58,7 @@ flowchart LR
     FE -->|"GET"| ST
 ```
 
-`zenoh-blob` provides the producer side:
+`zblob` provides the producer side:
 
 - `publish_chunk` / `publish_chunks` — PUT content-addressed chunks.
 - `publish_index` — PUT an encoded `TreeIndex`.
@@ -88,14 +88,14 @@ for an annotated config. The essentials:
 A producer then publishes against the same prefixes:
 
 ```rust
-let (index, chunks) = zenoh_blob::build_tree(dir, "snap-2026-06-29", &chunker)?;
-zenoh_blob::publish_snapshot(
+let (index, chunks) = zblob::build_tree(dir, "snap-2026-06-29", &chunker)?;
+zblob::publish_snapshot(
     &session,
     "zensight/_blob/store",
     "zensight/_blob/tree",
     &index,
     chunks,
-    zenoh_blob::Format::Cbor,
+    zblob::Format::Cbor,
 ).await?;
 // producer may now exit; the router serves the snapshot
 ```
@@ -108,6 +108,6 @@ zenoh_blob::publish_snapshot(
 - **Authorization.** A storage answers any GET in its key range and accepts any
   PUT. Gate writes/reads with Zenoh access control if the keyspace is sensitive.
 - **Verification.** The serverless publish → (producer gone) → download path is
-  covered by `zenoh-blob/tests/storage.rs`, which stands a minimal in-process
+  covered by `zblob/tests/storage.rs`, which stands a minimal in-process
   storage in for `storage-manager` and reconstructs a tree from it with no
   `TreeServer` running.

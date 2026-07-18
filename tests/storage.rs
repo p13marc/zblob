@@ -16,7 +16,7 @@ use std::sync::Mutex;
 use std::time::Duration;
 
 use common::{isolated_config, unique_prefix};
-use zenoh_blob::{
+use zblob::{
     FixedSizeChunker, Format, MIN_CHUNK_SIZE, MemoryStore, TreeClient, build_tree, publish_snapshot,
 };
 

@@ -136,7 +136,7 @@ fn tracing_error(e: &BlobError) {
     // The crate has no logging dependency; surface serve errors on stderr in debug
     // builds without pulling `tracing` into a would-be-published library.
     #[cfg(debug_assertions)]
-    eprintln!("zenoh-blob: serve error: {e}");
+    eprintln!("zblob: serve error: {e}");
     let _ = e;
 }
 

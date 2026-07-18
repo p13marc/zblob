@@ -6,7 +6,7 @@
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use zenoh_blob::{AsyncReadSeek, BlobSource, Digest, Hash, OpenFuture, Sha256Digest};
+use zblob::{AsyncReadSeek, BlobSource, Digest, Hash, OpenFuture, Sha256Digest};
 
 pub fn isolated_config() -> zenoh::Config {
     let mut config = zenoh::Config::default();

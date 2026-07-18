@@ -1,4 +1,4 @@
-//! `zenoh-blob` — generic resumable chunked blob transfer over Zenoh.
+//! `zblob` — generic resumable chunked blob transfer over Zenoh.
 //!
 //! A small, self-contained library for downloading a large artifact (a file, a
 //! report bundle, a pcap) from one Zenoh peer to another with **progress**,

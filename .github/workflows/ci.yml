@@ -1,9 +1,4 @@
-# CI for the standalone zenoh-blob repository.
-#
-# This file is INERT while zenoh-blob lives inside the ZenSight monorepo —
-# GitHub Actions only reads workflows from the repository-root `.github/workflows`.
-# It becomes the crate's CI once extracted to its own repo (see
-# docs/ZENOH-BLOB-GRADUATION.md), where this directory is the repo root.
+# CI for zblob: build, test, lint, and a `cargo publish` dry-run.
 name: CI
 
 on:
