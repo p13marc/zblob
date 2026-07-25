@@ -36,7 +36,7 @@ impl fmt::Debug for Hash {
     }
 }
 
-/// Error parsing a [`Hash`] from a hex string.
+/// Error parsing a [`struct@Hash`] from a hex string.
 #[derive(Debug, thiserror::Error)]
 #[error("invalid hex hash: {0}")]
 pub struct HashParseError(String);
@@ -89,7 +89,7 @@ impl<'de> Deserialize<'de> for Hash {
 pub trait Digest: Default {
     /// Absorb more input.
     fn update(&mut self, data: &[u8]);
-    /// Consume the hasher and produce the final [`Hash`].
+    /// Consume the hasher and produce the final [`struct@Hash`].
     fn finalize(self) -> Hash;
     /// The wire/key name of this algorithm (e.g. `"sha256"`).
     fn name() -> &'static str;
