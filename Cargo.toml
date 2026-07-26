@@ -9,7 +9,7 @@
 name = "zblob"
 version = "0.1.0"
 edition = "2024"
-rust-version = "1.88"
+rust-version = "1.97"
 license = "MIT"
 description = "Generic resumable chunked blob & directory transfer over Zenoh (progress, SHA-256, resume)"
 repository = "https://github.com/p13marc/zblob"
