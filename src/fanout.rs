@@ -1,0 +1,338 @@
+//! One-to-many fanout tier (optional `fanout` feature).
+//!
+//! The Tier-1 queryable model degrades to N independent transfers when one
+//! artifact must reach many nodes at once (a config rollout, a firmware
+//! push). This tier publishes the blob **once** as a sample stream on
+//! `<prefix>/<id>/fanout` through a `zenoh-ext` `AdvancedPublisher`:
+//!
+//! - the publisher **caches** every frame, so late joiners replay history;
+//! - **sample-miss detection** + heartbeat let subscribers recover losses;
+//! - every slice frame is still a self-verifying bao slice, so each receiver
+//!   verifies against the manifest root exactly like a Tier-1 download.
+//!
+//! The cache holds the entire encoded blob in publisher memory for the
+//! handle's lifetime — this tier is for rollout-sized artifacts, not
+//! arbitrarily large blobs.
+
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use std::time::Duration;
+
+use serde::{Deserialize, Serialize};
+use tokio::io::{AsyncSeekExt, AsyncWriteExt, SeekFrom};
+use zenoh_ext::{
+    AdvancedPublisherBuilderExt, AdvancedSubscriberBuilderExt, CacheConfig, HistoryConfig,
+    MissDetectionConfig, RecoveryConfig,
+};
+
+use crate::cancel::CancelToken;
+use crate::chunk::TransferChunks;
+use crate::error::{BlobError, Result};
+use crate::hash::Hash;
+use crate::manifest::{BlobSpec, Manifest};
+use crate::obs::{TransferStats, zdebug};
+use crate::progress::{Progress, ProgressSink};
+use crate::verify;
+
+/// Key the fanout stream of blob `id` is published on.
+pub fn fanout_key(prefix: &str, id: &str) -> String {
+    format!("{prefix}/{id}/fanout")
+}
+
+/// One sample of the fanout stream.
+#[derive(Serialize, Deserialize)]
+enum FanoutFrame {
+    /// Frame 0: the manifest.
+    Manifest(Manifest),
+    /// A bao slice for one transfer chunk.
+    Slice {
+        /// Transfer chunk index.
+        index: u32,
+        /// Bao slice (self-verifying against the manifest root).
+        bao: Vec<u8>,
+    },
+}
+
+/// Fanout tuning.
+#[derive(Debug, Clone)]
+pub struct FanoutConfig {
+    /// Publisher heartbeat period for sample-miss detection (default 500 ms).
+    pub heartbeat: Duration,
+    /// Receiver-side stall timeout: give up if no useful frame arrives for
+    /// this long (default 30 s).
+    pub stall_timeout: Duration,
+}
+
+impl Default for FanoutConfig {
+    fn default() -> Self {
+        FanoutConfig {
+            heartbeat: Duration::from_millis(500),
+            stall_timeout: Duration::from_secs(30),
+        }
+    }
+}
+
+/// Keeps a fanout publication (and its replay cache) alive.
+pub struct FanoutHandle {
+    stop: Arc<tokio::sync::Notify>,
+    join: tokio::task::JoinHandle<Result<()>>,
+}
+
+impl FanoutHandle {
+    /// Stop serving the cache and release its memory.
+    pub async fn shutdown(self) -> Result<()> {
+        self.stop.notify_one();
+        self.join
+            .await
+            .map_err(|e| BlobError::Protocol(format!("fanout task join: {e}")))?
+    }
+}
+
+/// Fan out the file at `path` under `spec`: hash it, publish the manifest and
+/// every bao slice once (cached for late joiners), and keep serving until the
+/// returned handle is shut down. Returns the manifest — distribute
+/// `(id, root)` so receivers can pin.
+pub async fn fanout_file(
+    session: Arc<zenoh::Session>,
+    prefix: &str,
+    spec: BlobSpec,
+    path: impl Into<PathBuf>,
+    cfg: FanoutConfig,
+) -> Result<(Manifest, FanoutHandle)> {
+    let path = path.into();
+    let hash_path = path.clone();
+    let (outboard, total_len) =
+        tokio::task::spawn_blocking(move || -> std::io::Result<(verify::MemOutboard, u64)> {
+            let file = std::fs::File::open(&hash_path)?;
+            let total_len = file.metadata()?.len();
+            Ok((verify::compute_outboard(file)?, total_len))
+        })
+        .await
+        .map_err(|e| BlobError::Protocol(format!("hash task: {e}")))??;
+    let outboard = Arc::new(outboard);
+    let chunks = TransferChunks::new(spec.chunk_size, total_len)?;
+    let count = chunks.count();
+    let manifest = Manifest {
+        version: crate::wire::WIRE_VERSION,
+        id: spec.id.clone(),
+        filename: spec.filename,
+        total_len,
+        chunk_size: spec.chunk_size,
+        root: Hash::from(outboard.root),
+        created_ms: spec.created_ms,
+    };
+    manifest.validate(u64::MAX)?;
+
+    let stop = Arc::new(tokio::sync::Notify::new());
+    let stop2 = stop.clone();
+    let key = fanout_key(prefix, &manifest.id);
+    let task_manifest = manifest.clone();
+    let join = tokio::spawn(async move {
+        let publisher = session
+            .declare_publisher(key)
+            .cache(CacheConfig::default().max_samples(count as usize + 1))
+            .sample_miss_detection(MissDetectionConfig::default().heartbeat(cfg.heartbeat))
+            .await
+            .map_err(BlobError::zenoh)?;
+
+        publisher
+            .put(crate::wire::encode(&(
+                crate::wire::WIRE_VERSION,
+                FanoutFrame::Manifest(task_manifest.clone()),
+            ))?)
+            .await
+            .map_err(BlobError::zenoh)?;
+
+        let mut reader = tokio::task::spawn_blocking(move || std::fs::File::open(&path))
+            .await
+            .map_err(|e| BlobError::Protocol(format!("open task: {e}")))??;
+        for index in 0..count {
+            let ob = outboard.clone();
+            let byte_range = chunks.byte_range(index);
+            let (r, slice) = tokio::task::spawn_blocking(
+                move || -> (std::fs::File, std::io::Result<Vec<u8>>) {
+                    let slice =
+                        verify::encode_slice(&reader, &*ob, verify::chunk_range(byte_range));
+                    (reader, slice)
+                },
+            )
+            .await
+            .map_err(|e| BlobError::Protocol(format!("encode task: {e}")))?;
+            reader = r;
+            publisher
+                .put(crate::wire::encode(&(
+                    crate::wire::WIRE_VERSION,
+                    FanoutFrame::Slice { index, bao: slice? },
+                ))?)
+                .await
+                .map_err(BlobError::zenoh)?;
+        }
+        zdebug!(id = %task_manifest.id, chunks = count, "fanout published; serving cache");
+
+        // All frames are in the cache; keep the publisher (and thus replay +
+        // heartbeat) alive until shutdown.
+        stop2.notified().await;
+        Ok(())
+    });
+
+    Ok((manifest, FanoutHandle { stop, join }))
+}
+
+/// Receive a fanned-out blob into `dest` (atomically, via `<dest>.part`),
+/// verifying every slice against the manifest root — pin it with
+/// [`DownloadRequest::pinned`](crate::DownloadRequest::pinned) semantics by
+/// passing `expected_root`. Works for subscribers that join *after*
+/// publication (history replay) and across losses (recovery + heartbeat).
+#[allow(clippy::too_many_arguments)] // transfer surface mirrors download_to
+pub async fn receive_fanout(
+    session: Arc<zenoh::Session>,
+    prefix: &str,
+    id: &str,
+    expected_root: Option<Hash>,
+    dest: &Path,
+    sink: &dyn ProgressSink,
+    cancel: &CancelToken,
+    cfg: FanoutConfig,
+) -> Result<TransferStats> {
+    let started_at = tokio::time::Instant::now();
+    let subscriber = session
+        .declare_subscriber(fanout_key(prefix, id))
+        .history(HistoryConfig::default().detect_late_publishers())
+        .recovery(RecoveryConfig::default().heartbeat())
+        .await
+        .map_err(BlobError::zenoh)?;
+
+    let mut manifest: Option<(Manifest, TransferChunks, blake3::Hash)> = None;
+    let mut file: Option<tokio::fs::File> = None;
+    let part = {
+        let mut p = dest.as_os_str().to_os_string();
+        p.push(".part");
+        PathBuf::from(p)
+    };
+    let mut present: Vec<bool> = Vec::new();
+    let mut received = 0u32;
+    let mut stats = TransferStats::default();
+
+    loop {
+        if cancel.is_cancelled() {
+            let total = manifest.as_ref().map(|(_, c, _)| c.count()).unwrap_or(0);
+            sink.emit(Progress::Cancelled { received, total });
+            return Err(BlobError::Cancelled { received, total });
+        }
+        let sample = match tokio::time::timeout(cfg.stall_timeout, subscriber.recv_async()).await {
+            Err(_) => {
+                let total = manifest.as_ref().map(|(_, c, _)| c.count()).unwrap_or(0);
+                return Err(BlobError::Incomplete { received, total });
+            }
+            Ok(Err(_)) => {
+                let total = manifest.as_ref().map(|(_, c, _)| c.count()).unwrap_or(0);
+                return Err(BlobError::Incomplete { received, total });
+            }
+            Ok(Ok(sample)) => sample,
+        };
+        let Ok((version, frame)) =
+            crate::wire::decode::<(u16, FanoutFrame)>(&sample.payload().to_bytes())
+        else {
+            continue;
+        };
+        if version != crate::wire::WIRE_VERSION {
+            continue;
+        }
+        match frame {
+            FanoutFrame::Manifest(m) => {
+                if manifest.is_some() {
+                    continue; // replays of frame 0 are expected; first wins.
+                }
+                m.validate(1 << 40)?;
+                if m.id != id {
+                    continue;
+                }
+                if let Some(expected) = expected_root
+                    && m.root != expected
+                {
+                    return Err(BlobError::RootMismatch {
+                        expected,
+                        actual: m.root,
+                    });
+                }
+                let chunks = m.chunks()?;
+                let count = chunks.count();
+                if let Some(parent) = dest.parent()
+                    && !parent.as_os_str().is_empty()
+                {
+                    tokio::fs::create_dir_all(parent).await?;
+                }
+                let f = tokio::fs::File::create(&part).await?;
+                f.set_len(m.total_len).await?;
+                present = vec![false; count as usize];
+                sink.emit(Progress::Started {
+                    total_len: m.total_len,
+                    chunk_count: count,
+                });
+                let root: blake3::Hash = m.root.into();
+                manifest = Some((m, chunks, root));
+                file = Some(
+                    tokio::fs::OpenOptions::new()
+                        .write(true)
+                        .open(&part)
+                        .await?,
+                );
+                if count == 0 {
+                    break;
+                }
+            }
+            FanoutFrame::Slice { index, bao } => {
+                let Some((m, chunks, root)) = &manifest else {
+                    continue; // slice before manifest replay; recovery re-delivers.
+                };
+                let count = chunks.count();
+                if index >= count || present[index as usize] {
+                    continue;
+                }
+                let mut leaves: Vec<(u64, Vec<u8>)> = Vec::new();
+                let decoded = verify::decode_slice(
+                    root,
+                    m.total_len,
+                    verify::chunk_range(chunks.byte_range(index)),
+                    &bao,
+                    |off, data| {
+                        leaves.push((off, data.to_vec()));
+                        Ok(())
+                    },
+                );
+                if decoded.is_err() {
+                    stats.rejected += 1;
+                    continue;
+                }
+                let f = file.as_mut().expect("file exists once manifest seen");
+                for (off, data) in leaves {
+                    f.seek(SeekFrom::Start(off)).await?;
+                    f.write_all(&data).await?;
+                }
+                present[index as usize] = true;
+                received += 1;
+                stats.chunks_fetched += 1;
+                stats.bytes_fetched += chunks.len_of(index) as u64;
+                sink.emit(Progress::Chunk {
+                    index,
+                    received,
+                    total: count,
+                    bytes_received: stats.bytes_fetched,
+                });
+                if received == count {
+                    break;
+                }
+            }
+        }
+    }
+
+    let f = file.expect("complete transfers have a file");
+    f.sync_data().await?;
+    drop(f);
+    tokio::fs::rename(&part, dest).await?;
+    sink.emit(Progress::Completed {
+        path: dest.to_path_buf(),
+    });
+    stats.elapsed = started_at.elapsed();
+    Ok(stats)
+}

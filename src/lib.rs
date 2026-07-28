@@ -50,6 +50,8 @@ mod chunk;
 mod client;
 mod compress;
 mod error;
+#[cfg(feature = "fanout")]
+pub mod fanout;
 pub mod gc;
 mod hash;
 mod manifest;

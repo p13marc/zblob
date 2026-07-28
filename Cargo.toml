@@ -30,12 +30,15 @@ postcard = { version = "1.1", features = ["use-std"] }
 tempfile = "3"
 zstd = { version = "0.13", optional = true }
 tracing = { version = "0.1", optional = true }
+zenoh-ext = { version = "1.9", features = ["unstable"], optional = true }
 
 [features]
 # Per-chunk zstd compression for Tier-2 chunk containers (wire + at rest).
 zstd = ["dep:zstd"]
 # Emit `tracing` events at registration/serve/download/GC points.
 tracing = ["dep:tracing"]
+# One-to-many fanout tier over zenoh-ext AdvancedPublisher.
+fanout = ["dep:zenoh-ext"]
 
 [dev-dependencies]
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "time"] }
