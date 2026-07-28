@@ -27,9 +27,10 @@ use crate::manifest::{BlobSpec, Manifest, validate_id};
 use crate::obs::{TransferStats, zdebug};
 use crate::progress::{Progress, ProgressSink};
 use crate::resume::ResumeState;
-use crate::wire::{ENC_MANIFEST, ENC_PUSH, ENC_SLICE, decode};
+use crate::wire::{Availability, ENC_AVAIL, ENC_MANIFEST, ENC_PUSH, ENC_SLICE, decode};
 use crate::{
-    MAX_RANGE_SPANS, manifest_key, push_offer_key, push_slice_key, slice_selector, verify,
+    MAX_RANGE_SPANS, availability_key, manifest_key, push_offer_key, push_slice_key,
+    slice_selector, verify,
 };
 
 /// What to do when the destination path already exists at completion time.
@@ -133,6 +134,10 @@ pub struct BlobClient {
     session: Arc<zenoh::Session>,
     prefix: String,
     cfg: ClientConfig,
+    // Single-flight guard: destinations with a download in progress *through
+    // this client*. Two concurrent downloads to one path would corrupt each
+    // other's .part/sidecar pair.
+    active: Arc<std::sync::Mutex<std::collections::HashSet<PathBuf>>>,
 }
 
 /// Builder for a [`BlobClient`] (see [`BlobClient::builder`]).
@@ -183,6 +188,7 @@ impl BlobClientBuilder {
             session: self.session,
             prefix: self.prefix,
             cfg: self.cfg,
+            active: Arc::new(std::sync::Mutex::new(std::collections::HashSet::new())),
         }
     }
 }
@@ -249,7 +255,11 @@ impl BlobClient {
         sink: &dyn ProgressSink,
         cancel: &CancelToken,
     ) -> Result<TransferStats> {
+        // Single-flight: a second concurrent download to the same destination
+        // through this client is refused instead of silently corrupting state.
+        let guard = ActiveGuard::acquire(&self.active, dest)?;
         let result = self.download_to_inner(req, dest, sink, cancel).await;
+        drop(guard);
         match &result {
             Err(BlobError::Cancelled { .. }) | Ok(_) => {}
             Err(e) => sink.emit(Progress::Failed {
@@ -257,6 +267,34 @@ impl BlobClient {
             }),
         }
         result
+    }
+
+    /// Ask every responder which chunks of `id` it holds. Returns one
+    /// [`Availability`] per reply — with replicated servers this is how a
+    /// caller sees the swarm (with reply consolidation disabled, ordinary
+    /// downloads already accept whichever replica answers each chunk first).
+    pub async fn fetch_availability(&self, id: &str) -> Result<Vec<Availability>> {
+        validate_id(id)?;
+        let key = availability_key(&self.prefix, id);
+        let replies = self
+            .session
+            .get(&key)
+            .consolidation(ConsolidationMode::None)
+            .timeout(self.cfg.query_timeout)
+            .await
+            .map_err(BlobError::zenoh)?;
+        let mut out = Vec::new();
+        while let Ok(reply) = replies.recv_async().await {
+            let Ok(sample) = reply.result() else { continue };
+            if sample.encoding().to_string() != ENC_AVAIL {
+                continue;
+            }
+            let avail: Availability = decode(&sample.payload().to_bytes())?;
+            if avail.version == crate::wire::WIRE_VERSION {
+                out.push(avail);
+            }
+        }
+        Ok(out)
     }
 
     /// Delete any partial download + sidecar for a previous
@@ -691,6 +729,39 @@ impl BlobClient {
             received: state.received(),
             total: count,
         })
+    }
+}
+
+/// RAII entry in a client's active-destination set.
+struct ActiveGuard {
+    active: Arc<std::sync::Mutex<std::collections::HashSet<PathBuf>>>,
+    dest: PathBuf,
+}
+
+impl ActiveGuard {
+    fn acquire(
+        active: &Arc<std::sync::Mutex<std::collections::HashSet<PathBuf>>>,
+        dest: &Path,
+    ) -> Result<Self> {
+        let mut set = active.lock().unwrap_or_else(|e| e.into_inner());
+        if !set.insert(dest.to_path_buf()) {
+            return Err(BlobError::Protocol(format!(
+                "a download to {dest:?} is already in progress on this client"
+            )));
+        }
+        Ok(ActiveGuard {
+            active: active.clone(),
+            dest: dest.to_path_buf(),
+        })
+    }
+}
+
+impl Drop for ActiveGuard {
+    fn drop(&mut self) {
+        self.active
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(&self.dest);
     }
 }
 

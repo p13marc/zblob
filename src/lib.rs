@@ -95,6 +95,11 @@ pub fn slice_key(prefix: &str, id: &str, index: u32) -> String {
     format!("{prefix}/{id}/slice/{index}")
 }
 
+/// Key a client GETs to ask responders which chunks of `id` they hold.
+pub fn availability_key(prefix: &str, id: &str) -> String {
+    format!("{prefix}/{id}/have")
+}
+
 /// Key an uploader GETs (with a manifest payload) to offer a push of `id`.
 pub fn push_offer_key(prefix: &str, id: &str) -> String {
     format!("{prefix}/{id}/push/offer")

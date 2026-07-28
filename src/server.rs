@@ -21,7 +21,7 @@ use crate::manifest::{BlobSpec, Manifest, validate_id};
 use crate::obs::{zdebug, zwarn};
 use crate::resume::ResumeState;
 use crate::verify::{self, OutboardStore, ReadAtCursor};
-use crate::wire::{ENC_MANIFEST, ENC_PUSH, ENC_SLICE, encode};
+use crate::wire::{Availability, ENC_AVAIL, ENC_MANIFEST, ENC_PUSH, ENC_SLICE, encode};
 use crate::{manifest_key, parse_id, parse_ranges, slice_key};
 
 /// A positional, sized, thread-safe byte source: what a [`BlobSource`] opens.
@@ -487,6 +487,18 @@ async fn serve_one(inner: &Inner, query: zenoh::query::Query) -> Result<()> {
             None => return Ok(()), // unknown id → client times out → NotFound.
         }
     };
+
+    // Availability request: which chunks can this server serve? A registered
+    // blob is always complete here, but the protocol supports partial holders.
+    if key_str.ends_with("/have") {
+        let avail = Availability::full(chunks.count());
+        query
+            .reply(crate::availability_key(&inner.prefix, &id), encode(&avail)?)
+            .encoding(ENC_AVAIL)
+            .await
+            .map_err(BlobError::zenoh)?;
+        return Ok(());
+    }
 
     // Manifest-only request: exact `.../manifest` GET.
     if key_str.ends_with("/manifest") {

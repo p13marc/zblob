@@ -28,6 +28,52 @@ pub const ENC_INDEX: &str = "zblob/index;v=2";
 pub const ENC_CHUNK: &str = "zblob/chunk";
 /// Encoding tag of push-protocol acknowledgement replies.
 pub const ENC_PUSH: &str = "zblob/push;v=2";
+/// Encoding tag of availability (`…/have`) replies.
+pub const ENC_AVAIL: &str = "zblob/have;v=2";
+
+/// A responder's chunk availability for one blob: which transfer chunks it
+/// can serve right now. A full server answers all-ones; the shape exists so
+/// partial holders (caches, in-progress replicas) can participate and so a
+/// client can pick the best-stocked peer before fetching.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct Availability {
+    /// Wire schema version (first field; postcard is positional).
+    pub version: u16,
+    /// Total transfer chunks of the blob.
+    pub chunk_count: u32,
+    /// LSB-first presence bitfield (`ceil(chunk_count / 8)` bytes).
+    pub bits: Vec<u8>,
+}
+
+impl Availability {
+    /// An all-chunks-present availability.
+    pub fn full(chunk_count: u32) -> Self {
+        let mut bits = vec![0xffu8; chunk_count.div_ceil(8) as usize];
+        // Zero the padding bits so `count()` is exact.
+        if let Some(last) = bits.last_mut()
+            && !chunk_count.is_multiple_of(8)
+        {
+            *last = (1u8 << (chunk_count % 8)) - 1;
+        }
+        Availability {
+            version: WIRE_VERSION,
+            chunk_count,
+            bits,
+        }
+    }
+
+    /// Whether chunk `i` is available.
+    pub fn is_set(&self, i: u32) -> bool {
+        i < self.chunk_count
+            && (i / 8) < self.bits.len() as u32
+            && self.bits[(i / 8) as usize] & (1 << (i % 8)) != 0
+    }
+
+    /// How many chunks are available.
+    pub fn count(&self) -> u32 {
+        self.bits.iter().map(|b| b.count_ones()).sum()
+    }
+}
 
 /// Encode a control message to postcard bytes.
 pub fn encode<T: Serialize>(value: &T) -> Result<Vec<u8>> {
