@@ -17,7 +17,7 @@ use crate::cancel::CancelToken;
 use crate::chunk::Chunker;
 use crate::error::{BlobError, Result};
 use crate::format::{Format, decode, encode};
-use crate::hash::{Digest, Hash, Sha256Digest};
+use crate::hash::Hash;
 use crate::progress::{Progress, ProgressSink};
 use crate::store::ContentStore;
 use crate::{store_key, tree_key};
@@ -122,19 +122,17 @@ impl TreeIndex {
     }
 
     /// Recompute the root digest over `entries` and compare to `root_hash`.
-    fn verify_root<D: Digest>(&self) -> bool {
-        root_digest::<D>(&self.entries) == self.root_hash
+    fn verify_root(&self) -> bool {
+        root_digest(&self.entries) == self.root_hash
     }
 }
 
 /// Digest over the canonical serialization of an entry list (the tree root hash).
-fn root_digest<D: Digest>(entries: &[Entry]) -> Hash {
-    let mut d = D::default();
+fn root_digest(entries: &[Entry]) -> Hash {
     // serde_json is deterministic for these types (no maps), giving a stable
     // canonical form to hash.
     let bytes = serde_json::to_vec(entries).unwrap_or_default();
-    d.update(&bytes);
-    d.finalize()
+    Hash::of(&bytes)
 }
 
 /// A built snapshot: its index plus the deduplicated `(hash, bytes)` chunks to
@@ -155,11 +153,11 @@ pub fn build_tree(
     let mut chunks: Vec<(Hash, Vec<u8>)> = Vec::new();
     let mut seen = std::collections::HashSet::new();
     walk(root, root, chunker, &mut entries, &mut chunks, &mut seen)?;
-    let root_hash = root_digest::<Sha256Digest>(&entries);
+    let root_hash = root_digest(&entries);
     Ok((
         TreeIndex {
             id: id.into(),
-            algo: Sha256Digest::name().to_string(),
+            algo: Hash::ALGO.to_string(),
             chunk_size: chunker.chunk_size(),
             chunk_policy: chunker.policy_tag(),
             entries,
@@ -224,9 +222,7 @@ fn walk(
             let mut refs = Vec::with_capacity(cuts.len());
             for (start, len) in cuts {
                 let slice = &data[start..start + len];
-                let mut d = Sha256Digest::default();
-                d.update(slice);
-                let hash = d.finalize();
+                let hash = Hash::of(slice);
                 refs.push(ChunkRef {
                     hash,
                     len: len as u32,
@@ -400,7 +396,7 @@ impl TreeClient {
         cancel: &CancelToken,
     ) -> Result<()> {
         let index = self.fetch_index(id).await?;
-        if index.algo != Sha256Digest::name() {
+        if index.algo != Hash::ALGO {
             return Err(BlobError::Protocol(format!(
                 "unsupported algo: {}",
                 index.algo
@@ -425,9 +421,7 @@ impl TreeClient {
             if !store.has(&hash) {
                 let bytes = self.fetch_chunk(&hash).await?;
                 // Verify by re-hashing on receipt → corruption is impossible.
-                let mut d = Sha256Digest::default();
-                d.update(&bytes);
-                if d.finalize() != hash {
+                if Hash::of(&bytes) != hash {
                     return Err(BlobError::HashMismatch);
                 }
                 store.put(&hash, &bytes)?;
@@ -448,7 +442,7 @@ impl TreeClient {
         }
 
         // Verify the Merkle-y root over the entry list.
-        if !index.verify_root::<Sha256Digest>() {
+        if !index.verify_root() {
             return Err(BlobError::HashMismatch);
         }
         sink.emit(Progress::Completed {
@@ -458,7 +452,7 @@ impl TreeClient {
     }
 
     async fn fetch_chunk(&self, hash: &Hash) -> Result<Vec<u8>> {
-        let key = store_key(&self.store_prefix, Sha256Digest::name(), hash);
+        let key = store_key(&self.store_prefix, Hash::ALGO, hash);
         let replies = self.session.get(&key).await.map_err(BlobError::zenoh)?;
         while let Ok(reply) = replies.recv_async().await {
             if let Ok(sample) = reply.result() {
@@ -541,7 +535,7 @@ mod tests {
         // One unique chunk despite two files.
         assert_eq!(chunks.len(), 1);
         assert_eq!(index.needed_chunks().len(), 1);
-        assert!(index.verify_root::<Sha256Digest>());
+        assert!(index.verify_root());
         // Two file entries.
         let files = index
             .entries

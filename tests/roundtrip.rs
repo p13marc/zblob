@@ -11,7 +11,6 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::io::AsyncReadExt;
 use zblob::{
     BlobClient, BlobServer, FileBlobSource, FixedSizeChunker, Format, MIN_CHUNK_SIZE, Manifest,
-    Sha256Digest,
 };
 
 fn isolated_config() -> zenoh::Config {
@@ -47,11 +46,8 @@ fn pseudo_random(len: usize, seed: u64) -> Vec<u8> {
     out
 }
 
-async fn sha256(bytes: &[u8]) -> zblob::Hash {
-    use zblob::Digest;
-    let mut d = Sha256Digest::default();
-    d.update(bytes);
-    d.finalize()
+fn content_hash(bytes: &[u8]) -> zblob::Hash {
+    zblob::Hash::of(bytes)
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -68,7 +64,7 @@ async fn roundtrip_multi_mb() {
     // Build the manifest by streaming the source.
     let chunker = FixedSizeChunker::new(MIN_CHUNK_SIZE);
     let mut reader = tokio::fs::File::open(&src_path).await.unwrap();
-    let manifest = Manifest::compute::<_, Sha256Digest>(
+    let manifest = Manifest::compute(
         &mut reader,
         &chunker,
         "blob-1",
@@ -108,7 +104,7 @@ async fn roundtrip_multi_mb() {
         .await
         .unwrap();
     assert_eq!(got.len(), data.len());
-    assert_eq!(sha256(&got).await, sha256(&data).await);
+    assert_eq!(content_hash(&got), content_hash(&data));
     assert_eq!(got_path.file_name().unwrap(), "source.bin");
 }
 

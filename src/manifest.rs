@@ -9,7 +9,7 @@ use tokio::io::{AsyncRead, AsyncReadExt};
 
 use crate::chunk::Chunker;
 use crate::error::Result;
-use crate::hash::{Digest, Hash};
+use crate::hash::Hash;
 
 /// Describes a single blob: its identity, size, chunking, and whole-blob digest.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -39,7 +39,7 @@ impl Manifest {
     /// `read_to_end`, so memory stays O(buffer) regardless of blob size.
     ///
     /// `created_ms` is supplied by the caller (the crate does not read the clock).
-    pub async fn compute<R, D>(
+    pub async fn compute<R>(
         reader: &mut R,
         chunker: &dyn Chunker,
         id: impl Into<String>,
@@ -48,9 +48,8 @@ impl Manifest {
     ) -> Result<Manifest>
     where
         R: AsyncRead + Unpin,
-        D: Digest,
     {
-        let mut digest = D::default();
+        let mut hasher = blake3::Hasher::new();
         let mut total_len: u64 = 0;
         let mut buf = vec![0u8; 64 * 1024];
         loop {
@@ -58,7 +57,7 @@ impl Manifest {
             if n == 0 {
                 break;
             }
-            digest.update(&buf[..n]);
+            hasher.update(&buf[..n]);
             total_len += n as u64;
         }
         Ok(Manifest {
@@ -67,8 +66,8 @@ impl Manifest {
             total_len,
             chunk_size: chunker.chunk_size(),
             chunk_count: chunker.count(total_len),
-            hash_algo: D::name().to_string(),
-            hash: digest.finalize(),
+            hash_algo: Hash::ALGO.to_string(),
+            hash: hasher.finalize().into(),
             created_ms,
         })
     }
@@ -78,34 +77,31 @@ impl Manifest {
 mod tests {
     use super::*;
     use crate::chunk::{FixedSizeChunker, MIN_CHUNK_SIZE};
-    use crate::hash::Sha256Digest;
 
     #[tokio::test]
     async fn compute_sizes_and_hashes() {
         let data = vec![7u8; MIN_CHUNK_SIZE as usize * 2 + 100];
         let mut cursor = std::io::Cursor::new(data.clone());
         let chunker = FixedSizeChunker::new(MIN_CHUNK_SIZE);
-        let m = Manifest::compute::<_, Sha256Digest>(&mut cursor, &chunker, "abc", "f.bin", 42)
+        let m = Manifest::compute(&mut cursor, &chunker, "abc", "f.bin", 42)
             .await
             .unwrap();
 
         assert_eq!(m.total_len, data.len() as u64);
         assert_eq!(m.chunk_count, 3); // two full + one short
         assert_eq!(m.chunk_size, MIN_CHUNK_SIZE);
-        assert_eq!(m.hash_algo, "sha256");
+        assert_eq!(m.hash_algo, "blake3");
         assert_eq!(m.created_ms, 42);
 
         // Hash matches a direct one-shot digest.
-        let mut d = Sha256Digest::default();
-        d.update(&data);
-        assert_eq!(m.hash, d.finalize());
+        assert_eq!(m.hash, Hash::of(&data));
     }
 
     #[tokio::test]
     async fn empty_blob() {
         let mut cursor = std::io::Cursor::new(Vec::new());
         let chunker = FixedSizeChunker::new(MIN_CHUNK_SIZE);
-        let m = Manifest::compute::<_, Sha256Digest>(&mut cursor, &chunker, "e", "empty", 0)
+        let m = Manifest::compute(&mut cursor, &chunker, "e", "empty", 0)
             .await
             .unwrap();
         assert_eq!(m.total_len, 0);

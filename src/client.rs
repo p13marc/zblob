@@ -13,7 +13,7 @@ use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt, SeekFrom};
 use crate::cancel::CancelToken;
 use crate::error::{BlobError, Result};
 use crate::format::{Format, decode};
-use crate::hash::{Digest, Sha256Digest};
+use crate::hash::Hash;
 use crate::manifest::Manifest;
 use crate::progress::{Progress, ProgressSink};
 use crate::resume::ResumeState;
@@ -94,7 +94,7 @@ impl BlobClient {
         // (otherwise it cannot place out-of-order chunks by offset). This also
         // keeps memory bounded: chunks go straight to disk, never buffered.
         let manifest = self.fetch_manifest(id).await?;
-        if manifest.hash_algo != Sha256Digest::name() {
+        if manifest.hash_algo != Hash::ALGO {
             return Err(BlobError::Protocol(format!(
                 "unsupported hash algo: {}",
                 manifest.hash_algo
@@ -190,7 +190,7 @@ impl BlobClient {
 
         // Verify the whole-blob hash by streaming the partial file once.
         sink.emit(Progress::Verifying);
-        let actual = hash_file::<Sha256Digest>(&part).await?;
+        let actual = hash_file(&part).await?;
         if actual != manifest.hash {
             let _ = tokio::fs::remove_file(&part).await;
             ResumeState::remove(&part).await;
@@ -231,16 +231,16 @@ fn parse_chunk_index(key: &str) -> Option<u32> {
 }
 
 /// Stream a file through a digest and return its hash, without loading it whole.
-async fn hash_file<D: Digest>(path: &Path) -> Result<crate::hash::Hash> {
+async fn hash_file(path: &Path) -> Result<Hash> {
     let mut f = tokio::fs::File::open(path).await?;
-    let mut digest = D::default();
+    let mut hasher = blake3::Hasher::new();
     let mut buf = vec![0u8; 64 * 1024];
     loop {
         let n = f.read(&mut buf).await?;
         if n == 0 {
             break;
         }
-        digest.update(&buf[..n]);
+        hasher.update(&buf[..n]);
     }
-    Ok(digest.finalize())
+    Ok(hasher.finalize().into())
 }

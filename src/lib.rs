@@ -66,7 +66,7 @@ pub use chunk::{
 pub use client::BlobClient;
 pub use error::{BlobError, Result};
 pub use format::{Format, decode, encode};
-pub use hash::{Digest, Hash, Sha256Digest};
+pub use hash::{Hash, HashParseError};
 pub use manifest::Manifest;
 pub use progress::{Progress, ProgressSink};
 pub use publish::{publish_chunk, publish_chunks, publish_index, publish_snapshot};

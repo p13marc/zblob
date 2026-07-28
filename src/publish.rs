@@ -15,7 +15,7 @@ use std::sync::Arc;
 
 use crate::error::{BlobError, Result};
 use crate::format::{Format, encode};
-use crate::hash::{Digest, Hash, Sha256Digest};
+use crate::hash::Hash;
 use crate::tree::TreeIndex;
 use crate::{store_key, tree_key};
 
@@ -47,7 +47,7 @@ pub async fn publish_chunks<I>(
 where
     I: IntoIterator<Item = (Hash, Vec<u8>)>,
 {
-    let algo = Sha256Digest::name();
+    let algo = Hash::ALGO;
     for (hash, bytes) in chunks {
         publish_chunk(session, store_prefix, algo, &hash, &bytes).await?;
     }

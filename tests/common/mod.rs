@@ -6,7 +6,7 @@
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use zblob::{AsyncReadSeek, BlobSource, Digest, Hash, OpenFuture, Sha256Digest};
+use zblob::{AsyncReadSeek, BlobSource, Hash, OpenFuture};
 
 pub fn isolated_config() -> zenoh::Config {
     let mut config = zenoh::Config::default();
@@ -44,10 +44,8 @@ pub fn pseudo_random(len: usize, seed: u64) -> Vec<u8> {
     out
 }
 
-pub fn sha256(bytes: &[u8]) -> Hash {
-    let mut d = Sha256Digest::default();
-    d.update(bytes);
-    d.finalize()
+pub fn content_hash(bytes: &[u8]) -> Hash {
+    Hash::of(bytes)
 }
 
 /// A [`BlobSource`] over an in-memory `Vec<u8>` (no temp file needed).

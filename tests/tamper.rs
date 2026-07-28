@@ -9,7 +9,7 @@ use std::time::Duration;
 use common::{BytesSource, open_session, pseudo_random, unique_prefix};
 use zblob::{
     BlobClient, BlobError, BlobServer, Chunker, FixedSizeChunker, Format, MIN_CHUNK_SIZE, Manifest,
-    Sha256Digest, chunk_key, encode, manifest_key,
+    chunk_key, encode, manifest_key,
 };
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -27,10 +27,9 @@ async fn corrupted_bytes_fail_hash() {
 
     let mut reader = std::io::Cursor::new(clean.as_slice());
     let chunker = FixedSizeChunker::new(MIN_CHUNK_SIZE);
-    let manifest =
-        Manifest::compute::<_, Sha256Digest>(&mut reader, &chunker, "blob-t", "data.bin", 1)
-            .await
-            .unwrap();
+    let manifest = Manifest::compute(&mut reader, &chunker, "blob-t", "data.bin", 1)
+        .await
+        .unwrap();
 
     let server = BlobServer::new(session.clone(), prefix.clone(), Format::Json);
     server
@@ -60,10 +59,9 @@ async fn wrong_length_chunk_rejected() {
     let data = Arc::new(pseudo_random(MIN_CHUNK_SIZE as usize * 4, 0x55AA));
     let mut reader = std::io::Cursor::new(data.as_slice());
     let chunker = FixedSizeChunker::new(MIN_CHUNK_SIZE);
-    let manifest =
-        Manifest::compute::<_, Sha256Digest>(&mut reader, &chunker, "blob-c", "data.bin", 1)
-            .await
-            .unwrap();
+    let manifest = Manifest::compute(&mut reader, &chunker, "blob-c", "data.bin", 1)
+        .await
+        .unwrap();
 
     // A hand-rolled, malicious server that truncates chunk index 2's payload.
     let bad_index = 2u32;

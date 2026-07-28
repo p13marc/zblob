@@ -6,10 +6,10 @@ mod common;
 use std::sync::Arc;
 use std::time::Duration;
 
-use common::{BytesSource, open_session, pseudo_random, sha256, unique_prefix};
+use common::{BytesSource, content_hash, open_session, pseudo_random, unique_prefix};
 use zblob::{
     BlobClient, BlobError, BlobServer, CancelToken, FixedSizeChunker, Format, MIN_CHUNK_SIZE,
-    Manifest, Progress, ProgressSink, Sha256Digest,
+    Manifest, Progress, ProgressSink,
 };
 
 /// Cancels the token after the first chunk is written.
@@ -35,10 +35,9 @@ async fn cancel_persists_then_resumes() {
     let data = Arc::new(pseudo_random(MIN_CHUNK_SIZE as usize * 8, 0xC0FFEE));
     let mut reader = std::io::Cursor::new(data.as_slice());
     let chunker = FixedSizeChunker::new(MIN_CHUNK_SIZE);
-    let manifest =
-        Manifest::compute::<_, Sha256Digest>(&mut reader, &chunker, "blob-x", "d.bin", 1)
-            .await
-            .unwrap();
+    let manifest = Manifest::compute(&mut reader, &chunker, "blob-x", "d.bin", 1)
+        .await
+        .unwrap();
 
     let server = BlobServer::new(session.clone(), prefix.clone(), Format::Json);
     server
@@ -70,7 +69,7 @@ async fn cancel_persists_then_resumes() {
     .expect("resume timed out")
     .expect("resume failed");
     let got = tokio::fs::read(&path).await.unwrap();
-    assert_eq!(sha256(&got), sha256(&data));
+    assert_eq!(content_hash(&got), content_hash(&data));
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -82,10 +81,9 @@ async fn delete_partial_clears_state() {
     let data = Arc::new(pseudo_random(MIN_CHUNK_SIZE as usize * 4, 0xBEEF));
     let mut reader = std::io::Cursor::new(data.as_slice());
     let chunker = FixedSizeChunker::new(MIN_CHUNK_SIZE);
-    let manifest =
-        Manifest::compute::<_, Sha256Digest>(&mut reader, &chunker, "blob-y", "d.bin", 1)
-            .await
-            .unwrap();
+    let manifest = Manifest::compute(&mut reader, &chunker, "blob-y", "d.bin", 1)
+        .await
+        .unwrap();
 
     let server = BlobServer::new(session.clone(), prefix.clone(), Format::Json);
     server

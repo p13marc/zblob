@@ -163,7 +163,6 @@ impl Chunker for FastCdcChunker {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::hash::{Digest, Sha256Digest};
 
     #[test]
     fn chunk_size_clamps() {
@@ -235,9 +234,7 @@ mod tests {
     }
 
     fn sha(data: &[u8]) -> crate::hash::Hash {
-        let mut d = Sha256Digest::default();
-        d.update(data);
-        d.finalize()
+        crate::hash::Hash::of(data)
     }
 
     /// FastCDC chunk-hash set over `data`.

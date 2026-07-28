@@ -100,12 +100,9 @@ impl ContentStore for DirStore {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::hash::{Digest, Sha256Digest};
 
     fn h(data: &[u8]) -> Hash {
-        let mut d = Sha256Digest::default();
-        d.update(data);
-        d.finalize()
+        Hash::of(data)
     }
 
     #[test]

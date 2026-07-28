@@ -6,10 +6,10 @@ mod common;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use common::{BytesSource, open_session, pseudo_random, sha256, unique_prefix};
+use common::{BytesSource, content_hash, open_session, pseudo_random, unique_prefix};
 use zblob::{
     BlobClient, BlobError, BlobServer, FixedSizeChunker, Format, MIN_CHUNK_SIZE, Manifest,
-    Progress, ProgressSink, Sha256Digest,
+    Progress, ProgressSink,
 };
 
 /// A progress sink that records every `Chunk` event's `received` counter.
@@ -37,10 +37,9 @@ async fn interrupt_then_resume() {
 
     let mut reader = std::io::Cursor::new(data.as_slice());
     let chunker = FixedSizeChunker::new(MIN_CHUNK_SIZE);
-    let manifest =
-        Manifest::compute::<_, Sha256Digest>(&mut reader, &chunker, "blob-r", "data.bin", 1)
-            .await
-            .unwrap();
+    let manifest = Manifest::compute(&mut reader, &chunker, "blob-r", "data.bin", 1)
+        .await
+        .unwrap();
     assert_eq!(manifest.chunk_count, 8);
 
     let server = BlobServer::new(session.clone(), prefix.clone(), Format::Json);
@@ -80,7 +79,7 @@ async fn interrupt_then_resume() {
 
     // Final bytes verify.
     let got = tokio::fs::read(&path).await.unwrap();
-    assert_eq!(sha256(&got), sha256(&data));
+    assert_eq!(content_hash(&got), content_hash(&data));
 
     // Resume pulled exactly the 3 missing chunks, and the first one bumped the
     // received counter to 6 (proving 5 were already on disk → `?from=5`).

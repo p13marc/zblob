@@ -1,23 +1,53 @@
-//! Content digests for blob integrity.
+//! Content hashing — BLAKE3, the crate-wide algorithm since v2.
 //!
-//! [`Digest`] is the pluggable hashing boundary; [`Sha256Digest`] is the default
-//! (R4). A future content-defined-chunking tier can swap in a different algorithm
-//! without touching the protocol — the algorithm name travels in the manifest.
+//! v1 shipped a nominally-pluggable `Digest` trait, but every code path
+//! hardcoded SHA-256, so v2 drops the pretense: BLAKE3 everywhere. What
+//! survives is *algorithm agility on the wire*: Tier-2 chunk keys carry an
+//! `<algo>` segment (`"blake3"` since v2), so stores populated by older
+//! producers under `sha256/…` keys coexist untouched next to `blake3/…` ones.
+//!
+//! Tier-1 blob identity is the BLAKE3 *bao root* (see [`crate::verify`]) —
+//! identical to `blake3::hash` of the content; the bao block size only affects
+//! slice/outboard granularity, never the root.
 
 use std::fmt;
 use std::str::FromStr;
 
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
-use sha2::Digest as _;
 
 /// A 32-byte content hash, rendered as lowercase hex on the wire and in keys.
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
-pub struct Hash(pub [u8; 32]);
+pub struct Hash([u8; 32]);
 
 impl Hash {
+    /// The wire/key name of the crate's hash algorithm.
+    pub const ALGO: &'static str = "blake3";
+
+    /// BLAKE3 hash of `data` in one shot.
+    pub fn of(data: &[u8]) -> Hash {
+        blake3::hash(data).into()
+    }
+
     /// The raw bytes.
     pub fn as_bytes(&self) -> &[u8; 32] {
         &self.0
+    }
+
+    /// Build a hash from raw bytes.
+    pub const fn from_bytes(bytes: [u8; 32]) -> Hash {
+        Hash(bytes)
+    }
+}
+
+impl From<blake3::Hash> for Hash {
+    fn from(h: blake3::Hash) -> Hash {
+        Hash(*h.as_bytes())
+    }
+}
+
+impl From<Hash> for blake3::Hash {
+    fn from(h: Hash) -> blake3::Hash {
+        blake3::Hash::from_bytes(h.0)
     }
 }
 
@@ -73,44 +103,40 @@ fn hex_val(c: u8) -> Option<u8> {
 
 impl Serialize for Hash {
     fn serialize<S: Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
-        s.serialize_str(&self.to_string())
+        if s.is_human_readable() {
+            s.serialize_str(&self.to_string())
+        } else {
+            s.serialize_bytes(&self.0)
+        }
     }
 }
 
 impl<'de> Deserialize<'de> for Hash {
     fn deserialize<D: Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
-        let s = String::deserialize(d)?;
-        s.parse().map_err(serde::de::Error::custom)
+        if d.is_human_readable() {
+            let s = String::deserialize(d)?;
+            s.parse().map_err(serde::de::Error::custom)
+        } else {
+            let bytes: [u8; 32] = serde_bytes_deserialize(d)?;
+            Ok(Hash(bytes))
+        }
     }
 }
 
-/// A streaming digest: feed bytes with [`Digest::update`], finish with
-/// [`Digest::finalize`]. `Default` constructs a fresh hasher.
-pub trait Digest: Default {
-    /// Absorb more input.
-    fn update(&mut self, data: &[u8]);
-    /// Consume the hasher and produce the final [`struct@Hash`].
-    fn finalize(self) -> Hash;
-    /// The wire/key name of this algorithm (e.g. `"sha256"`).
-    fn name() -> &'static str;
-}
-
-/// SHA-256, the default blob digest.
-#[derive(Default)]
-pub struct Sha256Digest(sha2::Sha256);
-
-impl Digest for Sha256Digest {
-    fn update(&mut self, data: &[u8]) {
-        self.0.update(data);
+/// Deserialize exactly 32 raw bytes (postcard/binary formats).
+fn serde_bytes_deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<[u8; 32], D::Error> {
+    struct V;
+    impl serde::de::Visitor<'_> for V {
+        type Value = [u8; 32];
+        fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            f.write_str("32 raw hash bytes")
+        }
+        fn visit_bytes<E: serde::de::Error>(self, v: &[u8]) -> Result<Self::Value, E> {
+            v.try_into()
+                .map_err(|_| E::invalid_length(v.len(), &"32 bytes"))
+        }
     }
-
-    fn finalize(self) -> Hash {
-        Hash(self.0.finalize().into())
-    }
-
-    fn name() -> &'static str {
-        "sha256"
-    }
+    d.deserialize_bytes(V)
 }
 
 #[cfg(test)]
@@ -118,34 +144,47 @@ mod tests {
     use super::*;
 
     #[test]
-    fn sha256_known_vector() {
-        // SHA-256("abc")
-        let mut d = Sha256Digest::default();
-        d.update(b"abc");
-        let h = d.finalize();
+    fn blake3_known_vector() {
+        // BLAKE3("abc") — official test vector.
+        let h = Hash::of(b"abc");
         assert_eq!(
             h.to_string(),
-            "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
+            "6437b3ac38465133ffb63b75273a8db548c558465d79db03fd359c6cd5bd9d85"
         );
     }
 
     #[test]
     fn hash_hex_roundtrip() {
-        let mut d = Sha256Digest::default();
-        d.update(b"abc");
-        let h = d.finalize();
+        let h = Hash::of(b"abc");
         let parsed: Hash = h.to_string().parse().unwrap();
         assert_eq!(h, parsed);
     }
 
     #[test]
-    fn hash_serde_is_hex_string() {
-        let mut d = Sha256Digest::default();
-        d.update(b"abc");
-        let h = d.finalize();
+    fn blake3_conversions_roundtrip() {
+        let b = blake3::hash(b"xyz");
+        let h: Hash = b.into();
+        let back: blake3::Hash = h.into();
+        assert_eq!(b, back);
+        assert_eq!(h.as_bytes(), b.as_bytes());
+    }
+
+    #[test]
+    fn human_readable_serde_is_hex_string() {
+        let h = Hash::of(b"abc");
         let json = serde_json::to_string(&h).unwrap();
-        assert!(json.starts_with('"') && json.contains("ba7816bf"));
+        assert!(json.starts_with('"') && json.contains("6437b3ac"));
         let back: Hash = serde_json::from_str(&json).unwrap();
+        assert_eq!(h, back);
+    }
+
+    #[test]
+    fn binary_serde_is_raw_bytes() {
+        let h = Hash::of(b"abc");
+        let bytes = postcard::to_stdvec(&h).unwrap();
+        // Length-prefixed 32 raw bytes, not 64 hex chars.
+        assert_eq!(bytes.len(), 33);
+        let back: Hash = postcard::from_bytes(&bytes).unwrap();
         assert_eq!(h, back);
     }
 
