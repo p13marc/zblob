@@ -1,0 +1,13 @@
+# cargo-audit policy. Every ignore must carry a justification and should be
+# re-evaluated whenever the `zenoh` dependency is bumped.
+[advisories]
+ignore = [
+    # lz4_flex 0.10 via zenoh-transport 1.9 (pins ^0.10; the fix is in the
+    # semver-incompatible 0.11.6+). Only reachable when Zenoh link compression
+    # is enabled in the session config — zblob does not enable it. Re-check on
+    # the next zenoh bump.
+    "RUSTSEC-2026-0041",
+    # rsa (Marvin timing sidechannel) via zenoh-transport's usrpwd/auth stack;
+    # no fixed release exists upstream. zblob does not use RSA-based auth.
+    "RUSTSEC-2023-0071",
+]
