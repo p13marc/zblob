@@ -12,32 +12,25 @@ use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt, SeekFrom};
 
 use crate::cancel::CancelToken;
 use crate::error::{BlobError, Result};
-use crate::format::{Format, decode};
 use crate::hash::Hash;
 use crate::manifest::Manifest;
 use crate::progress::{Progress, ProgressSink};
 use crate::resume::ResumeState;
+use crate::wire::decode;
 use crate::{chunk::Chunker, chunk::FixedSizeChunker, download_selector};
 
 /// Downloads blobs served by a [`crate::BlobServer`] under the same key prefix.
 pub struct BlobClient {
     session: Arc<zenoh::Session>,
     prefix: String,
-    format: Format,
 }
 
 impl BlobClient {
-    /// Build a client that downloads blobs under `key_prefix`, decoding the
-    /// manifest with `format`.
-    pub fn new(
-        session: Arc<zenoh::Session>,
-        key_prefix: impl Into<String>,
-        format: Format,
-    ) -> Self {
+    /// Build a client that downloads blobs under `key_prefix`.
+    pub fn new(session: Arc<zenoh::Session>, key_prefix: impl Into<String>) -> Self {
         BlobClient {
             session,
             prefix: key_prefix.into(),
-            format,
         }
     }
 
@@ -213,7 +206,7 @@ impl BlobClient {
         while let Ok(reply) = replies.recv_async().await {
             let Ok(sample) = reply.result() else { continue };
             if sample.key_expr().as_str().ends_with("/manifest") {
-                return decode(&sample.payload().to_bytes(), self.format);
+                return decode(&sample.payload().to_bytes());
             }
         }
         Err(BlobError::NotFound(id.to_string()))

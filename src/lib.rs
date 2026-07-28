@@ -47,7 +47,6 @@ mod cancel;
 mod chunk;
 mod client;
 mod error;
-mod format;
 mod hash;
 mod manifest;
 mod progress;
@@ -57,6 +56,7 @@ mod server;
 mod store;
 mod tree;
 mod verify;
+pub mod wire;
 
 pub use cancel::CancelToken;
 pub use chunk::{
@@ -65,7 +65,6 @@ pub use chunk::{
 };
 pub use client::BlobClient;
 pub use error::{BlobError, Result};
-pub use format::{Format, decode, encode};
 pub use hash::{Hash, HashParseError};
 pub use manifest::Manifest;
 pub use progress::{Progress, ProgressSink};

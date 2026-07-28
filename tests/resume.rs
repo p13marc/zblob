@@ -8,8 +8,8 @@ use std::time::Duration;
 
 use common::{BytesSource, content_hash, open_session, pseudo_random, unique_prefix};
 use zblob::{
-    BlobClient, BlobError, BlobServer, FixedSizeChunker, Format, MIN_CHUNK_SIZE, Manifest,
-    Progress, ProgressSink,
+    BlobClient, BlobError, BlobServer, FixedSizeChunker, MIN_CHUNK_SIZE, Manifest, Progress,
+    ProgressSink,
 };
 
 /// A progress sink that records every `Chunk` event's `received` counter.
@@ -42,7 +42,7 @@ async fn interrupt_then_resume() {
         .unwrap();
     assert_eq!(manifest.chunk_count, 8);
 
-    let server = BlobServer::new(session.clone(), prefix.clone(), Format::Json);
+    let server = BlobServer::new(session.clone(), prefix.clone());
     // Round 1: a truncated source → the server errors mid-stream after 5 chunks.
     server
         .register(manifest.clone(), Arc::new(BytesSource(truncated)))
@@ -50,7 +50,7 @@ async fn interrupt_then_resume() {
     tokio::spawn(server.clone().run());
     tokio::time::sleep(Duration::from_millis(150)).await;
 
-    let client = BlobClient::new(session.clone(), prefix.clone(), Format::Json);
+    let client = BlobClient::new(session.clone(), prefix.clone());
     let err = client
         .download("blob-r", dir.path(), &())
         .await

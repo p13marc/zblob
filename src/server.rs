@@ -12,8 +12,8 @@ use tokio::sync::{RwLock, Semaphore};
 
 use crate::chunk::{Chunker, FixedSizeChunker};
 use crate::error::{BlobError, Result};
-use crate::format::{Format, encode};
 use crate::manifest::Manifest;
+use crate::wire::encode;
 use crate::{chunk_key, manifest_key, parse_from, parse_id};
 
 /// Max concurrent in-flight transfers a single server will stream at once. This
@@ -65,7 +65,6 @@ struct Registered {
 struct Inner {
     session: Arc<zenoh::Session>,
     prefix: String,
-    format: Format,
     registry: RwLock<HashMap<String, Registered>>,
     inflight: Semaphore,
 }
@@ -77,18 +76,12 @@ pub struct BlobServer {
 }
 
 impl BlobServer {
-    /// Build a server that will serve blobs under `key_prefix`, encoding the
-    /// manifest with `format`.
-    pub fn new(
-        session: Arc<zenoh::Session>,
-        key_prefix: impl Into<String>,
-        format: Format,
-    ) -> Self {
+    /// Build a server that will serve blobs under `key_prefix`.
+    pub fn new(session: Arc<zenoh::Session>, key_prefix: impl Into<String>) -> Self {
         BlobServer {
             inner: Arc::new(Inner {
                 session,
                 prefix: key_prefix.into(),
-                format,
                 registry: RwLock::new(HashMap::new()),
                 inflight: Semaphore::new(MAX_INFLIGHT),
             }),
@@ -164,7 +157,7 @@ async fn serve_one(inner: &Inner, query: zenoh::query::Query) -> Result<()> {
     };
 
     // Manifest reply (always sent first).
-    let payload = encode(&manifest, inner.format)?;
+    let payload = encode(&manifest)?;
     query
         .reply(manifest_key(&inner.prefix, &id), payload)
         .await

@@ -8,8 +8,8 @@ use std::time::Duration;
 
 use common::{BytesSource, open_session, pseudo_random, unique_prefix};
 use zblob::{
-    BlobClient, BlobError, BlobServer, Chunker, FixedSizeChunker, Format, MIN_CHUNK_SIZE, Manifest,
-    chunk_key, encode, manifest_key,
+    BlobClient, BlobError, BlobServer, Chunker, FixedSizeChunker, MIN_CHUNK_SIZE, Manifest,
+    chunk_key, manifest_key, wire::encode,
 };
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -31,14 +31,14 @@ async fn corrupted_bytes_fail_hash() {
         .await
         .unwrap();
 
-    let server = BlobServer::new(session.clone(), prefix.clone(), Format::Json);
+    let server = BlobServer::new(session.clone(), prefix.clone());
     server
         .register(manifest, Arc::new(BytesSource(Arc::new(corrupted))))
         .await;
     tokio::spawn(server.run());
     tokio::time::sleep(Duration::from_millis(150)).await;
 
-    let client = BlobClient::new(session.clone(), prefix.clone(), Format::Json);
+    let client = BlobClient::new(session.clone(), prefix.clone());
     let err = client
         .download("blob-t", dir.path(), &())
         .await
@@ -79,10 +79,7 @@ async fn wrong_length_chunk_rejected() {
             let key = query.key_expr().as_str().to_string();
             let id = &manifest_c.id;
             let _ = query
-                .reply(
-                    manifest_key(&prefix_c, id),
-                    encode(&manifest_c, Format::Json).unwrap(),
-                )
+                .reply(manifest_key(&prefix_c, id), encode(&manifest_c).unwrap())
                 .await;
             if key.ends_with("/manifest") {
                 continue;
@@ -100,7 +97,7 @@ async fn wrong_length_chunk_rejected() {
     });
     tokio::time::sleep(Duration::from_millis(150)).await;
 
-    let client = BlobClient::new(session.clone(), prefix.clone(), Format::Json);
+    let client = BlobClient::new(session.clone(), prefix.clone());
     let err = client
         .download("blob-c", dir.path(), &())
         .await

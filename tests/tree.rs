@@ -12,8 +12,7 @@ use std::sync::Mutex;
 
 use zblob::{
     BlobError, CancelToken, ContentStore, DirStore, Entry, FastCdcChunker, FixedSizeChunker,
-    Format, MIN_CHUNK_SIZE, MemoryStore, Progress, ProgressSink, TreeClient, TreeServer,
-    build_tree,
+    MIN_CHUNK_SIZE, MemoryStore, Progress, ProgressSink, TreeClient, TreeServer, build_tree,
 };
 
 /// Populate a temp directory tree: a nested dir, two files (one large enough to
@@ -71,7 +70,7 @@ async fn serve(
     store: Arc<dyn ContentStore>,
     index: zblob::TreeIndex,
 ) -> tokio::task::JoinHandle<()> {
-    let server = TreeServer::new(session, store_prefix, tree_prefix, Format::Json, store);
+    let server = TreeServer::new(session, store_prefix, tree_prefix, store);
     server.register(index).await;
     let handle = tokio::spawn(async move {
         let _ = server.run().await;
@@ -111,7 +110,7 @@ async fn tree_roundtrip() {
 
     // Download into an empty client store + fresh dest dir.
     let client_dir = tempfile::tempdir().unwrap();
-    let client = TreeClient::new(session.clone(), store_prefix, tree_prefix, Format::Json);
+    let client = TreeClient::new(session.clone(), store_prefix, tree_prefix);
     let client_store = MemoryStore::new();
     client
         .download_tree("snap1", client_dir.path(), &client_store)
@@ -176,7 +175,7 @@ async fn tree_roundtrip_fastcdc() {
     .await;
 
     let client_dir = tempfile::tempdir().unwrap();
-    let client = TreeClient::new(session.clone(), store_prefix, tree_prefix, Format::Json);
+    let client = TreeClient::new(session.clone(), store_prefix, tree_prefix);
     let client_store = MemoryStore::new();
     client
         .download_tree("snap1", client_dir.path(), &client_store)
@@ -210,7 +209,6 @@ async fn reedit_transfers_only_changed_chunks() {
         session.clone(),
         store_prefix.clone(),
         tree_prefix.clone(),
-        Format::Json,
         server_store.clone(),
     );
     server.register(index1).await;
@@ -226,12 +224,7 @@ async fn reedit_transfers_only_changed_chunks() {
     // Persistent client store survives "across syncs" (DirStore on disk).
     let store_dir = tempfile::tempdir().unwrap();
     let client_store = DirStore::open(store_dir.path()).unwrap();
-    let client = TreeClient::new(
-        session.clone(),
-        store_prefix.clone(),
-        tree_prefix.clone(),
-        Format::Json,
-    );
+    let client = TreeClient::new(session.clone(), store_prefix.clone(), tree_prefix.clone());
     client
         .download_tree("snap1", client_dir.path(), &client_store)
         .await
@@ -319,7 +312,7 @@ async fn resume_from_prepopulated_store() {
 
     // Resume: download_tree fetches only the missing remainder.
     let client_dir = tempfile::tempdir().unwrap();
-    let client = TreeClient::new(session.clone(), store_prefix, tree_prefix, Format::Json);
+    let client = TreeClient::new(session.clone(), store_prefix, tree_prefix);
     client
         .download_tree("snap1", client_dir.path(), &client_store)
         .await
@@ -371,12 +364,7 @@ async fn cancellable_reports_progress_and_resumes() {
     )
     .await;
 
-    let client = TreeClient::new(
-        session.clone(),
-        store_prefix.clone(),
-        tree_prefix.clone(),
-        Format::Json,
-    );
+    let client = TreeClient::new(session.clone(), store_prefix.clone(), tree_prefix.clone());
 
     // 1) Cancel after the first chunk: the call returns Cancelled and the store is
     //    left with whatever it fetched, so a resume can finish.

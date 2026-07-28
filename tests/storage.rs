@@ -17,7 +17,7 @@ use std::time::Duration;
 
 use common::{isolated_config, unique_prefix};
 use zblob::{
-    FixedSizeChunker, Format, MIN_CHUNK_SIZE, MemoryStore, TreeClient, build_tree, publish_snapshot,
+    FixedSizeChunker, MIN_CHUNK_SIZE, MemoryStore, TreeClient, build_tree, publish_snapshot,
 };
 
 /// A minimal stand-in for `zenoh-plugin-storage-manager`: retain PUTs on a key
@@ -74,23 +74,16 @@ async fn publish_to_storage_then_download_without_server() {
 
     let chunker = FixedSizeChunker::new(MIN_CHUNK_SIZE);
     let (index, chunks) = build_tree(src.path(), "snap1", &chunker).unwrap();
-    publish_snapshot(
-        &session,
-        &store_prefix,
-        &tree_prefix,
-        &index,
-        chunks,
-        Format::Json,
-    )
-    .await
-    .expect("publish snapshot");
+    publish_snapshot(&session, &store_prefix, &tree_prefix, &index, chunks)
+        .await
+        .expect("publish snapshot");
 
     // Let the storage capture every PUT, then the producer is "gone": no
     // TreeServer is ever spawned — only the storage answers from here on.
     tokio::time::sleep(Duration::from_millis(200)).await;
 
     let client_dir = tempfile::tempdir().unwrap();
-    let client = TreeClient::new(session.clone(), store_prefix, tree_prefix, Format::Json);
+    let client = TreeClient::new(session.clone(), store_prefix, tree_prefix);
     let client_store = MemoryStore::new();
     client
         .download_tree("snap1", client_dir.path(), &client_store)

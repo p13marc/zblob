@@ -16,10 +16,10 @@ use serde::{Deserialize, Serialize};
 use crate::cancel::CancelToken;
 use crate::chunk::Chunker;
 use crate::error::{BlobError, Result};
-use crate::format::{Format, decode, encode};
 use crate::hash::Hash;
 use crate::progress::{Progress, ProgressSink};
 use crate::store::ContentStore;
+use crate::wire::{decode, encode};
 use crate::{store_key, tree_key};
 
 /// A reference to one content-addressed chunk.
@@ -32,8 +32,11 @@ pub struct ChunkRef {
 }
 
 /// One entry in a tree snapshot (paths are relative, `/`-separated).
+///
+/// Serialized with serde's default (externally tagged / variant-indexed)
+/// representation — the internally-tagged form v1 used is not representable in
+/// postcard, which is not self-describing.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(tag = "kind", rename_all = "snake_case")]
 pub enum Entry {
     /// A directory.
     Dir {
@@ -250,7 +253,6 @@ pub struct TreeServer {
     session: Arc<zenoh::Session>,
     store_prefix: String,
     tree_prefix: String,
-    format: Format,
     store: Arc<dyn ContentStore>,
     index: Arc<tokio::sync::RwLock<std::collections::HashMap<String, TreeIndex>>>,
 }
@@ -262,14 +264,12 @@ impl TreeServer {
         session: Arc<zenoh::Session>,
         store_prefix: impl Into<String>,
         tree_prefix: impl Into<String>,
-        format: Format,
         store: Arc<dyn ContentStore>,
     ) -> Self {
         TreeServer {
             session,
             store_prefix: store_prefix.into(),
             tree_prefix: tree_prefix.into(),
-            format,
             store,
             index: Arc::new(tokio::sync::RwLock::new(std::collections::HashMap::new())),
         }
@@ -312,7 +312,7 @@ impl TreeServer {
                     let key = query.key_expr().as_str().to_string();
                     if let Some(id) = key.strip_prefix(&format!("{}/", self.tree_prefix))
                         && let Some(index) = self.index.read().await.get(id).cloned()
-                        && let Ok(payload) = encode(&index, self.format)
+                        && let Ok(payload) = encode(&index)
                     {
                         let _ = query.reply(query.key_expr().clone(), payload).await;
                     }
@@ -336,7 +336,6 @@ pub struct TreeClient {
     session: Arc<zenoh::Session>,
     store_prefix: String,
     tree_prefix: String,
-    format: Format,
 }
 
 impl TreeClient {
@@ -345,13 +344,11 @@ impl TreeClient {
         session: Arc<zenoh::Session>,
         store_prefix: impl Into<String>,
         tree_prefix: impl Into<String>,
-        format: Format,
     ) -> Self {
         TreeClient {
             session,
             store_prefix: store_prefix.into(),
             tree_prefix: tree_prefix.into(),
-            format,
         }
     }
 
@@ -361,7 +358,7 @@ impl TreeClient {
         let replies = self.session.get(&key).await.map_err(BlobError::zenoh)?;
         while let Ok(reply) = replies.recv_async().await {
             if let Ok(sample) = reply.result() {
-                return decode(&sample.payload().to_bytes(), self.format);
+                return decode(&sample.payload().to_bytes());
             }
         }
         Err(BlobError::NotFound(id.to_string()))

@@ -14,9 +14,9 @@
 use std::sync::Arc;
 
 use crate::error::{BlobError, Result};
-use crate::format::{Format, encode};
 use crate::hash::Hash;
 use crate::tree::TreeIndex;
+use crate::wire::encode;
 use crate::{store_key, tree_key};
 
 /// PUT one content-addressed chunk into the storage under `store_prefix`.
@@ -54,16 +54,15 @@ where
     Ok(())
 }
 
-/// PUT a tree index into the storage at `<tree_prefix>/<id>`, encoded with
-/// `format`. A [`crate::TreeClient`] with the matching `tree_prefix`/`format` then
-/// GETs it like any other index.
+/// PUT a tree index into the storage at `<tree_prefix>/<id>`. A
+/// [`crate::TreeClient`] with the matching `tree_prefix` then GETs it like any
+/// other index.
 pub async fn publish_index(
     session: &Arc<zenoh::Session>,
     tree_prefix: &str,
     index: &TreeIndex,
-    format: Format,
 ) -> Result<()> {
-    let payload = encode(index, format)?;
+    let payload = encode(index)?;
     session
         .put(tree_key(tree_prefix, &index.id), payload)
         .await
@@ -78,9 +77,8 @@ pub async fn publish_snapshot(
     tree_prefix: &str,
     index: &TreeIndex,
     chunks: Vec<(Hash, Vec<u8>)>,
-    format: Format,
 ) -> Result<()> {
     publish_chunks(session, store_prefix, chunks).await?;
-    publish_index(session, tree_prefix, index, format).await?;
+    publish_index(session, tree_prefix, index).await?;
     Ok(())
 }

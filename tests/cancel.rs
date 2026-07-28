@@ -8,8 +8,8 @@ use std::time::Duration;
 
 use common::{BytesSource, content_hash, open_session, pseudo_random, unique_prefix};
 use zblob::{
-    BlobClient, BlobError, BlobServer, CancelToken, FixedSizeChunker, Format, MIN_CHUNK_SIZE,
-    Manifest, Progress, ProgressSink,
+    BlobClient, BlobError, BlobServer, CancelToken, FixedSizeChunker, MIN_CHUNK_SIZE, Manifest,
+    Progress, ProgressSink,
 };
 
 /// Cancels the token after the first chunk is written.
@@ -39,14 +39,14 @@ async fn cancel_persists_then_resumes() {
         .await
         .unwrap();
 
-    let server = BlobServer::new(session.clone(), prefix.clone(), Format::Json);
+    let server = BlobServer::new(session.clone(), prefix.clone());
     server
         .register(manifest, Arc::new(BytesSource(data.clone())))
         .await;
     tokio::spawn(server.run());
     tokio::time::sleep(Duration::from_millis(150)).await;
 
-    let client = BlobClient::new(session.clone(), prefix.clone(), Format::Json);
+    let client = BlobClient::new(session.clone(), prefix.clone());
 
     // Cancel mid-transfer → Cancelled, partial persisted.
     let token = CancelToken::new();
@@ -85,14 +85,14 @@ async fn delete_partial_clears_state() {
         .await
         .unwrap();
 
-    let server = BlobServer::new(session.clone(), prefix.clone(), Format::Json);
+    let server = BlobServer::new(session.clone(), prefix.clone());
     server
         .register(manifest, Arc::new(BytesSource(data.clone())))
         .await;
     tokio::spawn(server.run());
     tokio::time::sleep(Duration::from_millis(150)).await;
 
-    let client = BlobClient::new(session.clone(), prefix.clone(), Format::Json);
+    let client = BlobClient::new(session.clone(), prefix.clone());
     let token = CancelToken::new();
     let sink = CancelAfterFirst {
         token: token.clone(),

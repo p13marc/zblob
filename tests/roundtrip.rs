@@ -9,9 +9,7 @@ use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use tokio::io::AsyncReadExt;
-use zblob::{
-    BlobClient, BlobServer, FileBlobSource, FixedSizeChunker, Format, MIN_CHUNK_SIZE, Manifest,
-};
+use zblob::{BlobClient, BlobServer, FileBlobSource, FixedSizeChunker, MIN_CHUNK_SIZE, Manifest};
 
 fn isolated_config() -> zenoh::Config {
     let mut config = zenoh::Config::default();
@@ -77,7 +75,7 @@ async fn roundtrip_multi_mb() {
     assert_eq!(manifest.chunk_count, 17);
 
     // Serve it.
-    let server = BlobServer::new(session.clone(), prefix.clone(), Format::Json);
+    let server = BlobServer::new(session.clone(), prefix.clone());
     server
         .register(manifest.clone(), Arc::new(FileBlobSource::new(&src_path)))
         .await;
@@ -85,7 +83,7 @@ async fn roundtrip_multi_mb() {
     tokio::time::sleep(Duration::from_millis(150)).await;
 
     // Download it.
-    let client = BlobClient::new(session.clone(), prefix, Format::Json);
+    let client = BlobClient::new(session.clone(), prefix);
     let dest = dir.path().join("dest");
     let got_path = tokio::time::timeout(
         Duration::from_secs(20),
