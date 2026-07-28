@@ -74,6 +74,18 @@ deployments fail closed instead of corrupting).
 - **Observability** (#32): `TransferStats` from every download, server
   `on_error` callbacks, optional `tracing` feature.
 
+### Content-addressed snapshots
+
+- `TreeIndex::keyed_by_root()` re-keys a snapshot by its own root hash, and
+  `DownloadRequest::by_root(root)` fetches one with the root as both key and
+  pin — so trust-on-first-use is not expressible for content-addressed trees
+  and a router storage's last-writer-wins reconciliation cannot lose
+  anything. Human snapshot names remain supported, with the documented
+  consequence that such a key means whatever its last writer said; the
+  recommended shape is a mutable name record pointing at an immutable root.
+  (The id is not part of the root digest, so re-keying never alters
+  identity.) This is the shape zenkey RFC 07 §2.3 now requires.
+
 ### Keyspace-convention alignment
 
 Checked against zenkey RFC 07 (`@blob`), which names zblob as its reference

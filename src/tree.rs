@@ -8,6 +8,17 @@
 //! are on disk", a dropped connection or a process restart loses nothing, and
 //! identical chunks across files/versions transfer once.
 //!
+//! **Naming.** A snapshot's `id` is a key segment the caller chooses. Prefer
+//! [`TreeIndex::keyed_by_root`] — keying a snapshot by its own root hash makes
+//! the key immutable (so any holder's copy is as good as any other's, and
+//! re-publishing is a no-op) and makes
+//! [`DownloadRequest::by_root`](crate::DownloadRequest::by_root) pin
+//! automatically. Human names ("nightly") are mutable facts; publish them
+//! wherever the application keeps mutable state, pointing at the current root,
+//! and resolve in two hops. A caller-chosen name is still supported for
+//! deployments that want it, with the usual consequence: the key means
+//! whatever its last writer said.
+//!
 //! Security model (v2): the index is attacker input until proven otherwise.
 //! Every path is sanitized (relative, `Normal` components only), symlinks are
 //! materialized **last** and their targets confined to the tree, file parents
@@ -222,6 +233,37 @@ impl TreeIndex {
     /// Recompute the canonical root digest over `entries`.
     pub fn compute_root(&self) -> Result<Hash> {
         root_digest(&self.entries)
+    }
+
+    /// Re-key this snapshot by its own root hash, so the key it is served
+    /// under *is* its identity (`<tree_prefix>/<root>`).
+    ///
+    /// This is the content-addressed shape a keyspace convention wants for
+    /// bulk data, and it is what makes a tree key behave like a chunk key:
+    /// immutable, so any holder's copy is as good as any other's, so
+    /// re-publishing is a no-op and a router storage's last-writer-wins
+    /// reconciliation cannot lose anything. It also removes
+    /// trust-on-first-use for free — a consumer that asks for a root already
+    /// stated the identity it demands, so
+    /// [`DownloadRequest::by_root`](crate::DownloadRequest::by_root) pins
+    /// automatically.
+    ///
+    /// The trade is that a *name* ("nightly") is no longer a key here. Names
+    /// are mutable facts and belong wherever the application publishes
+    /// mutable state — a small record pointing at the current root. The
+    /// consumer then resolves in two hops: name → root, then fetch the root.
+    ///
+    /// The id is not part of the root digest, so re-keying never invalidates
+    /// the index.
+    pub fn keyed_by_root(mut self) -> Self {
+        self.id = self.root_hash.to_string();
+        self
+    }
+
+    /// Whether this index is keyed by its own root (see
+    /// [`keyed_by_root`](Self::keyed_by_root)).
+    pub fn is_content_addressed(&self) -> bool {
+        self.id == self.root_hash.to_string()
     }
 
     /// Validate an index received from the network: schema version, algorithm,

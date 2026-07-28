@@ -135,6 +135,20 @@ impl DownloadRequest {
             expected_root: Some(root),
         }
     }
+
+    /// Fetch a **content-addressed** artifact: the id *is* the root, so the
+    /// request is pinned by construction and trust-on-first-use is not
+    /// expressible.
+    ///
+    /// This is the natural request shape for a Tier-2 snapshot re-keyed with
+    /// [`TreeIndex::keyed_by_root`](crate::TreeIndex::keyed_by_root), and for
+    /// any deployment that names blobs by their content hash.
+    pub fn by_root(root: Hash) -> Self {
+        DownloadRequest {
+            id: root.to_string(),
+            expected_root: Some(root),
+        }
+    }
 }
 
 /// Downloads blobs served by a [`crate::BlobServer`] under the same key prefix.

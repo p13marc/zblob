@@ -682,3 +682,73 @@ fn non_utf8_names_error_on_build() {
     let err = build_tree(src.path(), "bad", &small_cdc(), &store).expect_err("must error");
     assert!(err.to_string().contains("non-UTF-8"), "{err}");
 }
+
+/// The content-addressed snapshot shape: a tree re-keyed by its own root is
+/// fetched with the root as both the key and the pin, so a substituted index
+/// cannot even be requested — trust-on-first-use is not expressible.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn content_addressed_trees_pin_by_construction() {
+    let session = common::open_session().await;
+    let p = unique_prefix();
+    let store_prefix = format!("{p}/store");
+    let tree_prefix = format!("{p}/tree");
+
+    let src = tempfile::tempdir().unwrap();
+    make_tree(src.path());
+
+    let server_store: Arc<dyn ContentStore> = Arc::new(MemoryStore::new());
+    // Build under a human name, then re-key by root — the id is not part of
+    // the root digest, so the identity is unchanged by the rename.
+    let named = build_tree(src.path(), "nightly", &small_cdc(), &*server_store).unwrap();
+    let index = named.clone().keyed_by_root();
+    assert_eq!(
+        index.root_hash, named.root_hash,
+        "re-keying must not alter identity"
+    );
+    assert!(index.is_content_addressed());
+    assert!(!named.is_content_addressed());
+    let root = index.root_hash;
+
+    let server = TreeServer::new(
+        session.clone(),
+        store_prefix.clone(),
+        tree_prefix.clone(),
+        server_store,
+    );
+    server.register(index).await;
+    let handle = server.spawn().await.unwrap();
+
+    // One value carries both the key and the pin.
+    let dest = tempfile::tempdir().unwrap();
+    let client = test_client(session.clone(), &store_prefix, &tree_prefix);
+    let store: Arc<dyn ContentStore> = Arc::new(MemoryStore::new());
+    client
+        .download_tree(
+            &DownloadRequest::by_root(root),
+            dest.path(),
+            &store,
+            &(),
+            &CancelToken::new(),
+        )
+        .await
+        .expect("content-addressed fetch");
+    assert_dirs_equal(src.path(), dest.path());
+
+    // Asking for a root nobody serves fails; it cannot silently resolve to
+    // some other snapshot the way a name could.
+    let other = zblob::Hash::of(b"a tree that does not exist here");
+    let err = client
+        .download_tree(
+            &DownloadRequest::by_root(other),
+            dest.path(),
+            &store,
+            &(),
+            &CancelToken::new(),
+        )
+        .await
+        .expect_err("unknown root must not resolve");
+    assert!(matches!(err, BlobError::NotFound(_)), "{err}");
+
+    handle.shutdown().await.unwrap();
+    session.close().await.unwrap();
+}
