@@ -203,7 +203,34 @@ impl DirStore {
 
 impl ContentStore for DirStore {
     fn has(&self, hash: &Hash) -> bool {
-        self.path(hash).exists()
+        // Presence must mean "get() can decode this" for *format* reasons, or
+        // a sealed/compressed store opened without the matching feature/key
+        // would skip fetching chunks it can never read (a permanently wedged
+        // download). One-byte header sniff keeps this cheap; content-level
+        // rot detection remains verify_on_read/scrub territory.
+        use std::io::Read;
+        let Ok(mut f) = std::fs::File::open(self.path(hash)) else {
+            return false;
+        };
+        let mut tag = [0u8; 1];
+        if f.read_exact(&mut tag).is_err() {
+            // Zero-length file: only valid as a raw frame of nothing — never
+            // produced; treat as missing so it gets re-fetched.
+            return false;
+        }
+        match tag[0] {
+            TAG_SEALED => {
+                #[cfg(feature = "encryption")]
+                {
+                    self.encryption.is_some()
+                }
+                #[cfg(not(feature = "encryption"))]
+                {
+                    false
+                }
+            }
+            _ => true, // raw always readable; zstd readability checked by get
+        }
     }
 
     fn get(&self, hash: &Hash) -> Option<Vec<u8>> {

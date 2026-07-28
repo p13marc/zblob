@@ -209,3 +209,82 @@ async fn concurrent_downloads_to_different_destinations() {
     handle.shutdown().await.unwrap();
     session.close().await.unwrap();
 }
+
+/// `download_to_writer` fills an in-memory cursor with verified bytes — no
+/// `.part`, no sidecar.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn download_to_writer_roundtrip() {
+    let session = open_session().await;
+    let prefix = unique_prefix();
+
+    let data = pseudo_random(MIN_CHUNK_SIZE as usize * 2 + 500, 54);
+    let server = BlobServer::new(session.clone(), prefix.clone());
+    let manifest = server
+        .register_source(
+            BlobSpec::new("wr").chunk_size(MIN_CHUNK_SIZE),
+            Arc::new(MemoryBlobSource::new(data.clone())),
+        )
+        .await
+        .unwrap();
+    let handle = server.spawn().await.unwrap();
+
+    let client = test_client(session.clone(), &prefix);
+    let mut cursor = std::io::Cursor::new(Vec::new());
+    let stats = client
+        .download_to_writer(
+            &DownloadRequest::pinned("wr", manifest.root),
+            &mut cursor,
+            &(),
+            &CancelToken::new(),
+        )
+        .await
+        .expect("writer download");
+    assert_eq!(cursor.into_inner(), data);
+    assert_eq!(stats.chunks_fetched, 3);
+
+    handle.shutdown().await.unwrap();
+    session.close().await.unwrap();
+}
+
+/// A tiny `outboard_mem_limit` forces `register_file` to spill the outboard
+/// to a sibling `.obao4` file; serving from it must still verify end to end.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn file_outboard_spill_roundtrip() {
+    let session = open_session().await;
+    let prefix = unique_prefix();
+
+    let data = pseudo_random(MIN_CHUNK_SIZE as usize * 5 + 3, 55);
+    let src = tempfile::tempdir().unwrap();
+    let src_path = src.path().join("spill.bin");
+    std::fs::write(&src_path, &data).unwrap();
+
+    let server = BlobServer::builder(session.clone(), prefix.clone())
+        .outboard_mem_limit(0) // force the file-backed outboard path
+        .build();
+    let manifest = server
+        .register_file(BlobSpec::new("spill").chunk_size(MIN_CHUNK_SIZE), &src_path)
+        .await
+        .expect("register");
+    assert!(
+        src.path().join("spill.bin.obao4").exists(),
+        "outboard must be spilled to the sibling file"
+    );
+    let handle = server.spawn().await.unwrap();
+
+    let dir = tempfile::tempdir().unwrap();
+    let dest = dir.path().join("out.bin");
+    let client = test_client(session.clone(), &prefix);
+    client
+        .download_to(
+            &DownloadRequest::pinned("spill", manifest.root),
+            &dest,
+            &(),
+            &CancelToken::new(),
+        )
+        .await
+        .expect("download from file outboard");
+    assert_eq!(std::fs::read(&dest).unwrap(), data);
+
+    handle.shutdown().await.unwrap();
+    session.close().await.unwrap();
+}

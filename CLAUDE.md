@@ -79,22 +79,28 @@ All key expressions are built through the helpers in `lib.rs` (`manifest_key`,
 `slice_key`, `slice_selector`, `availability_key`, `push_*_key`, `store_key`,
 `tree_key`, `parse_id`, `parse_ranges`) — don't format keys ad hoc.
 
-### Two Zenoh facts the design relies on (from `lib.rs`)
+### Three facts the design relies on (from `lib.rs`)
 
-1. **Backpressure is automatic.** `Session::get` defaults to
+1. **Backpressure is automatic on queries.** `Session::get` defaults to
    `CongestionControl::Block` and replies inherit it. The crate deliberately
-   sets no congestion control and does not enable Zenoh's `internal` feature —
-   do not "fix" this by enabling it. (Reply *consolidation* is different:
-   clients set `ConsolidationMode::None` so replies stream.)
+   sets no congestion control on queries and does not enable Zenoh's
+   `internal` feature — do not "fix" this by enabling it. (Reply
+   *consolidation* is different: clients set `ConsolidationMode::None` so
+   replies stream. **Publications default to `Drop`**, so the `fanout` tier
+   sets `Block` explicitly.)
 2. **Reply keys must match the query.** Clients must GET the `<prefix>/<id>/**`
    wildcard or slice replies are silently rejected
    (`ReplyKeyExpr::MatchingQuery`). `slice_selector` enforces this.
+3. **Any peer can answer.** Unacceptable replies (bad decode, failed
+   validation, wrong id, wrong pinned root) are skipped, never fatal — one
+   hostile or stale responder must not deny a fetch an honest replica
+   answers. Keep this property when touching any `fetch_*` loop.
 
 ## Tests
 
 Integration tests live in `tests/`, one file per concern (roundtrip, resume,
 cancel, tamper, tree, tree_security, storage, push, multisource, coverage,
-minifuzz, fanout). Shared helpers are in `tests/common/mod.rs`:
+minifuzz, compression, fanout). Shared helpers are in `tests/common/mod.rs`:
 `open_session()` opens an isolated in-process session with scouting disabled
 (the loopback pattern — tests must not discover each other or the LAN),
 `unique_prefix()` namespaces keys per test, `pseudo_random()` gives
@@ -112,3 +118,7 @@ are started with `spawn().await` (queryables are declared before it returns)
   design invariants live only there — read them before changing behavior).
 - Wire changes bump `WIRE_VERSION` (postcard is positional — schema shape
   changes are otherwise silent corruption).
+- `#![warn(missing_docs)]` is on: every public item needs a doc comment.
+- Test fake-servers must frame chunk payloads in a container (`0x00` + bytes)
+  like a real server, or the client rejects them before the code under test
+  runs and the test passes for the wrong reason.

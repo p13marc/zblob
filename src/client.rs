@@ -214,6 +214,20 @@ impl BlobClient {
     /// Fetch and validate just the manifest for blob `id` — probe existence,
     /// size, and root before committing to a download.
     pub async fn fetch_manifest(&self, id: &str) -> Result<Manifest> {
+        self.fetch_manifest_matching(id, None).await
+    }
+
+    /// Like [`fetch_manifest`](Self::fetch_manifest), but with multi-responder
+    /// resilience: a malformed, invalid, mismatched-id, or (when pinned)
+    /// wrong-root reply is *skipped*, not fatal — one hostile or stale
+    /// responder must not be able to deny a fetch that an honest replica
+    /// still answers. The first rejection is kept for diagnostics if nobody
+    /// acceptable replies.
+    async fn fetch_manifest_matching(
+        &self,
+        id: &str,
+        expected_root: Option<Hash>,
+    ) -> Result<Manifest> {
         validate_id(id)?;
         let key = manifest_key(&self.prefix, id);
         let replies = self
@@ -223,22 +237,40 @@ impl BlobClient {
             .timeout(self.cfg.query_timeout)
             .await
             .map_err(BlobError::zenoh)?;
+        let mut rejected: Option<BlobError> = None;
         while let Ok(reply) = replies.recv_async().await {
             let Ok(sample) = reply.result() else { continue };
             if sample.encoding().to_string() != ENC_MANIFEST {
                 continue; // stale/foreign responder; keep listening.
             }
-            let manifest: Manifest = decode(&sample.payload().to_bytes())?;
-            manifest.validate(self.cfg.max_blob_size)?;
-            if manifest.id != id {
-                return Err(BlobError::Protocol(format!(
-                    "manifest id {:?} does not match requested {id:?}",
-                    manifest.id
-                )));
+            let verdict = decode::<Manifest>(&sample.payload().to_bytes())
+                .and_then(|m| m.validate(self.cfg.max_blob_size).map(|()| m))
+                .and_then(|m| {
+                    if m.id != id {
+                        return Err(BlobError::Protocol(format!(
+                            "manifest id {:?} does not match requested {id:?}",
+                            m.id
+                        )));
+                    }
+                    if let Some(expected) = expected_root
+                        && m.root != expected
+                    {
+                        return Err(BlobError::RootMismatch {
+                            expected,
+                            actual: m.root,
+                        });
+                    }
+                    Ok(m)
+                });
+            match verdict {
+                Ok(manifest) => return Ok(manifest),
+                Err(e) => {
+                    zdebug!(id, error = %e, "skipping unacceptable manifest reply");
+                    rejected.get_or_insert(e);
+                }
             }
-            return Ok(manifest);
         }
-        Err(BlobError::NotFound(id.to_string()))
+        Err(rejected.unwrap_or_else(|| BlobError::NotFound(id.to_string())))
     }
 
     /// Download a blob to the file at `dest` (written via `<dest>.part` + a
@@ -289,8 +321,10 @@ impl BlobClient {
             if sample.encoding().to_string() != ENC_AVAIL {
                 continue;
             }
-            let avail: Availability = decode(&sample.payload().to_bytes())?;
-            if avail.version == crate::wire::WIRE_VERSION {
+            // A malformed reply from one responder must not hide the others.
+            if let Ok(avail) = decode::<Availability>(&sample.payload().to_bytes())
+                && avail.version == crate::wire::WIRE_VERSION
+            {
                 out.push(avail);
             }
         }
@@ -380,7 +414,20 @@ impl BlobClient {
         let wanted = wanted
             .ok_or_else(|| BlobError::PushDenied("no push endpoint answered the offer".into()))?;
 
+        // The offer reply is attacker input like everything else off the wire:
+        // enforce sorted, disjoint, in-bounds, non-empty spans *before* any
+        // arithmetic — a hostile responder must not be able to drive an
+        // underflow or an out-of-range slice encoding.
         let count = chunks.count();
+        let mut prev_end = 0u32;
+        for &(a, b) in &wanted {
+            if a < prev_end || a >= b || b > count {
+                return Err(BlobError::Protocol(format!(
+                    "push offer replied malformed wanted ranges ({a}, {b}) for {count} chunks"
+                )));
+            }
+            prev_end = b;
+        }
         let to_send: u32 = wanted.iter().map(|(a, b)| b - a).sum();
         if to_send < count {
             sink.emit(Progress::Resumed {
@@ -475,6 +522,58 @@ impl BlobClient {
         Ok(manifest)
     }
 
+    /// Download a blob into any seekable async writer (a `tokio::fs::File`
+    /// opened with custom options, an in-memory `Cursor`, …). Verified leaves
+    /// are written at their blob offsets exactly like
+    /// [`download_to`](Self::download_to), but **without resume**: no `.part`,
+    /// no sidecar — an interrupted call must start over, and the writer must
+    /// be sized/seekable for the whole blob. Emits `Started`/`Chunk` progress;
+    /// the `Ok` return is completion.
+    pub async fn download_to_writer<W>(
+        &self,
+        req: &DownloadRequest,
+        writer: &mut W,
+        sink: &dyn ProgressSink,
+        cancel: &CancelToken,
+    ) -> Result<TransferStats>
+    where
+        W: tokio::io::AsyncWrite + tokio::io::AsyncSeek + Unpin + Send,
+    {
+        let started_at = tokio::time::Instant::now();
+        let (manifest, chunks) = self.start(req).await?;
+        let count = chunks.count();
+        zdebug!(id = %manifest.id, total_len = manifest.total_len, chunks = count, "writer download start");
+        sink.emit(Progress::Started {
+            total_len: manifest.total_len,
+            chunk_count: count,
+        });
+
+        let mut state = ResumeState::fresh(&manifest, count);
+        let mut stats = TransferStats::default();
+        let mut target = WriterTarget(writer);
+        let result = self
+            .fill_holes(
+                &manifest,
+                &chunks,
+                &mut target,
+                &mut state,
+                None,
+                sink,
+                cancel,
+                &mut stats,
+            )
+            .await;
+        match &result {
+            Err(BlobError::Cancelled { .. }) | Ok(_) => {}
+            Err(e) => sink.emit(Progress::Failed {
+                error: e.to_string(),
+            }),
+        }
+        result?;
+        stats.elapsed = started_at.elapsed();
+        Ok(stats)
+    }
+
     async fn download_to_inner(
         &self,
         req: &DownloadRequest,
@@ -530,7 +629,14 @@ impl BlobClient {
             ..Default::default()
         };
         self.fill_holes(
-            &manifest, &chunks, &mut file, &mut state, &part, sink, cancel, &mut stats,
+            &manifest,
+            &chunks,
+            &mut file,
+            &mut state,
+            Some(&part),
+            sink,
+            cancel,
+            &mut stats,
         )
         .await?;
 
@@ -551,17 +657,12 @@ impl BlobClient {
         Ok(stats)
     }
 
-    /// Fetch + validate the manifest and enforce root pinning.
+    /// Fetch + validate the manifest and enforce root pinning (pinning is
+    /// applied per reply, so a wrong-root responder cannot mask a right one).
     async fn start(&self, req: &DownloadRequest) -> Result<(Manifest, TransferChunks)> {
-        let manifest = self.fetch_manifest(&req.id).await?;
-        if let Some(expected) = req.expected_root
-            && manifest.root != expected
-        {
-            return Err(BlobError::RootMismatch {
-                expected,
-                actual: manifest.root,
-            });
-        }
+        let manifest = self
+            .fetch_manifest_matching(&req.id, req.expected_root)
+            .await?;
         // An empty blob carries no slices, so nothing later proves the root;
         // check it here or a server could serve "verified" emptiness.
         if manifest.total_len == 0 && manifest.root != Hash::of(b"") {
@@ -576,14 +677,16 @@ impl BlobClient {
 
     /// The retry/resume loop: query the bitfield's holes until full or out of
     /// attempts. Progress ≡ the bitfield, so resume and retry are one path.
+    /// `part` enables sidecar persistence (file downloads); `None` keeps the
+    /// bitfield purely in memory (writer downloads).
     #[allow(clippy::too_many_arguments)]
-    async fn fill_holes(
+    async fn fill_holes<T: SliceTarget>(
         &self,
         manifest: &Manifest,
         chunks: &TransferChunks,
-        file: &mut tokio::fs::File,
+        file: &mut T,
         state: &mut ResumeState,
-        part: &Path,
+        part: Option<&Path>,
         sink: &dyn ProgressSink,
         cancel: &CancelToken,
         stats: &mut TransferStats,
@@ -600,7 +703,7 @@ impl BlobClient {
 
         while !state.is_complete(count) {
             if cancel.is_cancelled() {
-                return self.persist_cancel(file, state, part, sink, count).await;
+                return Self::persist_cancel(file, state, part, sink, count).await;
             }
 
             // Take as many holes as one query may carry.
@@ -627,7 +730,7 @@ impl BlobClient {
             while let Ok(reply) = replies.recv_async().await {
                 if cancel.is_cancelled() {
                     drop(replies);
-                    return self.persist_cancel(file, state, part, sink, count).await;
+                    return Self::persist_cancel(file, state, part, sink, count).await;
                 }
                 let Ok(sample) = reply.result() else { continue };
                 if sample.encoding().to_string() != ENC_SLICE {
@@ -660,8 +763,7 @@ impl BlobClient {
                     continue;
                 }
                 for (off, data) in leaves {
-                    file.seek(SeekFrom::Start(off)).await?;
-                    file.write_all(&data).await?;
+                    file.write_leaf(off, &data).await?;
                 }
                 if state.mark(index) {
                     bytes_received += chunks.len_of(index) as u64;
@@ -674,10 +776,12 @@ impl BlobClient {
                         total: count,
                         bytes_received,
                     });
-                    // Batched persistence: data first (sync_data), then bits —
+                    // Batched persistence: data first (commit), then bits —
                     // bits must never claim data the OS hasn't received.
-                    if marks_since_save >= 64 || last_save.elapsed() > Duration::from_secs(2) {
-                        file.sync_data().await?;
+                    if let Some(part) = part
+                        && (marks_since_save >= 64 || last_save.elapsed() > Duration::from_secs(2))
+                    {
+                        file.commit().await?;
                         state.save_atomic(part).await?;
                         marks_since_save = 0;
                         last_save = tokio::time::Instant::now();
@@ -693,8 +797,10 @@ impl BlobClient {
                 stats.retries += 1;
                 zdebug!(id = %manifest.id, attempt = no_progress, "no progress; backing off");
                 if no_progress >= self.cfg.retry.max_attempts {
-                    file.sync_data().await?;
-                    state.save_atomic(part).await?;
+                    file.commit().await?;
+                    if let Some(part) = part {
+                        state.save_atomic(part).await?;
+                    }
                     return Err(BlobError::Incomplete {
                         received: state.received(),
                         total: count,
@@ -706,21 +812,24 @@ impl BlobClient {
             }
         }
 
-        file.sync_data().await?;
-        state.save_atomic(part).await?;
+        file.commit().await?;
+        if let Some(part) = part {
+            state.save_atomic(part).await?;
+        }
         Ok(())
     }
 
-    async fn persist_cancel(
-        &self,
-        file: &mut tokio::fs::File,
+    async fn persist_cancel<T: SliceTarget>(
+        file: &mut T,
         state: &ResumeState,
-        part: &Path,
+        part: Option<&Path>,
         sink: &dyn ProgressSink,
         count: u32,
     ) -> Result<()> {
-        file.sync_data().await?;
-        state.save_atomic(part).await?;
+        file.commit().await?;
+        if let Some(part) = part {
+            state.save_atomic(part).await?;
+        }
         sink.emit(Progress::Cancelled {
             received: state.received(),
             total: count,
@@ -729,6 +838,45 @@ impl BlobClient {
             received: state.received(),
             total: count,
         })
+    }
+}
+
+/// Where verified leaves land: a positional write plus a durability point.
+trait SliceTarget: Send {
+    /// Write verified bytes at their blob offset.
+    async fn write_leaf(&mut self, offset: u64, data: &[u8]) -> Result<()>;
+    /// Make everything written so far durable/visible (fsync for files,
+    /// flush for writers).
+    async fn commit(&mut self) -> Result<()>;
+}
+
+impl SliceTarget for tokio::fs::File {
+    async fn write_leaf(&mut self, offset: u64, data: &[u8]) -> Result<()> {
+        self.seek(SeekFrom::Start(offset)).await?;
+        self.write_all(data).await?;
+        Ok(())
+    }
+    async fn commit(&mut self) -> Result<()> {
+        self.sync_data().await?;
+        Ok(())
+    }
+}
+
+/// Adapter for [`BlobClient::download_to_writer`].
+struct WriterTarget<'a, W>(&'a mut W);
+
+impl<W> SliceTarget for WriterTarget<'_, W>
+where
+    W: tokio::io::AsyncWrite + tokio::io::AsyncSeek + Unpin + Send,
+{
+    async fn write_leaf(&mut self, offset: u64, data: &[u8]) -> Result<()> {
+        self.0.seek(SeekFrom::Start(offset)).await?;
+        self.0.write_all(data).await?;
+        Ok(())
+    }
+    async fn commit(&mut self) -> Result<()> {
+        self.0.flush().await?;
+        Ok(())
     }
 }
 

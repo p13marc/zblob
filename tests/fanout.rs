@@ -16,7 +16,7 @@ async fn fanout_reaches_live_and_late_subscribers() {
     let session = open_session().await;
     let prefix = unique_prefix();
 
-    let data = pseudo_random(MIN_CHUNK_SIZE as usize * 3 + 4321, 41);
+    let data = pseudo_random(MIN_CHUNK_SIZE as usize * 15 + 4321, 41);
     let src = tempfile::tempdir().unwrap();
     let src_path = src.path().join("rollout.bin");
     std::fs::write(&src_path, &data).unwrap();
@@ -46,7 +46,10 @@ async fn fanout_reaches_live_and_late_subscribers() {
             .await
         })
     };
-    // Give the live subscriber time to declare before publishing.
+    // Best-effort head start so the live subscriber usually sees the stream
+    // live; if publishing wins the race anyway, the subscriber's declare-time
+    // history query replays the cache — either path must produce the same
+    // result, so this cannot flake, it only varies which path is exercised.
     tokio::time::sleep(Duration::from_millis(200)).await;
 
     let (manifest, handle) = fanout_file(
@@ -65,7 +68,7 @@ async fn fanout_reaches_live_and_late_subscribers() {
         .expect("live subscriber timed out")
         .unwrap()
         .expect("live receive");
-    assert_eq!(live_stats.chunks_fetched, 4);
+    assert_eq!(live_stats.chunks_fetched, 16);
     assert_eq!(std::fs::read(&live_dest).unwrap(), data);
 
     // Late joiner: subscribes *after* everything was published — the
@@ -91,7 +94,7 @@ async fn fanout_reaches_live_and_late_subscribers() {
     .await
     .expect("late subscriber timed out")
     .expect("late receive");
-    assert_eq!(late_stats.chunks_fetched, 4);
+    assert_eq!(late_stats.chunks_fetched, 16);
     assert_eq!(std::fs::read(&late_dest).unwrap(), data);
 
     handle.shutdown().await.unwrap();

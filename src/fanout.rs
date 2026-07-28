@@ -20,6 +20,7 @@ use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncSeekExt, AsyncWriteExt, SeekFrom};
+use zenoh::qos::{CongestionControl, Reliability};
 use zenoh_ext::{
     AdvancedPublisherBuilderExt, AdvancedSubscriberBuilderExt, CacheConfig, HistoryConfig,
     MissDetectionConfig, RecoveryConfig,
@@ -27,6 +28,7 @@ use zenoh_ext::{
 
 use crate::cancel::CancelToken;
 use crate::chunk::TransferChunks;
+use crate::client::Overwrite;
 use crate::error::{BlobError, Result};
 use crate::hash::Hash;
 use crate::manifest::{BlobSpec, Manifest};
@@ -61,6 +63,9 @@ pub struct FanoutConfig {
     /// Receiver-side stall timeout: give up if no useful frame arrives for
     /// this long (default 30 s).
     pub stall_timeout: Duration,
+    /// Receiver-side policy when `dest` already exists (default
+    /// [`Overwrite::Refuse`], matching `download_to`).
+    pub overwrite: Overwrite,
 }
 
 impl Default for FanoutConfig {
@@ -68,9 +73,19 @@ impl Default for FanoutConfig {
         FanoutConfig {
             heartbeat: Duration::from_millis(500),
             stall_timeout: Duration::from_secs(30),
+            overwrite: Overwrite::default(),
         }
     }
 }
+
+/// How many pre-manifest slice frames a receiver will buffer (and their total
+/// byte cap) while waiting for the manifest frame. Frames beyond the cap are
+/// dropped; heartbeat recovery re-delivers samples the *transport* missed but
+/// not ones the application discarded, so a receiver that joins mid-stream
+/// may need the publisher's cache replay (which the initial history query
+/// performs) to fill what it dropped here.
+const EARLY_SLICE_MAX_FRAMES: usize = 512;
+const EARLY_SLICE_MAX_BYTES: usize = 256 * 1024 * 1024;
 
 /// Keeps a fanout publication (and its replay cache) alive.
 pub struct FanoutHandle {
@@ -130,8 +145,17 @@ pub async fn fanout_file(
     let join = tokio::spawn(async move {
         let publisher = session
             .declare_publisher(key)
+            // Publications default to CongestionControl::Drop — for bulk
+            // fanout that would shed slices under local backpressure and
+            // leave subscribers to limp along on recovery. Block instead
+            // (reliable delivery is the point of this tier).
+            .congestion_control(CongestionControl::Block)
+            .reliability(Reliability::Reliable)
             .cache(CacheConfig::default().max_samples(count as usize + 1))
             .sample_miss_detection(MissDetectionConfig::default().heartbeat(cfg.heartbeat))
+            // Liveliness token: lets subscribers' `detect_late_publishers`
+            // notice this publisher (re)appearing and re-query its history.
+            .publisher_detection()
             .await
             .map_err(BlobError::zenoh)?;
 
@@ -178,11 +202,17 @@ pub async fn fanout_file(
     Ok((manifest, FanoutHandle { stop, join }))
 }
 
-/// Receive a fanned-out blob into `dest` (atomically, via `<dest>.part`),
-/// verifying every slice against the manifest root — pin it with
-/// [`DownloadRequest::pinned`](crate::DownloadRequest::pinned) semantics by
-/// passing `expected_root`. Works for subscribers that join *after*
-/// publication (history replay) and across losses (recovery + heartbeat).
+/// Receive a fanned-out blob into `dest` (via `<dest>.part`, atomically
+/// renamed on completion, honoring [`FanoutConfig::overwrite`]), verifying
+/// every slice against the manifest root — pin it by passing `expected_root`.
+/// Works for subscribers that join *after* publication (history replay) and
+/// across losses (recovery + heartbeat). Slices arriving before the manifest
+/// frame are buffered (bounded); unacceptable manifest frames from hostile
+/// co-publishers are skipped, not fatal.
+///
+/// Unlike `download_to` there is **no resume**: on error or cancellation the
+/// partial is removed and a retry starts over (the publisher's cache replay
+/// makes that cheap).
 #[allow(clippy::too_many_arguments)] // transfer surface mirrors download_to
 pub async fn receive_fanout(
     session: Arc<zenoh::Session>,
@@ -197,38 +227,38 @@ pub async fn receive_fanout(
     let started_at = tokio::time::Instant::now();
     let subscriber = session
         .declare_subscriber(fanout_key(prefix, id))
+        // The declare-time history query replays the publisher's whole cache
+        // (no depth limit) — this is what makes late joiners work; the
+        // default 10 s query timeout is too tight for a large replay.
         .history(HistoryConfig::default().detect_late_publishers())
         .recovery(RecoveryConfig::default().heartbeat())
+        .query_timeout(cfg.stall_timeout)
         .await
         .map_err(BlobError::zenoh)?;
 
-    let mut manifest: Option<(Manifest, TransferChunks, blake3::Hash)> = None;
-    let mut file: Option<tokio::fs::File> = None;
-    let part = {
-        let mut p = dest.as_os_str().to_os_string();
-        p.push(".part");
-        PathBuf::from(p)
-    };
-    let mut present: Vec<bool> = Vec::new();
-    let mut received = 0u32;
-    let mut stats = TransferStats::default();
-
-    loop {
+    // Phase A: acquire an acceptable manifest, buffering early slices.
+    let mut early: Vec<(u32, Vec<u8>)> = Vec::new();
+    let mut early_bytes = 0usize;
+    let mut deferred_reject: Option<BlobError> = None;
+    let (m, chunks, root) = loop {
         if cancel.is_cancelled() {
-            let total = manifest.as_ref().map(|(_, c, _)| c.count()).unwrap_or(0);
-            sink.emit(Progress::Cancelled { received, total });
-            return Err(BlobError::Cancelled { received, total });
+            sink.emit(Progress::Cancelled {
+                received: 0,
+                total: 0,
+            });
+            return Err(BlobError::Cancelled {
+                received: 0,
+                total: 0,
+            });
         }
         let sample = match tokio::time::timeout(cfg.stall_timeout, subscriber.recv_async()).await {
-            Err(_) => {
-                let total = manifest.as_ref().map(|(_, c, _)| c.count()).unwrap_or(0);
-                return Err(BlobError::Incomplete { received, total });
-            }
-            Ok(Err(_)) => {
-                let total = manifest.as_ref().map(|(_, c, _)| c.count()).unwrap_or(0);
-                return Err(BlobError::Incomplete { received, total });
-            }
             Ok(Ok(sample)) => sample,
+            _ => {
+                return Err(deferred_reject.unwrap_or(BlobError::Incomplete {
+                    received: 0,
+                    total: 0,
+                }));
+            }
         };
         let Ok((version, frame)) =
             crate::wire::decode::<(u16, FanoutFrame)>(&sample.payload().to_bytes())
@@ -240,99 +270,214 @@ pub async fn receive_fanout(
         }
         match frame {
             FanoutFrame::Manifest(m) => {
-                if manifest.is_some() {
-                    continue; // replays of frame 0 are expected; first wins.
-                }
-                m.validate(1 << 40)?;
-                if m.id != id {
-                    continue;
-                }
-                if let Some(expected) = expected_root
-                    && m.root != expected
-                {
-                    return Err(BlobError::RootMismatch {
-                        expected,
-                        actual: m.root,
-                    });
-                }
-                let chunks = m.chunks()?;
-                let count = chunks.count();
-                if let Some(parent) = dest.parent()
-                    && !parent.as_os_str().is_empty()
-                {
-                    tokio::fs::create_dir_all(parent).await?;
-                }
-                let f = tokio::fs::File::create(&part).await?;
-                f.set_len(m.total_len).await?;
-                present = vec![false; count as usize];
-                sink.emit(Progress::Started {
-                    total_len: m.total_len,
-                    chunk_count: count,
-                });
-                let root: blake3::Hash = m.root.into();
-                manifest = Some((m, chunks, root));
-                file = Some(
-                    tokio::fs::OpenOptions::new()
-                        .write(true)
-                        .open(&part)
-                        .await?,
-                );
-                if count == 0 {
-                    break;
+                let verdict = m
+                    .validate(1 << 40)
+                    .and_then(|()| {
+                        if m.id != id {
+                            return Err(BlobError::Protocol(format!(
+                                "fanout manifest id {:?} does not match {id:?}",
+                                m.id
+                            )));
+                        }
+                        if let Some(expected) = expected_root
+                            && m.root != expected
+                        {
+                            return Err(BlobError::RootMismatch {
+                                expected,
+                                actual: m.root,
+                            });
+                        }
+                        // An empty blob carries no slices, so nothing later
+                        // proves the root; check it here or a publisher could
+                        // serve "verified" emptiness under any claimed root.
+                        if m.total_len == 0 && m.root != Hash::of(b"") {
+                            return Err(BlobError::RootMismatch {
+                                expected: Hash::of(b""),
+                                actual: m.root,
+                            });
+                        }
+                        Ok(())
+                    })
+                    .and_then(|()| m.chunks());
+                match verdict {
+                    Ok(chunks) => {
+                        let root: blake3::Hash = m.root.into();
+                        break (m, chunks, root);
+                    }
+                    Err(e) => {
+                        deferred_reject.get_or_insert(e);
+                        continue; // a hostile co-publisher must not be fatal
+                    }
                 }
             }
             FanoutFrame::Slice { index, bao } => {
-                let Some((m, chunks, root)) = &manifest else {
-                    continue; // slice before manifest replay; recovery re-delivers.
-                };
-                let count = chunks.count();
-                if index >= count || present[index as usize] {
-                    continue;
-                }
-                let mut leaves: Vec<(u64, Vec<u8>)> = Vec::new();
-                let decoded = verify::decode_slice(
-                    root,
-                    m.total_len,
-                    verify::chunk_range(chunks.byte_range(index)),
-                    &bao,
-                    |off, data| {
-                        leaves.push((off, data.to_vec()));
-                        Ok(())
-                    },
-                );
-                if decoded.is_err() {
-                    stats.rejected += 1;
-                    continue;
-                }
-                let f = file.as_mut().expect("file exists once manifest seen");
-                for (off, data) in leaves {
-                    f.seek(SeekFrom::Start(off)).await?;
-                    f.write_all(&data).await?;
-                }
-                present[index as usize] = true;
-                received += 1;
-                stats.chunks_fetched += 1;
-                stats.bytes_fetched += chunks.len_of(index) as u64;
-                sink.emit(Progress::Chunk {
-                    index,
-                    received,
-                    total: count,
-                    bytes_received: stats.bytes_fetched,
-                });
-                if received == count {
-                    break;
+                if early.len() < EARLY_SLICE_MAX_FRAMES
+                    && early_bytes + bao.len() <= EARLY_SLICE_MAX_BYTES
+                {
+                    early_bytes += bao.len();
+                    early.push((index, bao));
                 }
             }
         }
-    }
+    };
 
-    let f = file.expect("complete transfers have a file");
-    f.sync_data().await?;
-    drop(f);
+    let count = chunks.count();
+    sink.emit(Progress::Started {
+        total_len: m.total_len,
+        chunk_count: count,
+    });
+    if let Some(parent) = dest.parent()
+        && !parent.as_os_str().is_empty()
+    {
+        tokio::fs::create_dir_all(parent).await?;
+    }
+    let part = {
+        let mut p = dest.as_os_str().to_os_string();
+        p.push(".part");
+        PathBuf::from(p)
+    };
+    {
+        let f = tokio::fs::File::create(&part).await?;
+        f.set_len(m.total_len).await?;
+    }
+    let mut file = tokio::fs::OpenOptions::new()
+        .write(true)
+        .open(&part)
+        .await?;
+    let mut present: Vec<bool> = vec![false; count as usize];
+    let mut received = 0u32;
+    let mut stats = TransferStats::default();
+
+    // Phase B: drain the early buffer, then the live/replayed stream. Any
+    // error or cancellation removes the partial (fanout has no resume).
+    let result: Result<()> = async {
+        for (index, bao) in early.drain(..) {
+            apply_slice(
+                &m,
+                &chunks,
+                &root,
+                &mut file,
+                &mut present,
+                &mut received,
+                &mut stats,
+                sink,
+                index,
+                &bao,
+            )
+            .await?;
+        }
+        while received < count {
+            if cancel.is_cancelled() {
+                sink.emit(Progress::Cancelled {
+                    received,
+                    total: count,
+                });
+                return Err(BlobError::Cancelled {
+                    received,
+                    total: count,
+                });
+            }
+            let sample =
+                match tokio::time::timeout(cfg.stall_timeout, subscriber.recv_async()).await {
+                    Ok(Ok(sample)) => sample,
+                    _ => {
+                        return Err(BlobError::Incomplete {
+                            received,
+                            total: count,
+                        });
+                    }
+                };
+            let Ok((version, frame)) =
+                crate::wire::decode::<(u16, FanoutFrame)>(&sample.payload().to_bytes())
+            else {
+                continue;
+            };
+            if version != crate::wire::WIRE_VERSION {
+                continue;
+            }
+            if let FanoutFrame::Slice { index, bao } = frame {
+                apply_slice(
+                    &m,
+                    &chunks,
+                    &root,
+                    &mut file,
+                    &mut present,
+                    &mut received,
+                    &mut stats,
+                    sink,
+                    index,
+                    &bao,
+                )
+                .await?;
+            }
+        }
+        file.sync_data().await?;
+        if cfg.overwrite == Overwrite::Refuse && tokio::fs::try_exists(dest).await? {
+            return Err(BlobError::DestinationExists(dest.to_path_buf()));
+        }
+        Ok(())
+    }
+    .await;
+    drop(file);
+    if let Err(e) = result {
+        let _ = tokio::fs::remove_file(&part).await;
+        return Err(e);
+    }
     tokio::fs::rename(&part, dest).await?;
     sink.emit(Progress::Completed {
         path: dest.to_path_buf(),
     });
     stats.elapsed = started_at.elapsed();
     Ok(stats)
+}
+
+/// Verify one slice frame against the root and write its leaves; duplicates
+/// and out-of-range indices are ignored, tampered frames counted + dropped.
+#[allow(clippy::too_many_arguments)]
+async fn apply_slice(
+    m: &Manifest,
+    chunks: &TransferChunks,
+    root: &blake3::Hash,
+    file: &mut tokio::fs::File,
+    present: &mut [bool],
+    received: &mut u32,
+    stats: &mut TransferStats,
+    sink: &dyn ProgressSink,
+    index: u32,
+    bao: &[u8],
+) -> Result<()> {
+    let count = chunks.count();
+    if index >= count || present[index as usize] {
+        return Ok(());
+    }
+    let mut leaves: Vec<(u64, Vec<u8>)> = Vec::new();
+    let decoded = verify::decode_slice(
+        root,
+        m.total_len,
+        verify::chunk_range(chunks.byte_range(index)),
+        bao,
+        |off, data| {
+            leaves.push((off, data.to_vec()));
+            Ok(())
+        },
+    );
+    if decoded.is_err() {
+        stats.rejected += 1;
+        return Ok(());
+    }
+    for (off, data) in leaves {
+        file.seek(SeekFrom::Start(off)).await?;
+        file.write_all(&data).await?;
+    }
+    present[index as usize] = true;
+    *received += 1;
+    stats.chunks_fetched += 1;
+    stats.bytes_fetched += chunks.len_of(index) as u64;
+    sink.emit(Progress::Chunk {
+        index,
+        received: *received,
+        total: count,
+        bytes_received: stats.bytes_fetched,
+    });
+    Ok(())
 }

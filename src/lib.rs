@@ -30,20 +30,29 @@
 //! works: the client persists a chunk bitfield next to the `.part` file and
 //! re-queries exactly its holes. See [`slice_selector`] / [`parse_ranges`].
 //!
-//! # Two Zenoh facts this design relies on
+//! # Three facts this design relies on
 //!
 //! 1. **Backpressure is automatic.** `Session::get` defaults to
 //!    `CongestionControl::Block`, and replies inherit the query's congestion
 //!    control, so chunk replies block (rather than drop) when the link backs up.
-//!    We therefore set **no** congestion control explicitly — the only setter is
-//!    behind Zenoh's `internal` feature, which this crate deliberately does not
-//!    enable. Do not "fix" this by enabling `internal`. (Reply *consolidation*
-//!    is a different knob: clients set `ConsolidationMode::None` so replies
-//!    stream instead of being buffered until query finalization.)
+//!    We therefore set **no** congestion control explicitly on queries — the
+//!    only setter is behind Zenoh's `internal` feature, which this crate
+//!    deliberately does not enable. Do not "fix" this by enabling `internal`.
+//!    (Reply *consolidation* is a different knob: clients set
+//!    `ConsolidationMode::None` so replies stream instead of being buffered
+//!    until query finalization. Publications — the `fanout` tier — are not
+//!    queries and *do* set `Block` explicitly, since their default is `Drop`.)
 //! 2. **Reply keys must match the query.** Replies use `ReplyKeyExpr::MatchingQuery`
 //!    by default, so the client **must** GET the wildcard `<prefix>/<id>/**` for
 //!    the `slice/<i>` replies to be accepted. A bare-`<id>` GET would silently
 //!    reject every slice. [`slice_selector`] enforces the wildcard.
+//! 3. **Any peer can answer, so one bad reply must not be fatal.** A queryable
+//!    key range is open: replies that fail decoding, validation, id matching,
+//!    or root pinning are *skipped* rather than aborting the query, so a
+//!    hostile or stale responder cannot deny a fetch that an honest replica
+//!    still answers.
+
+#![warn(missing_docs)]
 
 mod cancel;
 mod chunk;

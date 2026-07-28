@@ -74,6 +74,34 @@ deployments fail closed instead of corrupting).
 - **Observability** (#32): `TransferStats` from every download, server
   `on_error` callbacks, optional `tracing` feature.
 
+### Hardening from the post-implementation audit
+
+- Push protocol: an offer can no longer hijack an already-registered id
+  (different content refused, identical content acked idempotently), the
+  offer key's id must match the manifest's, concurrent pushes are capped and
+  idle ones evicted with their spool files, sidecar saves are batched, and the
+  `pushes` lock is no longer held across I/O or replies.
+- Uploaders validate the server's "wanted ranges" reply (sorted, disjoint,
+  in-bounds) before any arithmetic — a hostile responder could otherwise
+  drive a `u32` underflow.
+- `TreeIndex::validate` bounds every `ChunkRef::len` by the declared CDC
+  maximum, closing an unbounded-allocation path through `seed::seed_store`.
+- Directory creation during materialization refuses to traverse pre-existing
+  symlinks (prevention, not just post-hoc detection), and hardlink *targets*
+  are canonicalized under the destination root.
+- One bad reply no longer denies a fetch: malformed/invalid/mismatched
+  manifest, index, and availability replies are skipped so an honest replica
+  can still answer (root pinning is applied per reply).
+- `DirStore::has` no longer claims chunks it cannot decode (a sealed store
+  opened without its key previously wedged downloads permanently); presence
+  checks moved off the async worker thread.
+- Fanout: publisher uses `CongestionControl::Block` + `publisher_detection`,
+  subscriber raises the history-replay query timeout, slices arriving before
+  the manifest are buffered instead of dropped, and receives honor an
+  overwrite policy and clean up their partial on failure.
+- `Manifest`/tag ids reject `\\` and are length-bounded (Windows spool/tag
+  traversal); resume bitfield counting masks padding bits.
+
 ### Filesystem fidelity
 
 - Non-regular files and non-UTF-8 names are loud errors, hard links round-trip
@@ -83,7 +111,8 @@ deployments fail closed instead of corrupting).
 ### API
 
 - Builders for `BlobServer`/`BlobClient`/`TreeClient`; `BlobSpec`;
-  public `fetch_manifest`; `download_to` with an `Overwrite` policy;
+  public `fetch_manifest`; `download_to` with an `Overwrite` policy and
+  `download_to_writer` for arbitrary seekable writers;
   `spawn()` → `ServerHandle::shutdown()`; `#[non_exhaustive] Progress` with
   `Started`/`Resumed`/`Cancelled` and byte counters (#19, #21).
 - FastCDC v2020 Level-2 defaults (16/64/256 KiB) with a **seedable gear

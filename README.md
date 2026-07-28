@@ -61,7 +61,9 @@ let stats = client
 
 Tier 1 also supports **push** (verified uploads gated by a `PushPolicy`
 authorization hook), **availability introspection** (`…/have` bitfields per
-responder), and replicated servers answering one download cooperatively.
+responder), replicated servers answering one download cooperatively, and
+`download_to_writer` for filling any seekable async writer without touching
+the filesystem.
 
 **Tier 2 — content-addressed directories** (the [casync] model). A snapshot is
 a [`TreeIndex`] (a depth-first entry list; files reference their chunks by
@@ -78,16 +80,16 @@ change re-transfers only its neighborhood.
 [FastCDC]: https://www.usenix.org/conference/atc16/technical-sessions/presentation/xia
 
 ```rust,ignore
-let store = zblob::MemoryStore::new();
-let index = zblob::build_tree(dir, "snap-1", &zblob::CdcParams::default(), &store)?;
+let store: Arc<dyn zblob::ContentStore> = Arc::new(zblob::MemoryStore::new());
+let index = zblob::build_tree(dir, "snap-1", &zblob::CdcParams::default(), &*store)?;
 
 // serve live...
-let server = zblob::TreeServer::new(session.clone(), "demo/store", "demo/tree", Arc::new(store));
+let server = zblob::TreeServer::new(session.clone(), "demo/store", "demo/tree", store.clone());
 server.register(index.clone()).await;
 let handle = server.spawn().await?;
 
 // ...or publish into a router storage (with read-back settling) and exit:
-zblob::publish_snapshot(&session, "demo/store", "demo/tree", &index, &store,
+zblob::publish_snapshot(&session, "demo/store", "demo/tree", &index, &*store,
                         zblob::ChunkCompression::default(), settle).await?;
 
 // client

@@ -32,8 +32,10 @@ use crate::{store_key, tree_key};
 
 /// PUT one content-addressed chunk into the storage under `store_prefix`.
 ///
-/// The key is `<store_prefix>/blake3/<hash>`; the value is the raw chunk
-/// bytes. Idempotent — re-PUTting an identical chunk is a no-op.
+/// The key is `<store_prefix>/blake3/<hash>`; the value is the chunk wrapped
+/// in the self-describing container frame (`0x00` + raw bytes, or a zstd
+/// frame when `compression` says so) — the same framing `TreeServer` puts on
+/// the wire. Idempotent — re-PUTting an identical chunk is a no-op.
 pub async fn publish_chunk(
     session: &zenoh::Session,
     store_prefix: &str,

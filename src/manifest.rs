@@ -93,12 +93,14 @@ impl Manifest {
     }
 }
 
-/// A blob id must be a single non-empty Zenoh key segment: no `/`, no
-/// wildcard/param characters, no `..`.
+/// A blob id must be a single non-empty Zenoh key segment of sane length: no
+/// `/` or `\` (ids are joined into spool/tag file names), no wildcard/param
+/// characters, no `..`.
 pub(crate) fn validate_id(id: &str) -> Result<()> {
     let ok = !id.is_empty()
+        && id.len() <= 200
         && id != ".."
-        && !id.contains(['/', '*', '?', '#', '$'])
+        && !id.contains(['/', '\\', '*', '?', '#', '$'])
         && !id.chars().any(char::is_whitespace);
     if ok {
         Ok(())

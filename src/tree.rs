@@ -33,7 +33,9 @@ use crate::error::{BlobError, Result};
 use crate::hash::Hash;
 use crate::manifest::validate_id;
 use crate::obs::{TransferStats, zdebug};
-use crate::paths::{assert_parent_within, sanitize_rel_path, sanitize_symlink_target};
+use crate::paths::{
+    assert_parent_within, create_dir_confined, sanitize_rel_path, sanitize_symlink_target,
+};
 use crate::progress::{Progress, ProgressSink};
 use crate::server::{ErrorCallback, FifoQueryable, ServerHandle, report_error};
 use crate::store::ContentStore;
@@ -245,6 +247,17 @@ impl TreeIndex {
                         return Err(BlobError::InvalidManifest(format!(
                             "file {:?}: size {size} != chunk sum {sum}",
                             e.path()
+                        )));
+                    }
+                    // Each declared length is an allocation the receiver (and
+                    // the zero-seed synthesizer) will perform: bound it by the
+                    // declared CDC maximum, which validate() capped above.
+                    if let Some(bad) = chunks.iter().find(|c| c.len == 0 || c.len > self.cdc.max) {
+                        return Err(BlobError::InvalidManifest(format!(
+                            "file {:?}: chunk len {} outside 1..={}",
+                            e.path(),
+                            bad.len,
+                            self.cdc.max
                         )));
                     }
                 }
@@ -776,6 +789,17 @@ impl TreeClient {
     /// Fetch and fully validate the snapshot index `id` (schema, paths,
     /// size↔chunk consistency, root recomputation).
     pub async fn fetch_index(&self, id: &str) -> Result<TreeIndex> {
+        self.fetch_index_matching(id, None).await
+    }
+
+    /// Pin-aware fetch: when `expected_root` is set, replies with a different
+    /// root are skipped like any other unacceptable reply, so one wrong-root
+    /// responder cannot mask an honest replica.
+    async fn fetch_index_matching(
+        &self,
+        id: &str,
+        expected_root: Option<Hash>,
+    ) -> Result<TreeIndex> {
         validate_id(id)?;
         let key = tree_key(&self.tree_prefix, id);
         let replies = self
@@ -785,30 +809,51 @@ impl TreeClient {
             .timeout(self.cfg.query_timeout)
             .await
             .map_err(BlobError::zenoh)?;
+        let mut rejected: Option<BlobError> = None;
         while let Ok(reply) = replies.recv_async().await {
             let Ok(sample) = reply.result() else { continue };
             if sample.encoding().to_string() != ENC_INDEX {
                 continue;
             }
+            // A bad reply from one responder is skipped, not fatal — a
+            // hostile or stale replier must not deny what an honest replica
+            // still answers. The first rejection is kept for diagnostics.
             let payload = sample.payload().to_bytes();
-            if payload.len() > self.cfg.max_index_bytes {
-                return Err(BlobError::InvalidManifest(format!(
+            let verdict = if payload.len() > self.cfg.max_index_bytes {
+                Err(BlobError::InvalidManifest(format!(
                     "index payload {} exceeds the {} byte limit",
                     payload.len(),
                     self.cfg.max_index_bytes
-                )));
+                )))
+            } else {
+                decode::<TreeIndex>(&payload)
+                    .and_then(|index| index.validate().map(|()| index))
+                    .and_then(|index| {
+                        if index.id != id {
+                            return Err(BlobError::Protocol(format!(
+                                "index id {:?} does not match requested {id:?}",
+                                index.id
+                            )));
+                        }
+                        if let Some(expected) = expected_root
+                            && index.root_hash != expected
+                        {
+                            return Err(BlobError::RootMismatch {
+                                expected,
+                                actual: index.root_hash,
+                            });
+                        }
+                        Ok(index)
+                    })
+            };
+            match verdict {
+                Ok(index) => return Ok(index),
+                Err(e) => {
+                    rejected.get_or_insert(e);
+                }
             }
-            let index: TreeIndex = decode(&payload)?;
-            index.validate()?;
-            if index.id != id {
-                return Err(BlobError::Protocol(format!(
-                    "index id {:?} does not match requested {id:?}",
-                    index.id
-                )));
-            }
-            return Ok(index);
         }
-        Err(BlobError::NotFound(id.to_string()))
+        Err(rejected.unwrap_or_else(|| BlobError::NotFound(id.to_string())))
     }
 
     /// Download snapshot `req.id` into `dest_root`: fetch only the chunks
@@ -820,6 +865,14 @@ impl TreeClient {
     /// Because progress *is* "which hashes are on disk", a cancelled or failed
     /// transfer leaves `store` populated with whatever it fetched, so calling
     /// again resumes — across reconnect and process restart — for free.
+    ///
+    /// Materialization is **in place and not atomic** (the rsync/casync
+    /// model): entries are written into `dest_root` directly so unchanged
+    /// files need no work, but an error mid-materialization leaves a mix of
+    /// old and new entries. Re-run the same call to converge — every chunk is
+    /// already in `store`, so a re-run only redoes local writes. Callers who
+    /// need an atomic cut-over should materialize into a fresh directory and
+    /// swap it in themselves.
     pub async fn download_tree(
         &self,
         req: &DownloadRequest,
@@ -829,15 +882,9 @@ impl TreeClient {
         cancel: &CancelToken,
     ) -> Result<TransferStats> {
         let started_at = tokio::time::Instant::now();
-        let index = self.fetch_index(&req.id).await?;
-        if let Some(expected) = req.expected_root
-            && index.root_hash != expected
-        {
-            return Err(BlobError::RootMismatch {
-                expected,
-                actual: index.root_hash,
-            });
-        }
+        let index = self
+            .fetch_index_matching(&req.id, req.expected_root)
+            .await?;
 
         let needed = index.needed_chunks();
         let total = needed.len() as u32;
@@ -882,14 +929,33 @@ impl TreeClient {
         let mut stats = TransferStats::default();
         let mut received: u32 = 0;
         let mut bytes_received: u64 = 0;
-        let mut iter = needed.iter().copied().enumerate();
+        // One blocking pass decides present vs missing (DirStore's `has` is a
+        // syscall per hash — tens of thousands of them do not belong on an
+        // async worker thread one by one).
+        let presence: Vec<bool> = {
+            let store = store.clone();
+            let needed = needed.to_vec();
+            tokio::task::spawn_blocking(move || {
+                needed.iter().map(|h| store.has(h)).collect::<Vec<_>>()
+            })
+            .await
+            .map_err(|e| BlobError::Protocol(format!("presence task: {e}")))?
+        };
+        let mut iter = needed
+            .iter()
+            .copied()
+            .zip(presence)
+            .enumerate()
+            .map(|(i, (h, present))| (i, h, present));
         let mut join: tokio::task::JoinSet<Result<(usize, u64, u32)>> = tokio::task::JoinSet::new();
 
         loop {
             // Keep the pipeline full.
             while join.len() < self.cfg.fetch_concurrency {
-                let Some((i, hash)) = iter.next() else { break };
-                if store.has(&hash) {
+                let Some((i, hash, present)) = iter.next() else {
+                    break;
+                };
+                if present {
                     received += 1;
                     stats.chunks_resumed += 1;
                     sink.emit(Progress::Chunk {
@@ -987,18 +1053,14 @@ fn reconstruct_tree(dest_root: &Path, entries: &[Entry], store: &dyn ContentStor
     std::fs::create_dir_all(dest_root)?;
     let root = dest_root.canonicalize()?;
 
-    // Pass 1: directories (DFS order → parents first). Modes are NOT applied
-    // yet — a read-only directory would break writing its own children; like
-    // tar/casync, directory permissions land last.
+    // Pass 1: directories (DFS order → parents first). Creation is
+    // component-wise and refuses to traverse pre-existing symlinks — the
+    // prevention counterpart of the canonicalization checks below. Modes are
+    // NOT applied yet — a read-only directory would break writing its own
+    // children; like tar/casync, directory permissions land last.
     for e in entries {
         if let Entry::Dir { path, .. } = e {
-            let p = root.join(sanitize_rel_path(path)?);
-            std::fs::create_dir_all(&p)?;
-            if !p.canonicalize()?.starts_with(&root) {
-                return Err(BlobError::Protocol(format!(
-                    "dir {path:?} resolves outside the destination root"
-                )));
-            }
+            create_dir_confined(&root, &sanitize_rel_path(path)?)?;
         }
     }
 
@@ -1012,10 +1074,11 @@ fn reconstruct_tree(dest_root: &Path, entries: &[Entry], store: &dyn ContentStor
                 size,
                 chunks,
             } => {
-                let p = root.join(sanitize_rel_path(path)?);
-                if let Some(parent) = p.parent() {
-                    std::fs::create_dir_all(parent)?;
+                let rel = sanitize_rel_path(path)?;
+                if let Some(parent) = rel.parent() {
+                    create_dir_confined(&root, parent)?;
                 }
+                let p = root.join(&rel);
                 assert_parent_within(&root, &p)?;
                 remove_existing(&p);
                 let mut f = std::fs::File::create(&p)?;
@@ -1039,14 +1102,29 @@ fn reconstruct_tree(dest_root: &Path, entries: &[Entry], store: &dyn ContentStor
                 set_mtime(&f, *mtime);
             }
             Entry::Hardlink { path, target } => {
-                let p = root.join(sanitize_rel_path(path)?);
-                let t = root.join(sanitize_rel_path(target)?);
-                if let Some(parent) = p.parent() {
-                    std::fs::create_dir_all(parent)?;
+                let rel = sanitize_rel_path(path)?;
+                if let Some(parent) = rel.parent() {
+                    create_dir_confined(&root, parent)?;
                 }
+                let p = root.join(&rel);
+                let t = root.join(sanitize_rel_path(target)?);
                 assert_parent_within(&root, &p)?;
+                // The *target* must also really live under the root:
+                // `link(2)` resolves symlinks in its source path, so a
+                // pre-existing outward-pointing symlink inside the dest could
+                // otherwise be laundered into a hard link to outside data.
+                let canon_t = t.canonicalize().map_err(|e| {
+                    BlobError::Protocol(format!(
+                        "hardlink target {target:?} is not materialized: {e}"
+                    ))
+                })?;
+                if !canon_t.starts_with(&root) || !canon_t.is_file() {
+                    return Err(BlobError::Protocol(format!(
+                        "hardlink target {target:?} resolves outside the destination root"
+                    )));
+                }
                 remove_existing(&p);
-                std::fs::hard_link(&t, &p)?;
+                std::fs::hard_link(&canon_t, &p)?;
             }
             _ => {}
         }
@@ -1057,10 +1135,10 @@ fn reconstruct_tree(dest_root: &Path, entries: &[Entry], store: &dyn ContentStor
         if let Entry::Symlink { path, target } = e {
             let rel = sanitize_rel_path(path)?;
             sanitize_symlink_target(&rel, target)?;
-            let p = root.join(&rel);
-            if let Some(parent) = p.parent() {
-                std::fs::create_dir_all(parent)?;
+            if let Some(parent) = rel.parent() {
+                create_dir_confined(&root, parent)?;
             }
+            let p = root.join(&rel);
             assert_parent_within(&root, &p)?;
             remove_existing(&p);
             symlink(target, &p)?;
@@ -1190,6 +1268,35 @@ mod tests {
                 root_hash,
             };
             assert!(index.validate().is_err(), "must reject path {evil:?}");
+        }
+    }
+
+    #[test]
+    fn oversized_chunk_len_rejected() {
+        // A declared length is an allocation the receiver performs: lens over
+        // the CDC maximum (or zero) must fail validation even when the size
+        // arithmetic is consistent.
+        for bad_len in [0u32, CdcParams::default().max + 1, u32::MAX] {
+            let entries = vec![Entry::File {
+                path: "f".into(),
+                mode: 0,
+                mtime: 0,
+                size: bad_len as u64,
+                chunks: vec![ChunkRef {
+                    hash: Hash::of(b"x"),
+                    len: bad_len,
+                }],
+            }];
+            let root_hash = root_digest(&entries).unwrap();
+            let index = TreeIndex {
+                version: WIRE_VERSION,
+                id: "x".into(),
+                algo: Hash::ALGO.into(),
+                cdc: CdcParams::default(),
+                entries,
+                root_hash,
+            };
+            assert!(index.validate().is_err(), "len {bad_len} must be rejected");
         }
     }
 

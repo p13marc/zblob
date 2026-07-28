@@ -82,6 +82,34 @@ pub(crate) fn assert_parent_within(canonical_root: &Path, path: &Path) -> Result
     Ok(())
 }
 
+/// Create `root.join(rel)` (and its ancestors) one component at a time,
+/// refusing to traverse any pre-existing symlink component — `create_dir_all`
+/// happily follows a symlinked directory *out* of the root before any
+/// containment check can run, so prevention has to happen per component.
+pub(crate) fn create_dir_confined(root: &Path, rel: &Path) -> Result<std::path::PathBuf> {
+    let mut cur = root.to_path_buf();
+    for comp in rel.components() {
+        cur.push(comp);
+        match std::fs::symlink_metadata(&cur) {
+            Ok(meta) if meta.file_type().is_symlink() => {
+                return Err(BlobError::Protocol(format!(
+                    "refusing to traverse symlink at {cur:?} while materializing {rel:?}"
+                )));
+            }
+            Ok(meta) if meta.is_dir() => {}
+            Ok(_) => {
+                return Err(BlobError::Protocol(format!(
+                    "non-directory in the way at {cur:?} while materializing {rel:?}"
+                )));
+            }
+            Err(_) => {
+                std::fs::create_dir(&cur)?;
+            }
+        }
+    }
+    Ok(cur)
+}
+
 /// Durably record a directory-entry change (rename/create) on platforms where
 /// that requires fsyncing the directory itself.
 #[cfg(unix)]
@@ -107,6 +135,21 @@ mod tests {
         for bad in ["", "/etc/passwd", "../x", "a/../../x", "a/..", ".", "./"] {
             assert!(sanitize_rel_path(bad).is_err(), "should reject {bad:?}");
         }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn confined_dir_creation_refuses_symlinks() {
+        let root = tempfile::tempdir().unwrap();
+        // Normal nested creation works and returns the leaf.
+        let leaf = create_dir_confined(root.path(), Path::new("a/b/c")).unwrap();
+        assert!(leaf.is_dir());
+        // A symlinked component (even pointing inside the root) is refused.
+        std::os::unix::fs::symlink(root.path().join("a"), root.path().join("link")).unwrap();
+        assert!(create_dir_confined(root.path(), Path::new("link/x")).is_err());
+        // A file in the way is refused, not clobbered.
+        std::fs::write(root.path().join("f"), b"x").unwrap();
+        assert!(create_dir_confined(root.path(), Path::new("f/child")).is_err());
     }
 
     #[test]

@@ -105,9 +105,21 @@ impl ResumeState {
         true
     }
 
-    /// Number of chunks present.
+    /// Number of chunks present. The final byte's padding bits are masked so
+    /// a corrupt sidecar cannot inflate the count past real chunks (and make
+    /// `is_complete` rename a holey partial into place).
     pub fn received(&self) -> u32 {
-        self.bits.iter().map(|b| b.count_ones()).sum()
+        let count = self.chunk_count();
+        self.bits
+            .iter()
+            .enumerate()
+            .map(|(i, b)| {
+                let bit_base = i as u32 * 8;
+                let valid = count.saturating_sub(bit_base).min(8);
+                let mask = if valid >= 8 { 0xff } else { (1u8 << valid) - 1 };
+                (b & mask).count_ones()
+            })
+            .sum()
     }
 
     /// Whether all `chunk_count` chunks are present.

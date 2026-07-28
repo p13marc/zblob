@@ -103,28 +103,32 @@ async fn concurrent_same_destination_single_flights() {
     let dir = tempfile::tempdir().unwrap();
     let dest = dir.path().join("same.bin");
 
-    // Launch two concurrent downloads to the same destination.
-    let (c1, c2) = (client.clone(), client.clone());
-    let (d1, d2) = (dest.clone(), dest.clone());
-    let (r1, r2) = tokio::join!(
-        tokio::spawn(async move {
-            c1.download_to(&DownloadRequest::new("sf"), &d1, &(), &CancelToken::new())
-                .await
-        }),
-        tokio::spawn(async move {
-            c2.download_to(&DownloadRequest::new("sf"), &d2, &(), &CancelToken::new())
-                .await
-        }),
+    // Deterministic overlap: the second download starts only once the first
+    // has emitted Started (the guard is held from download_to entry, strictly
+    // before any progress can be observed).
+    let (started_tx, started_rx) = tokio::sync::oneshot::channel::<()>();
+    let started_tx = std::sync::Mutex::new(Some(started_tx));
+    let (c1, d1) = (client.clone(), dest.clone());
+    let first = tokio::spawn(async move {
+        let sink = move |p: zblob::Progress| {
+            if matches!(p, zblob::Progress::Started { .. })
+                && let Some(tx) = started_tx.lock().unwrap().take()
+            {
+                let _ = tx.send(());
+            }
+        };
+        c1.download_to(&DownloadRequest::new("sf"), &d1, &sink, &CancelToken::new())
+            .await
+    });
+    started_rx.await.expect("first download must start");
+    let second = client
+        .download_to(&DownloadRequest::new("sf"), &dest, &(), &CancelToken::new())
+        .await;
+    assert!(
+        matches!(&second, Err(BlobError::Protocol(msg)) if msg.contains("already in progress")),
+        "second concurrent download must be refused: {second:?}"
     );
-    let results = [r1.unwrap(), r2.unwrap()];
-    let ok = results.iter().filter(|r| r.is_ok()).count();
-    let refused = results
-        .iter()
-        .filter(
-            |r| matches!(r, Err(BlobError::Protocol(msg)) if msg.contains("already in progress")),
-        )
-        .count();
-    assert_eq!((ok, refused), (1, 1), "exactly one wins, one is refused");
+    first.await.unwrap().expect("first download completes");
     assert_eq!(std::fs::read(&dest).unwrap(), data);
 
     handle.shutdown().await.unwrap();

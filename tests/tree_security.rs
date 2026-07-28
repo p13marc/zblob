@@ -54,8 +54,13 @@ async fn fake_tree_server(
                 continue;
             }
             if let Some((_, bytes)) = chunks.iter().find(|(k, _)| *k == key) {
+                // Real servers frame chunks in a container (0x00 = raw); an
+                // unframed reply would be rejected before materialization and
+                // the test would pass for the wrong reason.
+                let mut framed = vec![0u8];
+                framed.extend_from_slice(bytes);
                 let _ = query
-                    .reply(key.clone(), bytes.clone())
+                    .reply(key.clone(), framed)
                     .encoding(wire::ENC_CHUNK)
                     .await;
             }
@@ -89,13 +94,19 @@ async fn zip_slip_index_rejected_nothing_written() {
     let evil_hash = Hash::of(&evil);
     let chunk_key = zblob::store_key(&store_prefix, Hash::ALGO, &evil_hash);
 
-    let escape_paths = ["../evil.txt", "/tmp/evil.txt", "a/../../evil.txt"];
+    let outer_abs = tempfile::tempdir().unwrap();
+    let abs_escape = outer_abs.path().join("evil.txt");
+    let escape_paths = [
+        "../evil.txt".to_string(),
+        abs_escape.to_str().unwrap().to_string(),
+        "a/../../evil.txt".to_string(),
+    ];
     for (i, path) in escape_paths.iter().enumerate() {
         let id = format!("slip{i}");
         let index = index_for(
             &id,
             vec![Entry::File {
-                path: (*path).into(),
+                path: path.clone(),
                 mode: 0,
                 mtime: 0,
                 size: evil.len() as u64,
@@ -134,8 +145,7 @@ async fn zip_slip_index_rejected_nothing_written() {
             "path {path:?}: {err}"
         );
         assert!(
-            !outer.path().join("evil.txt").exists()
-                && !std::path::Path::new("/tmp/evil.txt").exists(),
+            !outer.path().join("evil.txt").exists() && !abs_escape.exists(),
             "escape target must not exist for {path:?}"
         );
         srv.abort();
@@ -330,5 +340,103 @@ async fn wrong_content_chunk_ignored() {
     assert!(store.hashes().unwrap().is_empty(), "nothing stored");
 
     srv.abort();
+    session.close().await.unwrap();
+}
+
+/// A hostile index cannot launder a pre-existing outward symlink into a hard
+/// link to data outside the root, nor create directories through it.
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn preexisting_symlink_cannot_be_traversed() {
+    let session = open_session().await;
+    let p = unique_prefix();
+    let store_prefix = format!("{p}/store");
+    let tree_prefix = format!("{p}/tree");
+
+    // The secret outside the destination root.
+    let outside = tempfile::tempdir().unwrap();
+    std::fs::write(outside.path().join("secret.pem"), b"KEY MATERIAL").unwrap();
+
+    let payload = b"attacker data".to_vec();
+    let payload_hash = Hash::of(&payload);
+    let chunk_key = zblob::store_key(&store_prefix, Hash::ALGO, &payload_hash);
+
+    // Case A: hardlink whose target path traverses the pre-existing symlink.
+    let hardlink_index = index_for(
+        "hl-escape",
+        vec![Entry::Hardlink {
+            path: "loot".into(),
+            target: "cache/secret.pem".into(),
+        }],
+    );
+    // Case B: a directory entry that would be created *through* the symlink.
+    let dir_index = index_for(
+        "dir-escape",
+        vec![
+            Entry::Dir {
+                path: "cache/spill".into(),
+                mode: 0,
+                mtime: 0,
+            },
+            Entry::File {
+                path: "cache/spill/owned.txt".into(),
+                mode: 0,
+                mtime: 0,
+                size: payload.len() as u64,
+                chunks: vec![zblob::ChunkRef {
+                    hash: payload_hash,
+                    len: payload.len() as u32,
+                }],
+            },
+        ],
+    );
+    let srv_a = fake_tree_server(
+        session.clone(),
+        tree_prefix.clone(),
+        "hl-escape",
+        wire::encode(&hardlink_index).unwrap(),
+        vec![],
+    )
+    .await;
+
+    let client = test_client(session.clone(), &store_prefix, &tree_prefix);
+    let store: Arc<dyn ContentStore> = Arc::new(MemoryStore::new());
+
+    for (id, srv) in [("hl-escape", Some(srv_a)), ("dir-escape", None)] {
+        let srv = match srv {
+            Some(s) => s,
+            None => {
+                fake_tree_server(
+                    session.clone(),
+                    tree_prefix.clone(),
+                    "dir-escape",
+                    wire::encode(&dir_index).unwrap(),
+                    vec![(chunk_key.clone(), payload.clone())],
+                )
+                .await
+            }
+        };
+        // Destination with a pre-existing symlink pointing outside.
+        let dest = tempfile::tempdir().unwrap();
+        std::os::unix::fs::symlink(outside.path(), dest.path().join("cache")).unwrap();
+
+        let err = client
+            .download_tree(
+                &DownloadRequest::new(id),
+                dest.path(),
+                &store,
+                &(),
+                &CancelToken::new(),
+            )
+            .await
+            .expect_err("symlink traversal must be refused");
+        assert!(matches!(err, BlobError::Protocol(_)), "{id}: {err}");
+        // Nothing landed outside; nothing was created through the link.
+        assert!(!outside.path().join("spill").exists());
+        assert!(!outside.path().join("owned.txt").exists());
+        assert!(!dest.path().join("loot").exists());
+        srv.abort();
+    }
+
     session.close().await.unwrap();
 }
