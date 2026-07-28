@@ -3,7 +3,7 @@
 All notable changes to `zblob` are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/); versions follow SemVer.
 
-## [Unreleased] — 0.2.0 "wire v2"
+## [0.2.0] — 2026-07-28 "wire v2"
 
 A ground-up redesign of the wire protocol and integrity model
 ([analysis](docs/analysis-2026-07.md), epic #37). **Breaking throughout** —
@@ -52,6 +52,27 @@ deployments fail closed instead of corrupting).
   per-query tasks + inflight semaphore on `TreeServer` (#12); `DirStore`
   fanout + atomic fsynced puts + optional verify-on-read + `scrub()` (#13);
   `publish_snapshot` read-back settle phase (#20).
+
+### New capabilities
+
+- **Push/upload** (#28): verified resumable uploads over the same queryable,
+  spooled server-side, gated by a `PushPolicy` hook (off by default).
+- **Multi-source** (#30): `…/have` availability bitfields per responder;
+  replicated servers cooperate on one download; same-destination downloads
+  single-flight.
+- **Fanout tier** (#31, `fanout` feature): one-to-many rollout over zenoh-ext
+  `AdvancedPublisher` with cached replay for late joiners.
+- **Local seeding** (#29): `seed::seed_store` satisfies chunks from prior
+  local copies and synthesized zero regions before touching the network.
+- **Store lifecycle** (#26): `ContentStore::remove`, persistent snapshot tags,
+  in-flight temp tags, `gc::sweep` mark-and-sweep.
+- **Compression** (#27, `zstd` feature): self-describing per-chunk containers
+  (wire + at rest), raw bail-out for incompressible data.
+- **Encryption at rest** (#33, `encryption` feature):
+  `DirStore::with_encryption` — per-chunk XChaCha20-Poly1305, convergent per
+  store key, address-bound AAD.
+- **Observability** (#32): `TransferStats` from every download, server
+  `on_error` callbacks, optional `tracing` feature.
 
 ### Filesystem fidelity
 
