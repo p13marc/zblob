@@ -82,6 +82,11 @@ pub enum BlobError {
     #[error("destination exists: {0}")]
     DestinationExists(PathBuf),
 
+    /// The server refused an upload offer (no push configured, policy said
+    /// no, or a conflicting push for the same id is in progress).
+    #[error("push denied: {0}")]
+    PushDenied(String),
+
     /// A generic protocol violation (malformed key, bad selector, …).
     #[error("protocol: {0}")]
     Protocol(String),

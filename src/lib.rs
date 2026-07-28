@@ -75,8 +75,8 @@ pub use obs::TransferStats;
 pub use progress::{Progress, ProgressSink};
 pub use publish::{publish_chunk, publish_index, publish_snapshot, publish_store};
 pub use server::{
-    BlobServer, BlobServerBuilder, BlobSource, FileBlobSource, MemoryBlobSource, ReadAtSize,
-    ServerHandle,
+    BlobServer, BlobServerBuilder, BlobSource, ErrorCallback, FileBlobSource, MemoryBlobSource,
+    PushPolicy, ReadAtSize, ServerHandle,
 };
 pub use store::{ContentStore, DirStore, MemoryStore};
 pub use tree::{
@@ -92,6 +92,16 @@ pub fn manifest_key(prefix: &str, id: &str) -> String {
 /// Key of slice `index` (the bao-verified transfer chunk) for blob `id`.
 pub fn slice_key(prefix: &str, id: &str, index: u32) -> String {
     format!("{prefix}/{id}/slice/{index}")
+}
+
+/// Key an uploader GETs (with a manifest payload) to offer a push of `id`.
+pub fn push_offer_key(prefix: &str, id: &str) -> String {
+    format!("{prefix}/{id}/push/offer")
+}
+
+/// Key an uploader GETs (with a bao-slice payload) to push chunk `index`.
+pub fn push_slice_key(prefix: &str, id: &str, index: u32) -> String {
+    format!("{prefix}/{id}/push/slice/{index}")
 }
 
 /// Selector a client GETs to fetch the given chunk-index ranges of blob `id`.

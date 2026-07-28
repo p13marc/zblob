@@ -19,8 +19,9 @@ use crate::chunk::TransferChunks;
 use crate::error::{BlobError, Result};
 use crate::manifest::{BlobSpec, Manifest, validate_id};
 use crate::obs::{zdebug, zwarn};
+use crate::resume::ResumeState;
 use crate::verify::{self, OutboardStore, ReadAtCursor};
-use crate::wire::{ENC_MANIFEST, ENC_SLICE, encode};
+use crate::wire::{ENC_MANIFEST, ENC_PUSH, ENC_SLICE, encode};
 use crate::{manifest_key, parse_id, parse_ranges, slice_key};
 
 /// A positional, sized, thread-safe byte source: what a [`BlobSource`] opens.
@@ -111,12 +112,36 @@ struct Registered {
 /// Callback invoked with every error raised while serving a query.
 pub type ErrorCallback = Arc<dyn Fn(&BlobError) + Send + Sync>;
 
+/// Authorization hook for the push (upload) protocol: called for the initial
+/// offer *and* for every pushed slice, with the offered manifest and the
+/// opaque token the uploader attached to the query (if any).
+pub trait PushPolicy: Send + Sync {
+    /// Whether to accept this upload.
+    fn allow(&self, manifest: &Manifest, token: Option<&[u8]>) -> bool;
+}
+
+#[derive(Clone)]
+struct PushConfig {
+    policy: Arc<dyn PushPolicy>,
+    spool_dir: std::path::PathBuf,
+    max_blob_size: u64,
+}
+
+/// An in-progress push: spooled `.part` + resume bitfield, mirroring the
+/// download client's state machine on the receiving side.
+struct PushEntry {
+    manifest: Manifest,
+    chunks: TransferChunks,
+    state: ResumeState,
+}
+
 #[derive(Clone)]
 struct ServerConfig {
     max_inflight: usize,
     max_chunks_per_query: u32,
     outboard_mem_limit: u64,
     on_error: Option<ErrorCallback>,
+    push: Option<PushConfig>,
 }
 
 impl Default for ServerConfig {
@@ -128,6 +153,7 @@ impl Default for ServerConfig {
             // keep their outboard in a sibling file.
             outboard_mem_limit: 16 * 1024 * 1024,
             on_error: None,
+            push: None,
         }
     }
 }
@@ -138,6 +164,7 @@ struct Inner {
     registry: RwLock<HashMap<String, Registered>>,
     inflight: Semaphore,
     cfg: ServerConfig,
+    pushes: tokio::sync::Mutex<HashMap<String, PushEntry>>,
 }
 
 /// Serves registered blobs over a Zenoh queryable at `<prefix>/**`.
@@ -183,6 +210,23 @@ impl BlobServerBuilder {
         self
     }
 
+    /// Accept verified pushes (uploads): `policy` authorizes each offer and
+    /// slice, `spool_dir` holds in-progress `.part`s and completed blobs.
+    /// Completed uploads are automatically registered and served. Pushes are
+    /// **rejected unless this is configured.**
+    pub fn accept_push(
+        mut self,
+        policy: Arc<dyn PushPolicy>,
+        spool_dir: impl Into<std::path::PathBuf>,
+    ) -> Self {
+        self.cfg.push = Some(PushConfig {
+            policy,
+            spool_dir: spool_dir.into(),
+            max_blob_size: 1 << 40,
+        });
+        self
+    }
+
     /// Build the server.
     pub fn build(self) -> BlobServer {
         BlobServer {
@@ -192,6 +236,7 @@ impl BlobServerBuilder {
                 registry: RwLock::new(HashMap::new()),
                 inflight: Semaphore::new(self.cfg.max_inflight),
                 cfg: self.cfg,
+                pushes: tokio::sync::Mutex::new(HashMap::new()),
             }),
         }
     }
@@ -416,6 +461,18 @@ async fn serve_one(inner: &Inner, query: zenoh::query::Query) -> Result<()> {
         return Ok(()); // not a per-blob query; ignore.
     };
 
+    // Push protocol (upload): dispatched before the registry lookup — a blob
+    // being pushed is not registered yet.
+    if key_str.ends_with("/push/offer") {
+        return handle_push_offer(inner, query).await;
+    }
+    if let Some(idx) = key_str
+        .rsplit_once("/push/slice/")
+        .and_then(|(head, i)| head.ends_with(&id).then(|| i.parse::<u32>().ok()).flatten())
+    {
+        return handle_push_slice(inner, query, &id, idx).await;
+    }
+
     // Snapshot the registration (clone the cheap manifest + Arc the rest) so we
     // don't hold the registry lock across the stream.
     let (manifest, chunks, source, outboard) = {
@@ -492,5 +549,248 @@ async fn serve_one(inner: &Inner, query: zenoh::query::Query) -> Result<()> {
         }
     }
     let _ = manifest; // identity travels via the manifest GET; slices are self-verifying.
+    Ok(())
+}
+
+/// The spool `.part` path for an in-progress push of `id`.
+fn push_part_path(push: &PushConfig, id: &str) -> std::path::PathBuf {
+    push.spool_dir.join(format!("{id}.push.part"))
+}
+
+/// Handle an upload offer: authorize, create/resume spool state, and reply
+/// with the chunk ranges the server still wants.
+async fn handle_push_offer(inner: &Inner, query: zenoh::query::Query) -> Result<()> {
+    let Some(push) = inner.cfg.push.clone() else {
+        let _ = query.reply_err("push not enabled on this server").await;
+        return Ok(());
+    };
+    let Some(payload) = query.payload() else {
+        let _ = query.reply_err("push offer carries no manifest").await;
+        return Ok(());
+    };
+    let manifest: Manifest = match crate::wire::decode(&payload.to_bytes()) {
+        Ok(m) => m,
+        Err(e) => {
+            let _ = query.reply_err(format!("bad manifest: {e}")).await;
+            return Ok(());
+        }
+    };
+    if let Err(e) = manifest.validate(push.max_blob_size) {
+        let _ = query.reply_err(format!("bad manifest: {e}")).await;
+        return Ok(());
+    }
+    let token = query.attachment().map(|a| a.to_bytes().to_vec());
+    if !push.policy.allow(&manifest, token.as_deref()) {
+        let _ = query.reply_err("push denied by policy").await;
+        return Ok(());
+    }
+    let chunks = manifest.chunks()?;
+    let count = chunks.count();
+
+    let mut pushes = inner.pushes.lock().await;
+    let entry = match pushes.get(&manifest.id) {
+        Some(existing) if existing.manifest.root != manifest.root => {
+            let _ = query
+                .reply_err("a conflicting push for this id is in progress")
+                .await;
+            return Ok(());
+        }
+        Some(existing) => existing,
+        None => {
+            tokio::fs::create_dir_all(&push.spool_dir).await?;
+            let part = push_part_path(&push, &manifest.id);
+            // Resume a spooled push across restarts, exactly like a download.
+            let existing_len = tokio::fs::metadata(&part).await.map(|m| m.len()).ok();
+            let state = match ResumeState::load(&part).await {
+                Some(s)
+                    if s.matches(&manifest, count) && existing_len == Some(manifest.total_len) =>
+                {
+                    s
+                }
+                _ => {
+                    let file = tokio::fs::File::create(&part).await?;
+                    file.set_len(manifest.total_len).await?;
+                    let fresh = ResumeState::fresh(&manifest, count);
+                    fresh.save_atomic(&part).await?;
+                    fresh
+                }
+            };
+            zdebug!(id = %manifest.id, chunks = count, "push offer accepted");
+            pushes.insert(
+                manifest.id.clone(),
+                PushEntry {
+                    manifest: manifest.clone(),
+                    chunks,
+                    state,
+                },
+            );
+            pushes.get(&manifest.id).expect("just inserted")
+        }
+    };
+
+    let wanted: Vec<(u32, u32)> = entry
+        .state
+        .missing_ranges(count)
+        .into_iter()
+        .map(|r| (r.start, r.end))
+        .collect();
+    let empty = wanted.is_empty();
+    let ack = crate::wire::encode(&wanted)?;
+    drop(pushes);
+    // An empty or already-complete blob finalizes straight away.
+    if empty {
+        finalize_push(inner, &push, &manifest.id).await?;
+    }
+    query
+        .reply(query.key_expr().clone(), ack)
+        .encoding(ENC_PUSH)
+        .await
+        .map_err(BlobError::zenoh)?;
+    Ok(())
+}
+
+/// Handle one pushed slice: authorize, verify against the offered root, write
+/// to the spool, and ack with the number of chunks still missing.
+async fn handle_push_slice(
+    inner: &Inner,
+    query: zenoh::query::Query,
+    id: &str,
+    index: u32,
+) -> Result<()> {
+    let Some(push) = inner.cfg.push.clone() else {
+        let _ = query.reply_err("push not enabled on this server").await;
+        return Ok(());
+    };
+    let Some(payload) = query.payload() else {
+        let _ = query.reply_err("push slice carries no payload").await;
+        return Ok(());
+    };
+    let slice = payload.to_bytes().to_vec();
+    let token = query.attachment().map(|a| a.to_bytes().to_vec());
+
+    let mut pushes = inner.pushes.lock().await;
+    let Some(entry) = pushes.get_mut(id) else {
+        let _ = query.reply_err("no push offer for this id").await;
+        return Ok(());
+    };
+    if !push.policy.allow(&entry.manifest, token.as_deref()) {
+        let _ = query.reply_err("push denied by policy").await;
+        return Ok(());
+    }
+    let count = entry.chunks.count();
+    if index >= count {
+        let _ = query.reply_err("slice index out of range").await;
+        return Ok(());
+    }
+
+    if !entry.state.is_set(index) {
+        // Verify-decode against the *offered* root; a bad slice is refused.
+        let root: blake3::Hash = entry.manifest.root.into();
+        let total_len = entry.manifest.total_len;
+        let byte_range = entry.chunks.byte_range(index);
+        let mut leaves: Vec<(u64, Vec<u8>)> = Vec::new();
+        let decoded = verify::decode_slice(
+            &root,
+            total_len,
+            verify::chunk_range(byte_range),
+            &slice,
+            |off, data| {
+                leaves.push((off, data.to_vec()));
+                Ok(())
+            },
+        );
+        if decoded.is_err() {
+            let _ = query.reply_err("slice failed verification").await;
+            return Ok(());
+        }
+        let part = push_part_path(&push, id);
+        let write_part = part.clone();
+        tokio::task::spawn_blocking(move || -> std::io::Result<()> {
+            use std::io::{Seek, SeekFrom, Write};
+            let mut f = std::fs::OpenOptions::new().write(true).open(&write_part)?;
+            for (off, data) in &leaves {
+                f.seek(SeekFrom::Start(*off))?;
+                f.write_all(data)?;
+            }
+            f.sync_data()
+        })
+        .await
+        .map_err(|e| BlobError::Protocol(format!("push write task: {e}")))??;
+        entry.state.mark(index);
+        entry.state.save_atomic(&part).await?;
+    }
+
+    let remaining = count - entry.state.received();
+    let ack = crate::wire::encode(&remaining)?;
+    drop(pushes);
+    if remaining == 0 {
+        finalize_push(inner, &push, id).await?;
+    }
+    query
+        .reply(query.key_expr().clone(), ack)
+        .encoding(ENC_PUSH)
+        .await
+        .map_err(BlobError::zenoh)?;
+    Ok(())
+}
+
+/// Complete a push: move the spool into place, compute the outboard, and
+/// register the blob for serving.
+async fn finalize_push(inner: &Inner, push: &PushConfig, id: &str) -> Result<()> {
+    let entry = {
+        let mut pushes = inner.pushes.lock().await;
+        match pushes.remove(id) {
+            Some(e) => e,
+            None => return Ok(()), // already finalized by a concurrent ack
+        }
+    };
+    let part = push_part_path(push, id);
+    let blob_path = push.spool_dir.join(format!("{id}.blob"));
+    tokio::fs::rename(&part, &blob_path).await?;
+    ResumeState::remove(&part).await;
+
+    let mem_limit = inner.cfg.outboard_mem_limit;
+    let hash_path = blob_path.clone();
+    let (outboard, total_len) =
+        tokio::task::spawn_blocking(move || -> std::io::Result<(OutboardStore, u64)> {
+            let file = std::fs::File::open(&hash_path)?;
+            let total_len = file.metadata()?.len();
+            let est_outboard = total_len / verify::GROUP_SIZE * 64;
+            let store = if est_outboard > mem_limit {
+                let obao = {
+                    let mut p = hash_path.as_os_str().to_os_string();
+                    p.push(".obao4");
+                    std::path::PathBuf::from(p)
+                };
+                OutboardStore::File(verify::compute_outboard_file(&file, total_len, &obao)?)
+            } else {
+                OutboardStore::Mem(verify::compute_outboard(file)?)
+            };
+            Ok((store, total_len))
+        })
+        .await
+        .map_err(|e| BlobError::Protocol(format!("finalize task: {e}")))??;
+
+    // Every slice was verified against the offered root, so this cannot fail
+    // unless the spool was tampered with on disk between write and finalize.
+    let actual: crate::hash::Hash = outboard.root().into();
+    if actual != entry.manifest.root || total_len != entry.manifest.total_len {
+        let _ = tokio::fs::remove_file(&blob_path).await;
+        return Err(BlobError::RootMismatch {
+            expected: entry.manifest.root,
+            actual,
+        });
+    }
+
+    zdebug!(id = %entry.manifest.id, total_len, "push finalized and registered");
+    inner.registry.write().await.insert(
+        entry.manifest.id.clone(),
+        Registered {
+            manifest: entry.manifest,
+            chunks: entry.chunks,
+            source: Arc::new(FileBlobSource::new(blob_path)),
+            outboard: Arc::new(outboard),
+        },
+    );
     Ok(())
 }

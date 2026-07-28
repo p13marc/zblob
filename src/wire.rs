@@ -26,6 +26,8 @@ pub const ENC_SLICE: &str = "zblob/bao4;v=2";
 pub const ENC_INDEX: &str = "zblob/index;v=2";
 /// Encoding tag of a Tier-2 raw content-addressed chunk reply.
 pub const ENC_CHUNK: &str = "zblob/chunk";
+/// Encoding tag of push-protocol acknowledgement replies.
+pub const ENC_PUSH: &str = "zblob/push;v=2";
 
 /// Encode a control message to postcard bytes.
 pub fn encode<T: Serialize>(value: &T) -> Result<Vec<u8>> {

@@ -23,12 +23,14 @@ use crate::cancel::CancelToken;
 use crate::chunk::TransferChunks;
 use crate::error::{BlobError, Result};
 use crate::hash::Hash;
-use crate::manifest::{Manifest, validate_id};
+use crate::manifest::{BlobSpec, Manifest, validate_id};
 use crate::obs::{TransferStats, zdebug};
 use crate::progress::{Progress, ProgressSink};
 use crate::resume::ResumeState;
-use crate::wire::{ENC_MANIFEST, ENC_SLICE, decode};
-use crate::{MAX_RANGE_SPANS, manifest_key, slice_selector, verify};
+use crate::wire::{ENC_MANIFEST, ENC_PUSH, ENC_SLICE, decode};
+use crate::{
+    MAX_RANGE_SPANS, manifest_key, push_offer_key, push_slice_key, slice_selector, verify,
+};
 
 /// What to do when the destination path already exists at completion time.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -263,6 +265,176 @@ impl BlobClient {
         let part = part_path(dest);
         let _ = tokio::fs::remove_file(&part).await;
         ResumeState::remove(&part).await;
+    }
+
+    /// Upload (push) the file at `path` to a server that has
+    /// [`accept_push`](crate::BlobServerBuilder::accept_push) configured,
+    /// under `spec`. `token` is an opaque credential the server's
+    /// [`PushPolicy`](crate::PushPolicy) sees with every request.
+    ///
+    /// The whole file is hashed locally first; every slice the server receives
+    /// is verified against that root, and a completed upload is registered and
+    /// served by the receiver. Interrupted uploads resume: the server's offer
+    /// reply names exactly the chunks it is still missing. Returns the
+    /// manifest (distribute `(id, root)` to downloaders).
+    pub async fn upload_file(
+        &self,
+        spec: BlobSpec,
+        path: impl Into<PathBuf>,
+        token: Option<Vec<u8>>,
+        sink: &dyn ProgressSink,
+        cancel: &CancelToken,
+    ) -> Result<Manifest> {
+        use crate::verify::{MemOutboard, chunk_range};
+        let path = path.into();
+
+        // Hash the source once: outboard + manifest, exactly like server-side
+        // registration.
+        let hash_path = path.clone();
+        let (outboard, total_len) =
+            tokio::task::spawn_blocking(move || -> std::io::Result<(MemOutboard, u64)> {
+                let file = std::fs::File::open(&hash_path)?;
+                let total_len = file.metadata()?.len();
+                Ok((verify::compute_outboard(file)?, total_len))
+            })
+            .await
+            .map_err(|e| BlobError::Protocol(format!("hash task: {e}")))??;
+        let outboard = Arc::new(outboard);
+        let chunks = TransferChunks::new(spec.chunk_size, total_len)?;
+        let manifest = Manifest {
+            version: crate::wire::WIRE_VERSION,
+            id: spec.id.clone(),
+            filename: spec.filename,
+            total_len,
+            chunk_size: spec.chunk_size,
+            root: crate::hash::Hash::from(outboard.root),
+            created_ms: spec.created_ms,
+        };
+        manifest.validate(u64::MAX)?;
+
+        // Offer: the reply lists the chunk ranges the server still wants.
+        let offer_key = push_offer_key(&self.prefix, &manifest.id);
+        let mut builder = self
+            .session
+            .get(&offer_key)
+            .consolidation(ConsolidationMode::None)
+            .timeout(self.cfg.query_timeout)
+            .payload(crate::wire::encode(&manifest)?);
+        if let Some(tok) = &token {
+            builder = builder.attachment(tok.clone());
+        }
+        let replies = builder.await.map_err(BlobError::zenoh)?;
+        let mut wanted: Option<Vec<(u32, u32)>> = None;
+        while let Ok(reply) = replies.recv_async().await {
+            match reply.result() {
+                Ok(sample) if sample.encoding().to_string() == ENC_PUSH => {
+                    wanted = Some(decode(&sample.payload().to_bytes())?);
+                    break;
+                }
+                Ok(_) => continue,
+                Err(e) => {
+                    return Err(BlobError::PushDenied(
+                        String::from_utf8_lossy(&e.payload().to_bytes()).into_owned(),
+                    ));
+                }
+            }
+        }
+        let wanted = wanted
+            .ok_or_else(|| BlobError::PushDenied("no push endpoint answered the offer".into()))?;
+
+        let count = chunks.count();
+        let to_send: u32 = wanted.iter().map(|(a, b)| b - a).sum();
+        if to_send < count {
+            sink.emit(Progress::Resumed {
+                received: count - to_send,
+                total: count,
+            });
+        } else {
+            sink.emit(Progress::Started {
+                total_len,
+                chunk_count: count,
+            });
+        }
+        zdebug!(id = %manifest.id, total = count, to_send, "push offer accepted");
+
+        // Stream the wanted slices, one acknowledged query each.
+        let mut sent = count - to_send;
+        let mut bytes_sent: u64 = 0;
+        let mut reader = tokio::task::spawn_blocking({
+            let path = path.clone();
+            move || std::fs::File::open(path)
+        })
+        .await
+        .map_err(|e| BlobError::Protocol(format!("open task: {e}")))??;
+        for (start, end) in wanted {
+            for index in start..end {
+                if cancel.is_cancelled() {
+                    sink.emit(Progress::Cancelled {
+                        received: sent,
+                        total: count,
+                    });
+                    return Err(BlobError::Cancelled {
+                        received: sent,
+                        total: count,
+                    });
+                }
+                let ob = outboard.clone();
+                let byte_range = chunks.byte_range(index);
+                let (r, slice) = tokio::task::spawn_blocking(
+                    move || -> (std::fs::File, std::io::Result<Vec<u8>>) {
+                        let slice = verify::encode_slice(&reader, &*ob, chunk_range(byte_range));
+                        (reader, slice)
+                    },
+                )
+                .await
+                .map_err(|e| BlobError::Protocol(format!("encode task: {e}")))?;
+                reader = r;
+                let slice = slice?;
+
+                let mut b = self
+                    .session
+                    .get(push_slice_key(&self.prefix, &manifest.id, index))
+                    .consolidation(ConsolidationMode::None)
+                    .timeout(self.cfg.query_timeout)
+                    .payload(slice);
+                if let Some(tok) = &token {
+                    b = b.attachment(tok.clone());
+                }
+                let replies = b.await.map_err(BlobError::zenoh)?;
+                let mut acked = false;
+                while let Ok(reply) = replies.recv_async().await {
+                    match reply.result() {
+                        Ok(sample) if sample.encoding().to_string() == ENC_PUSH => {
+                            let _remaining: u32 = decode(&sample.payload().to_bytes())?;
+                            acked = true;
+                            break;
+                        }
+                        Ok(_) => continue,
+                        Err(e) => {
+                            return Err(BlobError::PushDenied(
+                                String::from_utf8_lossy(&e.payload().to_bytes()).into_owned(),
+                            ));
+                        }
+                    }
+                }
+                if !acked {
+                    return Err(BlobError::Incomplete {
+                        received: sent,
+                        total: count,
+                    });
+                }
+                sent += 1;
+                bytes_sent += chunks.len_of(index) as u64;
+                sink.emit(Progress::Chunk {
+                    index,
+                    received: sent,
+                    total: count,
+                    bytes_received: bytes_sent,
+                });
+            }
+        }
+        sink.emit(Progress::Completed { path });
+        Ok(manifest)
     }
 
     async fn download_to_inner(
