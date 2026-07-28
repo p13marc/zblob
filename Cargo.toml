@@ -19,13 +19,17 @@ categories = ["network-programming", "filesystem"]
 
 [dependencies]
 zenoh = { version = "1.9", features = ["unstable"] }
-tokio = { version = "1", features = ["full"] }
+tokio = { version = "1", features = ["fs", "io-util", "rt", "sync", "macros", "time"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 ciborium = "0.2"
 thiserror = "2"
 sha2 = "0.11"
 fastcdc = "4"
+blake3 = "1.8"
+bao-tree = { version = "0.16", default-features = false, features = ["fs", "validate"] }
+postcard = { version = "1.1", features = ["use-std"] }
 
 [dev-dependencies]
 tempfile = "3"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "time"] }

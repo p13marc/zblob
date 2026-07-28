@@ -56,6 +56,7 @@ mod resume;
 mod server;
 mod store;
 mod tree;
+mod verify;
 
 pub use cancel::CancelToken;
 pub use chunk::{
