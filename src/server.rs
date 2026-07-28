@@ -191,6 +191,10 @@ pub struct ServerHandle {
 }
 
 impl ServerHandle {
+    pub(crate) fn new(join: tokio::task::JoinHandle<Result<()>>, stop: Arc<Notify>) -> Self {
+        ServerHandle { join, stop }
+    }
+
     /// Ask the serve loop to stop and wait for it to finish. Query tasks
     /// already in flight complete on their own.
     pub async fn shutdown(self) -> Result<()> {
@@ -341,7 +345,7 @@ impl BlobServer {
         self.serve_loop(queryable, Arc::new(Notify::new())).await
     }
 
-    async fn declare(&self) -> Result<BlobQueryable> {
+    async fn declare(&self) -> Result<FifoQueryable> {
         let key = format!("{}/**", self.inner.prefix);
         self.inner
             .session
@@ -350,7 +354,7 @@ impl BlobServer {
             .map_err(BlobError::zenoh)
     }
 
-    async fn serve_loop(self, queryable: BlobQueryable, stop: Arc<Notify>) -> Result<()> {
+    async fn serve_loop(self, queryable: FifoQueryable, stop: Arc<Notify>) -> Result<()> {
         loop {
             tokio::select! {
                 _ = stop.notified() => break,
@@ -369,17 +373,17 @@ impl BlobServer {
     }
 }
 
-/// The declared-queryable type with zenoh's default FIFO handler.
-type BlobQueryable =
-    zenoh::query::Queryable<zenoh::handlers::FifoChannelHandler<zenoh::query::Query>>;
-
-fn tracing_error(e: &BlobError) {
+pub(crate) fn tracing_error(e: &BlobError) {
     // The crate has no logging dependency; surface serve errors on stderr in debug
     // builds without pulling `tracing` into a would-be-published library.
     #[cfg(debug_assertions)]
     eprintln!("zblob: serve error: {e}");
     let _ = e;
 }
+
+/// The declared-queryable type with zenoh's default FIFO handler.
+pub(crate) type FifoQueryable =
+    zenoh::query::Queryable<zenoh::handlers::FifoChannelHandler<zenoh::query::Query>>;
 
 async fn serve_one(inner: &Inner, query: zenoh::query::Query) -> Result<()> {
     let _permit = inner

@@ -6,21 +6,31 @@
 mod common;
 
 use std::sync::Arc;
-
-use common::{isolated_config, unique_prefix};
 use std::sync::Mutex;
+use std::time::Duration;
 
+use common::unique_prefix;
 use zblob::{
-    BlobError, CancelToken, ContentStore, DirStore, Entry, FastCdcChunker, FixedSizeChunker,
-    MIN_CHUNK_SIZE, MemoryStore, Progress, ProgressSink, TreeClient, TreeServer, build_tree,
+    BlobError, CancelToken, CdcParams, ContentStore, DirStore, DownloadRequest, Entry, MemoryStore,
+    Progress, ProgressSink, TreeClient, TreeServer, build_tree,
 };
+
+/// Small CDC parameters so the test fixtures span multiple chunks.
+fn small_cdc() -> CdcParams {
+    CdcParams {
+        min: 2048,
+        avg: 8192,
+        max: 32768,
+        normalization: 2,
+        gear_seed: 0,
+    }
+}
 
 /// Populate a temp directory tree: a nested dir, two files (one large enough to
 /// span several chunks), and — on unix — a symlink.
 fn make_tree(root: &std::path::Path) {
     std::fs::create_dir_all(root.join("sub/deep")).unwrap();
-    // ~3.5 chunks so we exercise the short tail + multi-chunk file.
-    let big = common::pseudo_random(MIN_CHUNK_SIZE as usize * 3 + 1234, 42);
+    let big = common::pseudo_random(100_000, 42);
     std::fs::write(root.join("big.bin"), &big).unwrap();
     std::fs::write(root.join("sub/hello.txt"), b"hello world").unwrap();
     std::fs::write(root.join("sub/deep/note.md"), b"# note\n").unwrap();
@@ -28,7 +38,8 @@ fn make_tree(root: &std::path::Path) {
     std::os::unix::fs::symlink("hello.txt", root.join("sub/link")).unwrap();
 }
 
-/// Recursively compare two directory trees for byte-identical content + structure.
+/// Recursively compare two directory trees for byte-identical content +
+/// structure, and (unix) equal modes.
 fn assert_dirs_equal(a: &std::path::Path, b: &std::path::Path) {
     let mut ea: Vec<_> = std::fs::read_dir(a)
         .unwrap()
@@ -58,153 +69,116 @@ fn assert_dirs_equal(a: &std::path::Path, b: &std::path::Path) {
                 std::fs::read(&pb).unwrap(),
                 "{name:?}"
             );
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                let mb = std::fs::symlink_metadata(&pb).unwrap();
+                assert_eq!(
+                    ma.permissions().mode(),
+                    mb.permissions().mode(),
+                    "mode differs for {name:?}"
+                );
+            }
         }
     }
 }
 
-/// Spawn a `TreeServer` serving `index` + `store` under the given prefixes.
-async fn serve(
-    session: Arc<zenoh::Session>,
-    store_prefix: String,
-    tree_prefix: String,
-    store: Arc<dyn ContentStore>,
-    index: zblob::TreeIndex,
-) -> tokio::task::JoinHandle<()> {
-    let server = TreeServer::new(session, store_prefix, tree_prefix, store);
-    server.register(index).await;
-    let handle = tokio::spawn(async move {
-        let _ = server.run().await;
-    });
-    // Let both queryables settle before the client GETs (mirrors the Tier-1 test).
-    tokio::time::sleep(std::time::Duration::from_millis(150)).await;
-    handle
+fn test_client(session: Arc<zenoh::Session>, store_prefix: &str, tree_prefix: &str) -> TreeClient {
+    TreeClient::builder(session, store_prefix, tree_prefix)
+        .query_timeout(Duration::from_secs(5))
+        .build()
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn tree_roundtrip() {
-    let session = Arc::new(zenoh::open(isolated_config()).await.unwrap());
+async fn tree_roundtrip_with_modes_and_mtime() {
+    let session = common::open_session().await;
     let p = unique_prefix();
     let store_prefix = format!("{p}/store");
     let tree_prefix = format!("{p}/tree");
 
     let src = tempfile::tempdir().unwrap();
     make_tree(src.path());
-
-    // Build the snapshot + populate the server store.
-    let chunker = FixedSizeChunker::new(MIN_CHUNK_SIZE);
-    let (index, chunks) = build_tree(src.path(), "snap1", &chunker).unwrap();
-    let server_store = Arc::new(MemoryStore::new());
-    for (h, bytes) in &chunks {
-        server_store.put(h, bytes).unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(
+            src.path().join("big.bin"),
+            std::fs::Permissions::from_mode(0o750),
+        )
+        .unwrap();
     }
-    let n_chunks = server_store.len();
 
-    let handle = serve(
+    let server_store: Arc<dyn ContentStore> = Arc::new(MemoryStore::new());
+    let index = build_tree(src.path(), "snap1", &small_cdc(), &*server_store).unwrap();
+    let n_chunks = index.needed_chunks().len();
+    assert!(n_chunks > 3, "fixture should span several chunks");
+    let expected_root = index.root_hash;
+
+    let server = TreeServer::new(
         session.clone(),
         store_prefix.clone(),
         tree_prefix.clone(),
         server_store,
-        index,
-    )
-    .await;
+    );
+    server.register(index).await;
+    let handle = server.spawn().await.unwrap();
 
-    // Download into an empty client store + fresh dest dir.
+    // Download (pinned) into an empty client store + fresh dest dir.
     let client_dir = tempfile::tempdir().unwrap();
-    let client = TreeClient::new(session.clone(), store_prefix, tree_prefix);
-    let client_store = MemoryStore::new();
-    client
-        .download_tree("snap1", client_dir.path(), &client_store)
-        .await
-        .expect("download tree");
+    let client = test_client(session.clone(), &store_prefix, &tree_prefix);
+    let client_store: Arc<dyn ContentStore> = Arc::new(MemoryStore::new());
+    tokio::time::timeout(
+        Duration::from_secs(20),
+        client.download_tree(
+            &DownloadRequest::pinned("snap1", expected_root),
+            client_dir.path(),
+            &client_store,
+            &(),
+            &CancelToken::new(),
+        ),
+    )
+    .await
+    .expect("timed out")
+    .expect("download tree");
 
     assert_dirs_equal(src.path(), client_dir.path());
-    // Every needed chunk was fetched exactly into the client store.
-    assert_eq!(client_store.len(), n_chunks);
+    assert_eq!(client_store.hashes().unwrap().len(), n_chunks);
 
-    handle.abort();
-    session.close().await.unwrap();
-}
-
-/// The whole tree pipeline (build → serve → download → reconstruct → verify root)
-/// works with a content-defined chunker too: chunks are variable-length, so this
-/// exercises the index's per-chunk `len` on the reconstruction path.
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn tree_roundtrip_fastcdc() {
-    let session = Arc::new(zenoh::open(isolated_config()).await.unwrap());
-    let p = unique_prefix();
-    let store_prefix = format!("{p}/store");
-    let tree_prefix = format!("{p}/tree");
-
-    let src = tempfile::tempdir().unwrap();
-    make_tree(src.path());
-
-    let chunker = FastCdcChunker::new(8192);
-    let (index, chunks) = build_tree(src.path(), "snap1", &chunker).unwrap();
-    assert!(index.chunk_policy.starts_with("fastcdc-"));
-    // The big file spans several variable-length chunks.
-    let big_chunks = index
-        .entries
-        .iter()
-        .find_map(|e| match e {
-            Entry::File { path, chunks, .. } if path == "big.bin" => Some(chunks.clone()),
-            _ => None,
-        })
+    // mtime restored (within fs precision).
+    let src_mtime = std::fs::metadata(src.path().join("big.bin"))
+        .unwrap()
+        .modified()
         .unwrap();
-    assert!(big_chunks.len() > 1);
+    let dst_mtime = std::fs::metadata(client_dir.path().join("big.bin"))
+        .unwrap()
+        .modified()
+        .unwrap();
+    let drift = src_mtime
+        .duration_since(dst_mtime)
+        .unwrap_or_else(|e| e.duration());
     assert!(
-        big_chunks
-            .iter()
-            .map(|c| c.len)
-            .collect::<std::collections::HashSet<_>>()
-            .len()
-            > 1,
-        "FastCDC should produce variable-length chunks"
+        drift <= Duration::from_secs(1),
+        "mtime restored ({drift:?})"
     );
 
-    let server_store = Arc::new(MemoryStore::new());
-    for (h, bytes) in &chunks {
-        server_store.put(h, bytes).unwrap();
-    }
-    let handle = serve(
-        session.clone(),
-        store_prefix.clone(),
-        tree_prefix.clone(),
-        server_store,
-        index,
-    )
-    .await;
-
-    let client_dir = tempfile::tempdir().unwrap();
-    let client = TreeClient::new(session.clone(), store_prefix, tree_prefix);
-    let client_store = MemoryStore::new();
-    client
-        .download_tree("snap1", client_dir.path(), &client_store)
-        .await
-        .expect("download fastcdc tree");
-
-    assert_dirs_equal(src.path(), client_dir.path());
-
-    handle.abort();
+    handle.shutdown().await.unwrap();
     session.close().await.unwrap();
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn reedit_transfers_only_changed_chunks() {
-    let session = Arc::new(zenoh::open(isolated_config()).await.unwrap());
+    let session = common::open_session().await;
     let p = unique_prefix();
     let store_prefix = format!("{p}/store");
     let tree_prefix = format!("{p}/tree");
-    let chunker = FixedSizeChunker::new(MIN_CHUNK_SIZE);
 
     let src = tempfile::tempdir().unwrap();
     make_tree(src.path());
 
     // Snapshot 1 → client store now holds every chunk.
-    let (index1, chunks1) = build_tree(src.path(), "snap1", &chunker).unwrap();
-    let server_store = Arc::new(MemoryStore::new());
-    for (h, bytes) in &chunks1 {
-        server_store.put(h, bytes).unwrap();
-    }
+    let server_store_mem = Arc::new(MemoryStore::new());
+    let server_store: Arc<dyn ContentStore> = server_store_mem.clone();
+    let index1 = build_tree(src.path(), "snap1", &small_cdc(), &*server_store).unwrap();
     let server = TreeServer::new(
         session.clone(),
         store_prefix.clone(),
@@ -212,39 +186,41 @@ async fn reedit_transfers_only_changed_chunks() {
         server_store.clone(),
     );
     server.register(index1).await;
-    let srv = {
-        let server = server.clone();
-        tokio::spawn(async move {
-            let _ = server.run().await;
-        })
-    };
-    tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+    let handle = server.clone().spawn().await.unwrap();
 
     let client_dir = tempfile::tempdir().unwrap();
     // Persistent client store survives "across syncs" (DirStore on disk).
     let store_dir = tempfile::tempdir().unwrap();
-    let client_store = DirStore::open(store_dir.path()).unwrap();
-    let client = TreeClient::new(session.clone(), store_prefix.clone(), tree_prefix.clone());
+    let client_store: Arc<dyn ContentStore> = Arc::new(DirStore::open(store_dir.path()).unwrap());
+    let client = test_client(session.clone(), &store_prefix, &tree_prefix);
     client
-        .download_tree("snap1", client_dir.path(), &client_store)
+        .download_tree(
+            &DownloadRequest::new("snap1"),
+            client_dir.path(),
+            &client_store,
+            &(),
+            &CancelToken::new(),
+        )
         .await
         .unwrap();
-    let after_first = std::fs::read_dir(store_dir.path()).unwrap().count();
+    let after_first = client_store.hashes().unwrap().len();
 
-    // Edit one small file → only its chunk changes. Append to the big file's tail
-    // would change one chunk too; editing the tiny file changes exactly one chunk.
+    // Edit one small file → only its chunk(s) change.
     std::fs::write(src.path().join("sub/hello.txt"), b"hello CHANGED world").unwrap();
-    let (index2, chunks2) = build_tree(src.path(), "snap2", &chunker).unwrap();
-    for (h, bytes) in &chunks2 {
-        server_store.put(h, bytes).unwrap();
-    }
+    let index2 = build_tree(src.path(), "snap2", &small_cdc(), &*server_store).unwrap();
     server.register(index2.clone()).await;
 
     client
-        .download_tree("snap2", client_dir.path(), &client_store)
+        .download_tree(
+            &DownloadRequest::new("snap2"),
+            client_dir.path(),
+            &client_store,
+            &(),
+            &CancelToken::new(),
+        )
         .await
         .unwrap();
-    let after_second = std::fs::read_dir(store_dir.path()).unwrap().count();
+    let after_second = client_store.hashes().unwrap().len();
 
     // The re-pull added exactly the one new (changed) chunk to the store.
     assert_eq!(
@@ -252,12 +228,11 @@ async fn reedit_transfers_only_changed_chunks() {
         1,
         "re-pull should transfer only the single changed chunk"
     );
-    // And the edited content is on disk.
     assert_eq!(
         std::fs::read(client_dir.path().join("sub/hello.txt")).unwrap(),
         b"hello CHANGED world"
     );
-    // The unchanged big file still verifies (its chunks were reused from the store).
+    // The unchanged big file still spans several reused chunks.
     let big_entry_chunks = index2
         .entries
         .iter()
@@ -268,60 +243,59 @@ async fn reedit_transfers_only_changed_chunks() {
         .unwrap();
     assert!(big_entry_chunks >= 3);
 
-    srv.abort();
+    handle.shutdown().await.unwrap();
     session.close().await.unwrap();
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn resume_from_prepopulated_store() {
-    let session = Arc::new(zenoh::open(isolated_config()).await.unwrap());
+    let session = common::open_session().await;
     let p = unique_prefix();
     let store_prefix = format!("{p}/store");
     let tree_prefix = format!("{p}/tree");
-    let chunker = FixedSizeChunker::new(MIN_CHUNK_SIZE);
 
     let src = tempfile::tempdir().unwrap();
     make_tree(src.path());
-    let (index, chunks) = build_tree(src.path(), "snap1", &chunker).unwrap();
-    let server_store = Arc::new(MemoryStore::new());
-    for (h, bytes) in &chunks {
-        server_store.put(h, bytes).unwrap();
-    }
-    let total = server_store.len();
+    let server_store: Arc<dyn ContentStore> = Arc::new(MemoryStore::new());
+    let index = build_tree(src.path(), "snap1", &small_cdc(), &*server_store).unwrap();
+    let total = index.needed_chunks().len();
 
-    let handle = serve(
+    let server = TreeServer::new(
         session.clone(),
         store_prefix.clone(),
         tree_prefix.clone(),
-        server_store,
-        index.clone(),
-    )
-    .await;
+        server_store.clone(),
+    );
+    server.register(index.clone()).await;
+    let handle = server.spawn().await.unwrap();
 
     // Simulate an interrupted earlier pull: half the chunks already on disk.
     let store_dir = tempfile::tempdir().unwrap();
-    let client_store = DirStore::open(store_dir.path()).unwrap();
+    let client_store: Arc<dyn ContentStore> = Arc::new(DirStore::open(store_dir.path()).unwrap());
     let needed = index.needed_chunks();
-    let half = needed.len() / 2;
-    for h in needed.iter().take(half) {
-        let bytes = chunks.iter().find(|(ch, _)| ch == h).unwrap().1.clone();
-        client_store.put(h, &bytes).unwrap();
+    for h in needed.iter().take(needed.len() / 2) {
+        client_store.put(h, &server_store.get(h).unwrap()).unwrap();
     }
-    let on_disk = || std::fs::read_dir(store_dir.path()).unwrap().count();
-    assert!(on_disk() < total);
+    assert!(client_store.hashes().unwrap().len() < total);
 
     // Resume: download_tree fetches only the missing remainder.
     let client_dir = tempfile::tempdir().unwrap();
-    let client = TreeClient::new(session.clone(), store_prefix, tree_prefix);
+    let client = test_client(session.clone(), &store_prefix, &tree_prefix);
     client
-        .download_tree("snap1", client_dir.path(), &client_store)
+        .download_tree(
+            &DownloadRequest::new("snap1"),
+            client_dir.path(),
+            &client_store,
+            &(),
+            &CancelToken::new(),
+        )
         .await
         .unwrap();
 
     assert_dirs_equal(src.path(), client_dir.path());
-    assert_eq!(on_disk(), total);
+    assert_eq!(client_store.hashes().unwrap().len(), total);
 
-    handle.abort();
+    handle.shutdown().await.unwrap();
     session.close().await.unwrap();
 }
 
@@ -336,43 +310,42 @@ impl ProgressSink for RecordingSink {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn cancellable_reports_progress_and_resumes() {
-    let session = Arc::new(zenoh::open(isolated_config()).await.unwrap());
+    let session = common::open_session().await;
     let p = unique_prefix();
     let store_prefix = format!("{p}/store");
     let tree_prefix = format!("{p}/tree");
-    let chunker = FixedSizeChunker::new(MIN_CHUNK_SIZE);
 
     let src = tempfile::tempdir().unwrap();
     make_tree(src.path());
-    let (index, chunks) = build_tree(src.path(), "snap1", &chunker).unwrap();
-    let server_store = Arc::new(MemoryStore::new());
-    for (h, bytes) in &chunks {
-        server_store.put(h, bytes).unwrap();
-    }
+    let server_store: Arc<dyn ContentStore> = Arc::new(MemoryStore::new());
+    let index = build_tree(src.path(), "snap1", &small_cdc(), &*server_store).unwrap();
     let total = index.needed_chunks().len();
     assert!(
         total >= 4,
         "need several chunks to test a mid-stream cancel"
     );
 
-    let handle = serve(
+    let server = TreeServer::new(
         session.clone(),
         store_prefix.clone(),
         tree_prefix.clone(),
         server_store,
-        index,
-    )
-    .await;
+    );
+    server.register(index).await;
+    let handle = server.spawn().await.unwrap();
 
-    let client = TreeClient::new(session.clone(), store_prefix.clone(), tree_prefix.clone());
+    // Serial fetch so the cancel lands mid-stream deterministically.
+    let client = TreeClient::builder(session.clone(), &store_prefix, &tree_prefix)
+        .query_timeout(Duration::from_secs(5))
+        .fetch_concurrency(1)
+        .build();
 
-    // 1) Cancel after the first chunk: the call returns Cancelled and the store is
-    //    left with whatever it fetched, so a resume can finish.
+    // 1) Cancel after the first chunk: the call returns Cancelled and the store
+    //    is left with whatever it fetched, so a resume can finish.
     let store_dir = tempfile::tempdir().unwrap();
-    let client_store = DirStore::open(store_dir.path()).unwrap();
+    let client_store: Arc<dyn ContentStore> = Arc::new(DirStore::open(store_dir.path()).unwrap());
     let cancel = CancelToken::new();
     {
-        // A sink that trips the cancel flag once one chunk has been received.
         struct CancelAfterOne {
             cancel: CancelToken,
         }
@@ -390,7 +363,13 @@ async fn cancellable_reports_progress_and_resumes() {
         };
         let dest = tempfile::tempdir().unwrap();
         let err = client
-            .download_tree_cancellable("snap1", dest.path(), &client_store, &sink, &cancel)
+            .download_tree(
+                &DownloadRequest::new("snap1"),
+                dest.path(),
+                &client_store,
+                &sink,
+                &cancel,
+            )
             .await
             .expect_err("cancelled mid-stream");
         match err {
@@ -401,7 +380,7 @@ async fn cancellable_reports_progress_and_resumes() {
             other => panic!("expected Cancelled, got {other:?}"),
         }
     }
-    let after_cancel = std::fs::read_dir(store_dir.path()).unwrap().count();
+    let after_cancel = client_store.hashes().unwrap().len();
     assert!(after_cancel >= 1 && after_cancel < total, "partial on disk");
 
     // 2) Resume with a fresh token + recording sink: it completes, progress is
@@ -409,8 +388,8 @@ async fn cancellable_reports_progress_and_resumes() {
     let sink = RecordingSink::default();
     let dest = tempfile::tempdir().unwrap();
     client
-        .download_tree_cancellable(
-            "snap1",
+        .download_tree(
+            &DownloadRequest::new("snap1"),
             dest.path(),
             &client_store,
             &sink,
@@ -439,6 +418,58 @@ async fn cancellable_reports_progress_and_resumes() {
     assert_eq!(last as usize, total, "progress reaches total");
     assert!(saw_complete, "emits Completed");
 
-    handle.abort();
+    handle.shutdown().await.unwrap();
+    session.close().await.unwrap();
+}
+
+/// Hard links survive the round trip as hard links (same inode), not copies.
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn hardlinks_roundtrip() {
+    use std::os::unix::fs::MetadataExt;
+
+    let session = common::open_session().await;
+    let p = unique_prefix();
+    let store_prefix = format!("{p}/store");
+    let tree_prefix = format!("{p}/tree");
+
+    let src = tempfile::tempdir().unwrap();
+    std::fs::write(src.path().join("orig.bin"), b"shared bytes").unwrap();
+    std::fs::hard_link(src.path().join("orig.bin"), src.path().join("copy.bin")).unwrap();
+
+    let server_store: Arc<dyn ContentStore> = Arc::new(MemoryStore::new());
+    let index = build_tree(src.path(), "hl", &small_cdc(), &*server_store).unwrap();
+    let server = TreeServer::new(
+        session.clone(),
+        store_prefix.clone(),
+        tree_prefix.clone(),
+        server_store,
+    );
+    server.register(index).await;
+    let handle = server.spawn().await.unwrap();
+
+    let dest = tempfile::tempdir().unwrap();
+    let client = test_client(session.clone(), &store_prefix, &tree_prefix);
+    let client_store: Arc<dyn ContentStore> = Arc::new(MemoryStore::new());
+    client
+        .download_tree(
+            &DownloadRequest::new("hl"),
+            dest.path(),
+            &client_store,
+            &(),
+            &CancelToken::new(),
+        )
+        .await
+        .unwrap();
+
+    let a = std::fs::metadata(dest.path().join("orig.bin")).unwrap();
+    let b = std::fs::metadata(dest.path().join("copy.bin")).unwrap();
+    assert_eq!(a.ino(), b.ino(), "hard link must be reconstructed as one");
+    assert_eq!(
+        std::fs::read(dest.path().join("copy.bin")).unwrap(),
+        b"shared bytes"
+    );
+
+    handle.shutdown().await.unwrap();
     session.close().await.unwrap();
 }

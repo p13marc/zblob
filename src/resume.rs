@@ -27,6 +27,7 @@ use serde::{Deserialize, Serialize};
 use crate::error::{BlobError, Result};
 use crate::hash::Hash;
 use crate::manifest::Manifest;
+use crate::paths::fsync_dir;
 use crate::wire::WIRE_VERSION;
 
 const MAGIC: &[u8; 8] = b"ZBLOBRS2";
@@ -165,17 +166,6 @@ impl ResumeState {
     pub async fn remove(part: &Path) {
         let _ = tokio::fs::remove_file(Self::sidecar_path(part)).await;
     }
-}
-
-/// Durably record a directory-entry change (rename/create) on platforms where
-/// that requires fsyncing the directory itself.
-#[cfg(unix)]
-fn fsync_dir(dir: &Path) -> std::io::Result<()> {
-    std::fs::File::open(dir)?.sync_all()
-}
-#[cfg(not(unix))]
-fn fsync_dir(_dir: &Path) -> std::io::Result<()> {
-    Ok(())
 }
 
 #[cfg(test)]

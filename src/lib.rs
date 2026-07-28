@@ -51,6 +51,7 @@ mod client;
 mod error;
 mod hash;
 mod manifest;
+mod paths;
 mod progress;
 mod publish;
 mod resume;
@@ -61,22 +62,19 @@ mod verify;
 pub mod wire;
 
 pub use cancel::CancelToken;
-pub use chunk::{
-    Chunker, DEFAULT_CHUNK_SIZE, FastCdcChunker, FixedSizeChunker, MAX_CHUNK_SIZE, MIN_CHUNK_SIZE,
-    TransferChunks,
-};
+pub use chunk::{CdcParams, DEFAULT_CHUNK_SIZE, MAX_CHUNK_SIZE, MIN_CHUNK_SIZE, TransferChunks};
 pub use client::{BlobClient, BlobClientBuilder, DownloadRequest, Overwrite, RetryPolicy};
 pub use error::{BlobError, Result};
 pub use hash::{Hash, HashParseError};
 pub use manifest::{BlobSpec, Manifest};
 pub use progress::{Progress, ProgressSink};
-pub use publish::{publish_chunk, publish_chunks, publish_index, publish_snapshot};
+pub use publish::{publish_chunk, publish_index, publish_snapshot, publish_store};
 pub use server::{
     BlobServer, BlobServerBuilder, BlobSource, FileBlobSource, MemoryBlobSource, ReadAtSize,
     ServerHandle,
 };
 pub use store::{ContentStore, DirStore, MemoryStore};
-pub use tree::{ChunkRef, Entry, TreeClient, TreeIndex, TreeServer, build_tree};
+pub use tree::{ChunkRef, Entry, TreeClient, TreeClientBuilder, TreeIndex, TreeServer, build_tree};
 
 /// Key of the manifest reply for blob `id` under `prefix`.
 pub fn manifest_key(prefix: &str, id: &str) -> String {

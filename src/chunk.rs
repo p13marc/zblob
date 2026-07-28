@@ -12,11 +12,16 @@
 //!   peer whose manifest carries an out-of-range size gets an error, not a
 //!   silently different geometry (v1's clamp made peers agree with each other
 //!   but disagree with the manifest, wedging the transfer forever).
-//! - **Content-defined chunks** ([`Chunker::split`]) — Tier 2's dedup unit,
-//!   where boundaries are derived from the data itself (FastCDC) so edits
-//!   re-chunk only their neighborhood.
+//! - **Content-defined chunks** ([`CdcParams`]) — Tier 2's dedup unit, where
+//!   FastCDC derives boundaries from the data itself so edits re-chunk only
+//!   their neighborhood. The parameters (including the gear seed) are recorded
+//!   in the [`crate::TreeIndex`] so every producer into a store cuts identical
+//!   boundaries.
 
+use std::io::Read;
 use std::ops::Range;
+
+use serde::{Deserialize, Serialize};
 
 use crate::error::{BlobError, Result};
 use crate::verify::GROUP_SIZE;
@@ -96,141 +101,110 @@ impl TransferChunks {
     }
 }
 
-/// A chunk boundary policy. Tier 1 is fixed-size; the trait leaves room for
-/// content-defined chunking later.
-pub trait Chunker: Send + Sync {
-    /// The (nominal) chunk size in bytes.
-    fn chunk_size(&self) -> u32;
-
-    /// Byte offset of chunk `index` (fixed-size: `index * chunk_size`).
-    fn offset(&self, index: u32) -> u64 {
-        index as u64 * self.chunk_size() as u64
-    }
-
-    /// Number of chunks needed for a blob of `total_len` bytes.
-    fn count(&self, total_len: u64) -> u32 {
-        if total_len == 0 {
-            return 0;
-        }
-        let size = self.chunk_size() as u64;
-        total_len.div_ceil(size) as u32
-    }
-
-    /// Length of chunk `index` for a blob of `total_len` bytes (the final chunk
-    /// may be short).
-    fn chunk_len(&self, index: u32, total_len: u64) -> u32 {
-        let start = self.offset(index);
-        if start >= total_len {
-            return 0;
-        }
-        let remaining = total_len - start;
-        remaining.min(self.chunk_size() as u64) as u32
-    }
-
-    /// Split `data` into chunk boundaries `(offset, len)`.
-    ///
-    /// This is the primitive Tier-2 ([`crate::TreeIndex`] building) uses, so a
-    /// content-defined chunker can cut at data-derived boundaries. The default is
-    /// fixed-size slicing derived from [`offset`](Self::offset) /
-    /// [`count`](Self::count) — so a fixed-size chunker needs no override and stays
-    /// usable by the offset-addressed Tier-1 protocol too.
-    fn split(&self, data: &[u8]) -> Vec<(usize, usize)> {
-        let total = data.len() as u64;
-        (0..self.count(total))
-            .map(|i| (self.offset(i) as usize, self.chunk_len(i, total) as usize))
-            .collect()
-    }
-
-    /// A short, self-describing tag for this chunking policy, recorded in the tree
-    /// index (e.g. `"fixed-524288"`, `"fastcdc-262144"`).
-    fn policy_tag(&self) -> String {
-        format!("fixed-{}", self.chunk_size())
-    }
+/// FastCDC (v2020) content-defined chunking parameters for Tier 2.
+///
+/// Recorded verbatim in the [`crate::TreeIndex`]: chunk boundaries are a
+/// function of these parameters *and the data*, so all producers into one
+/// store must share them for cross-producer dedup to work.
+///
+/// `gear_seed` perturbs the gear table ([restic] seeds per-repo for the same
+/// reason): with the public table (`0`), chunk boundaries — and therefore
+/// chunk sizes — are predictable from content, which makes content-addressed
+/// stores a dedup side-channel across trust domains. Give each private store
+/// its own random seed. The seed is visible to anyone who can read the index
+/// (same trust domain as the data itself).
+///
+/// [restic]: https://restic.net
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CdcParams {
+    /// Minimum chunk size in bytes (FastCDC floor: 64).
+    pub min: u32,
+    /// Target average chunk size in bytes.
+    pub avg: u32,
+    /// Maximum chunk size in bytes.
+    pub max: u32,
+    /// FastCDC normalization level (0–3; 2 keeps most chunks near `avg`).
+    pub normalization: u8,
+    /// Gear-table seed (`0` = the public table).
+    pub gear_seed: u64,
 }
 
-/// Constant-size chunker (Tier-2 use; Tier 1 uses [`TransferChunks`]).
-#[derive(Debug, Clone, Copy)]
-pub struct FixedSizeChunker {
-    size: u32,
-}
-
-impl Default for FixedSizeChunker {
+impl Default for CdcParams {
+    /// The casync-style transfer class: 16 KiB / 64 KiB / 256 KiB, level 2,
+    /// public gear table.
     fn default() -> Self {
-        FixedSizeChunker {
-            size: DEFAULT_CHUNK_SIZE,
+        CdcParams {
+            min: 16 * 1024,
+            avg: 64 * 1024,
+            max: 256 * 1024,
+            normalization: 2,
+            gear_seed: 0,
         }
     }
 }
 
-impl FixedSizeChunker {
-    /// Build a fixed-size chunker; `bytes` is clamped to the allowed range.
-    pub fn new(bytes: u32) -> Self {
-        FixedSizeChunker {
-            size: bytes.clamp(MIN_CHUNK_SIZE, MAX_CHUNK_SIZE),
+impl CdcParams {
+    /// The defaults with a per-store gear seed (see the type docs).
+    pub fn with_seed(gear_seed: u64) -> Self {
+        CdcParams {
+            gear_seed,
+            ..Default::default()
         }
     }
-}
 
-impl Chunker for FixedSizeChunker {
-    fn chunk_size(&self) -> u32 {
-        self.size
-    }
-}
-
-/// Content-defined chunker (FastCDC, #200). Cut points are derived from a rolling
-/// gear-hash of the data, so inserting/removing bytes only re-chunks the
-/// neighborhood of the edit — chunks before and after a change keep their hashes
-/// and dedup across versions. **Tier-2 only**: the cut points depend on the data,
-/// so the offset-addressed Tier-1 protocol (which the client must address by
-/// `index * chunk_size` without seeing the bytes) cannot use it.
-#[derive(Debug, Clone, Copy)]
-pub struct FastCdcChunker {
-    min: u32,
-    avg: u32,
-    max: u32,
-}
-
-impl FastCdcChunker {
-    /// Build a FastCDC chunker around an average chunk size, with `min = avg/4`
-    /// and `max = avg*4` (the conventional FastCDC spread). `avg` is floored at
-    /// 256 bytes so `min` stays above FastCDC's hard floor of 64.
-    pub fn new(avg: u32) -> Self {
-        let avg = avg.max(256);
-        FastCdcChunker {
-            min: avg / 4,
-            avg,
-            max: avg.saturating_mul(4),
+    /// Validate the parameter ranges (fastcdc's own bounds, plus a 16 MiB
+    /// ceiling so a hostile index cannot demand giant allocations).
+    pub fn validate(&self) -> Result<()> {
+        let ok = self.min >= 64
+            && self.min <= self.avg
+            && self.avg <= self.max
+            && self.avg >= 256
+            && self.max <= 16 * 1024 * 1024
+            && self.normalization <= 3;
+        if ok {
+            Ok(())
+        } else {
+            Err(BlobError::InvalidManifest(format!(
+                "invalid CDC parameters {self:?}"
+            )))
         }
     }
-}
 
-impl Chunker for FastCdcChunker {
-    fn chunk_size(&self) -> u32 {
-        self.avg
+    fn level(&self) -> fastcdc::v2020::Normalization {
+        match self.normalization {
+            0 => fastcdc::v2020::Normalization::Level0,
+            1 => fastcdc::v2020::Normalization::Level1,
+            3 => fastcdc::v2020::Normalization::Level3,
+            _ => fastcdc::v2020::Normalization::Level2,
+        }
     }
 
-    fn split(&self, data: &[u8]) -> Vec<(usize, usize)> {
-        if data.is_empty() {
-            return Vec::new();
-        }
-        fastcdc::v2020::FastCDC::new(
-            data,
+    /// Stream `reader` into content-defined chunks. Memory stays
+    /// O(`max` chunk size) no matter the input length.
+    pub fn chunk_reader<R: Read>(
+        &self,
+        reader: R,
+    ) -> impl Iterator<Item = std::io::Result<Vec<u8>>> {
+        fastcdc::v2020::StreamCDC::with_level_and_seed(
+            reader,
             self.min as usize,
             self.avg as usize,
             self.max as usize,
+            self.level(),
+            self.gear_seed,
         )
-        .map(|c| (c.offset, c.length))
-        .collect()
-    }
-
-    fn policy_tag(&self) -> String {
-        format!("fastcdc-{}", self.avg)
+        .map(|item| match item {
+            Ok(chunk) => Ok(chunk.data),
+            Err(fastcdc::v2020::Error::IoError(e)) => Err(e),
+            Err(other) => Err(std::io::Error::other(format!("fastcdc: {other:?}"))),
+        })
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::hash::Hash;
 
     #[test]
     fn transfer_chunk_size_validated_never_clamped() {
@@ -270,58 +244,31 @@ mod tests {
     }
 
     #[test]
-    fn fixed_chunker_clamps() {
-        assert_eq!(FixedSizeChunker::new(1).chunk_size(), MIN_CHUNK_SIZE);
-        assert_eq!(FixedSizeChunker::new(u32::MAX).chunk_size(), MAX_CHUNK_SIZE);
-    }
-
-    #[test]
-    fn count_and_lengths() {
-        let c = FixedSizeChunker::new(MIN_CHUNK_SIZE);
-        let size = MIN_CHUNK_SIZE as u64;
-
-        assert_eq!(c.count(0), 0);
-        assert_eq!(c.count(1), 1);
-        assert_eq!(c.count(size), 1);
-        assert_eq!(c.count(size + 1), 2);
-
-        // 3.5 chunks worth → 4 chunks, last one half-size.
-        let total = size * 3 + size / 2;
-        assert_eq!(c.count(total), 4);
-        assert_eq!(c.chunk_len(0, total), MIN_CHUNK_SIZE);
-        assert_eq!(c.chunk_len(2, total), MIN_CHUNK_SIZE);
-        assert_eq!(c.chunk_len(3, total) as u64, size / 2);
-        assert_eq!(c.chunk_len(4, total), 0); // past the end
-    }
-
-    #[test]
-    fn offsets() {
-        let c = FixedSizeChunker::new(MAX_CHUNK_SIZE);
-        assert_eq!(c.offset(0), 0);
-        assert_eq!(c.offset(3), 3 * MAX_CHUNK_SIZE as u64);
-    }
-
-    #[test]
-    fn fixed_split_matches_offset_arithmetic() {
-        let c = FixedSizeChunker::new(MIN_CHUNK_SIZE);
-        let total = MIN_CHUNK_SIZE as usize * 3 + 1000;
-        let data = vec![7u8; total];
-        let cuts = c.split(&data);
-        assert_eq!(cuts.len(), 4);
-        assert_eq!(cuts[0], (0, MIN_CHUNK_SIZE as usize));
-        assert_eq!(cuts[3], (MIN_CHUNK_SIZE as usize * 3, 1000));
-        // Cuts tile the whole input with no gaps or overlaps.
-        let covered: usize = cuts.iter().map(|(_, l)| l).sum();
-        assert_eq!(covered, total);
-    }
-
-    #[test]
-    fn policy_tags() {
-        assert_eq!(
-            FixedSizeChunker::new(DEFAULT_CHUNK_SIZE).policy_tag(),
-            format!("fixed-{DEFAULT_CHUNK_SIZE}")
-        );
-        assert_eq!(FastCdcChunker::new(262_144).policy_tag(), "fastcdc-262144");
+    fn cdc_params_validation() {
+        assert!(CdcParams::default().validate().is_ok());
+        assert!(CdcParams::with_seed(42).validate().is_ok());
+        let bad = [
+            CdcParams {
+                min: 32,
+                ..Default::default()
+            },
+            CdcParams {
+                min: 1 << 20,
+                avg: 1 << 18,
+                ..Default::default()
+            },
+            CdcParams {
+                max: 32 * 1024 * 1024,
+                ..Default::default()
+            },
+            CdcParams {
+                normalization: 9,
+                ..Default::default()
+            },
+        ];
+        for p in bad {
+            assert!(p.validate().is_err(), "{p:?}");
+        }
     }
 
     /// Deterministic pseudo-random bytes (xorshift64; no `rand` dep).
@@ -337,26 +284,38 @@ mod tests {
         out
     }
 
-    fn sha(data: &[u8]) -> crate::hash::Hash {
-        crate::hash::Hash::of(data)
+    fn small_cdc(seed: u64) -> CdcParams {
+        CdcParams {
+            min: 2048,
+            avg: 8192,
+            max: 32768,
+            normalization: 2,
+            gear_seed: seed,
+        }
     }
 
-    /// FastCDC chunk-hash set over `data`.
-    fn cdc_hashes(
-        chunker: &FastCdcChunker,
-        data: &[u8],
-    ) -> std::collections::HashSet<crate::hash::Hash> {
-        chunker
-            .split(data)
-            .into_iter()
-            .map(|(o, l)| sha(&data[o..o + l]))
+    fn cdc_hashes(params: &CdcParams, data: &[u8]) -> std::collections::HashSet<Hash> {
+        params
+            .chunk_reader(std::io::Cursor::new(data))
+            .map(|c| Hash::of(&c.unwrap()))
             .collect()
     }
 
-    /// Fixed N-byte tiling chunk-hash set (the `FixedSizeChunker` clamps to 256 KiB,
-    /// too coarse for this small fixture, so tile directly for the comparison).
-    fn fixed_hashes(data: &[u8], size: usize) -> std::collections::HashSet<crate::hash::Hash> {
-        data.chunks(size).map(sha).collect()
+    #[test]
+    fn chunks_tile_the_input() {
+        let data = pseudo_random(100_000, 7);
+        let rebuilt: Vec<u8> = small_cdc(0)
+            .chunk_reader(std::io::Cursor::new(&data))
+            .flat_map(|c| c.unwrap())
+            .collect();
+        assert_eq!(rebuilt, data);
+        // Empty input → no chunks.
+        assert_eq!(
+            small_cdc(0)
+                .chunk_reader(std::io::Cursor::new(&[] as &[u8]))
+                .count(),
+            0
+        );
     }
 
     /// Inserting a few bytes near the front of a file should leave most FastCDC
@@ -369,16 +328,15 @@ mod tests {
         let mut edited = base.clone();
         edited.splice(4096..4096, pseudo_random(50, 0xBEEF));
 
-        let cdc = FastCdcChunker::new(8192);
+        let cdc = small_cdc(0);
         let cdc_a = cdc_hashes(&cdc, &base);
         let cdc_b = cdc_hashes(&cdc, &edited);
         let cdc_ratio = cdc_a.intersection(&cdc_b).count() as f64 / cdc_a.len() as f64;
 
-        let fix_a = fixed_hashes(&base, 8192);
-        let fix_b = fixed_hashes(&edited, 8192);
+        let fix_a: std::collections::HashSet<Hash> = base.chunks(8192).map(Hash::of).collect();
+        let fix_b: std::collections::HashSet<Hash> = edited.chunks(8192).map(Hash::of).collect();
         let fix_ratio = fix_a.intersection(&fix_b).count() as f64 / fix_a.len() as f64;
 
-        // FastCDC keeps the vast majority of chunks; fixed-size loses most.
         assert!(
             cdc_ratio > 0.8,
             "FastCDC should retain >80% of chunks, got {cdc_ratio:.2}"
@@ -386,6 +344,22 @@ mod tests {
         assert!(
             cdc_ratio > fix_ratio + 0.3,
             "FastCDC ({cdc_ratio:.2}) should dedup far better than fixed ({fix_ratio:.2})"
+        );
+    }
+
+    /// Different gear seeds must cut different boundaries (the dedup
+    /// side-channel mitigation), while each seed remains self-consistent.
+    #[test]
+    fn gear_seed_changes_boundaries() {
+        let data = pseudo_random(200_000, 0x5EED);
+        let a = cdc_hashes(&small_cdc(0), &data);
+        let b = cdc_hashes(&small_cdc(0xDEADBEEF), &data);
+        let a2 = cdc_hashes(&small_cdc(0), &data);
+        assert_eq!(a, a2, "same seed → identical chunking");
+        let overlap = a.intersection(&b).count() as f64 / a.len().max(1) as f64;
+        assert!(
+            overlap < 0.5,
+            "different seeds should share few chunks, got {overlap:.2}"
         );
     }
 }
