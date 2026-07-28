@@ -6,7 +6,7 @@
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use zblob::{AsyncReadSeek, BlobSource, Hash, OpenFuture};
+use zblob::Hash;
 
 pub fn isolated_config() -> zenoh::Config {
     let mut config = zenoh::Config::default();
@@ -48,25 +48,29 @@ pub fn content_hash(bytes: &[u8]) -> Hash {
     Hash::of(bytes)
 }
 
-/// A [`BlobSource`] over an in-memory `Vec<u8>` (no temp file needed).
-pub struct BytesSource(pub Arc<Vec<u8>>);
+/// Raw bao-slice construction for adversarial/fake-server tests: lets a test
+/// serve protocol-correct (or deliberately tampered) slice replies without
+/// going through `BlobServer`.
+pub mod bao {
+    use bao_tree::io::outboard::PreOrderMemOutboard;
+    use bao_tree::io::sync::encode_ranges_validated;
+    use bao_tree::{BlockSize, ChunkNum, ChunkRanges};
 
-impl BlobSource for BytesSource {
-    fn open(&self) -> OpenFuture {
-        let data = self.0.clone();
-        Box::pin(async move {
-            let cursor = std::io::Cursor::new(BytesOwned(data));
-            Ok(Box::new(cursor) as Box<dyn AsyncReadSeek>)
-        })
+    /// Must match zblob's verification block size (16 KiB groups).
+    pub const BLOCK: BlockSize = BlockSize::from_chunk_log(4);
+
+    pub fn outboard(data: &[u8]) -> PreOrderMemOutboard {
+        PreOrderMemOutboard::create(data, BLOCK)
     }
-}
 
-/// Owns an `Arc<Vec<u8>>` and exposes it as `AsRef<[u8]>` so a `Cursor` over it is
-/// `AsyncRead + AsyncSeek`.
-pub struct BytesOwned(pub Arc<Vec<u8>>);
-
-impl AsRef<[u8]> for BytesOwned {
-    fn as_ref(&self) -> &[u8] {
-        &self.0
+    /// The bao slice for transfer chunk `index` of `data` at `chunk_size`.
+    pub fn slice(data: &[u8], ob: &PreOrderMemOutboard, chunk_size: u32, index: u32) -> Vec<u8> {
+        let total = data.len() as u64;
+        let start = (index as u64 * chunk_size as u64).min(total);
+        let end = (start + chunk_size as u64).min(total);
+        let ranges = ChunkRanges::from(ChunkNum(start >> 10)..ChunkNum::chunks(end));
+        let mut out = Vec::new();
+        encode_ranges_validated(data, ob, &ranges, &mut out).unwrap();
+        out
     }
 }

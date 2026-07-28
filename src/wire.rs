@@ -14,6 +14,19 @@ use serde::{Serialize, de::DeserializeOwned};
 
 use crate::error::{BlobError, Result};
 
+/// The wire schema version this crate speaks. Carried as the first field of
+/// every control struct; any shape change bumps it.
+pub const WIRE_VERSION: u16 = 2;
+
+/// Zenoh [`Encoding`](zenoh::bytes::Encoding) tag of a manifest reply.
+pub const ENC_MANIFEST: &str = "zblob/manifest;v=2";
+/// Encoding tag of a bao slice reply (BlockSize 4 = 16 KiB groups).
+pub const ENC_SLICE: &str = "zblob/bao4;v=2";
+/// Encoding tag of a Tier-2 tree index reply.
+pub const ENC_INDEX: &str = "zblob/index;v=2";
+/// Encoding tag of a Tier-2 raw content-addressed chunk reply.
+pub const ENC_CHUNK: &str = "zblob/chunk";
+
 /// Encode a control message to postcard bytes.
 pub fn encode<T: Serialize>(value: &T) -> Result<Vec<u8>> {
     postcard::to_stdvec(value).map_err(BlobError::encode)

@@ -1,16 +1,27 @@
 //! Pause/cancel: a cancelled download persists its partial and resumes; a
-//! deleted partial starts over.
+//! deleted partial starts over from scratch.
 
 mod common;
 
 use std::sync::Arc;
 use std::time::Duration;
 
-use common::{BytesSource, content_hash, open_session, pseudo_random, unique_prefix};
+use common::{content_hash, open_session, pseudo_random, unique_prefix};
 use zblob::{
-    BlobClient, BlobError, BlobServer, CancelToken, FixedSizeChunker, MIN_CHUNK_SIZE, Manifest,
-    Progress, ProgressSink,
+    BlobClient, BlobError, BlobServer, BlobSpec, CancelToken, DownloadRequest, MIN_CHUNK_SIZE,
+    MemoryBlobSource, Progress, ProgressSink, RetryPolicy,
 };
+
+fn test_client(session: Arc<zenoh::Session>, prefix: &str) -> BlobClient {
+    BlobClient::builder(session, prefix)
+        .query_timeout(Duration::from_secs(5))
+        .retry(RetryPolicy {
+            max_attempts: 2,
+            base_backoff: Duration::from_millis(50),
+            max_backoff: Duration::from_millis(200),
+        })
+        .build()
+}
 
 /// Cancels the token after the first chunk is written.
 struct CancelAfterFirst {
@@ -31,22 +42,20 @@ async fn cancel_persists_then_resumes() {
     let session = open_session().await;
     let prefix = unique_prefix();
     let dir = tempfile::tempdir().unwrap();
+    let dest = dir.path().join("d.bin");
 
-    let data = Arc::new(pseudo_random(MIN_CHUNK_SIZE as usize * 8, 0xC0FFEE));
-    let mut reader = std::io::Cursor::new(data.as_slice());
-    let chunker = FixedSizeChunker::new(MIN_CHUNK_SIZE);
-    let manifest = Manifest::compute(&mut reader, &chunker, "blob-x", "d.bin", 1)
-        .await
-        .unwrap();
-
+    let data = pseudo_random(MIN_CHUNK_SIZE as usize * 8, 0xC0FFEE);
     let server = BlobServer::new(session.clone(), prefix.clone());
     server
-        .register(manifest, Arc::new(BytesSource(data.clone())))
-        .await;
-    tokio::spawn(server.run());
-    tokio::time::sleep(Duration::from_millis(150)).await;
+        .register_source(
+            BlobSpec::new("blob-x").chunk_size(MIN_CHUNK_SIZE),
+            Arc::new(MemoryBlobSource::new(data.clone())),
+        )
+        .await
+        .unwrap();
+    let handle = server.spawn().await.unwrap();
 
-    let client = BlobClient::new(session.clone(), prefix.clone());
+    let client = test_client(session.clone(), &prefix);
 
     // Cancel mid-transfer → Cancelled, partial persisted.
     let token = CancelToken::new();
@@ -54,22 +63,33 @@ async fn cancel_persists_then_resumes() {
         token: token.clone(),
     };
     let err = client
-        .download_cancellable("blob-x", dir.path(), &sink, &token)
+        .download_to(&DownloadRequest::new("blob-x"), &dest, &sink, &token)
         .await
-        .unwrap_err();
-    assert!(matches!(err, BlobError::Cancelled { .. }), "got {err:?}");
-    assert!(dir.path().join("blob-x.part").exists());
+        .expect_err("must cancel");
+    assert!(matches!(err, BlobError::Cancelled { .. }), "{err}");
+    assert!(dir.path().join("d.bin.part").exists());
+    assert!(dir.path().join("d.bin.part.meta").exists());
 
     // Resume (fresh token) → completes + verifies.
-    let path = tokio::time::timeout(
+    tokio::time::timeout(
         Duration::from_secs(20),
-        client.download("blob-x", dir.path(), &()),
+        client.download_to(
+            &DownloadRequest::new("blob-x"),
+            &dest,
+            &(),
+            &CancelToken::new(),
+        ),
     )
     .await
     .expect("resume timed out")
     .expect("resume failed");
-    let got = tokio::fs::read(&path).await.unwrap();
-    assert_eq!(content_hash(&got), content_hash(&data));
+    assert_eq!(
+        content_hash(&std::fs::read(&dest).unwrap()),
+        content_hash(&data)
+    );
+
+    handle.shutdown().await.unwrap();
+    session.close().await.unwrap();
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -77,32 +97,33 @@ async fn delete_partial_clears_state() {
     let session = open_session().await;
     let prefix = unique_prefix();
     let dir = tempfile::tempdir().unwrap();
+    let dest = dir.path().join("d.bin");
 
-    let data = Arc::new(pseudo_random(MIN_CHUNK_SIZE as usize * 4, 0xBEEF));
-    let mut reader = std::io::Cursor::new(data.as_slice());
-    let chunker = FixedSizeChunker::new(MIN_CHUNK_SIZE);
-    let manifest = Manifest::compute(&mut reader, &chunker, "blob-y", "d.bin", 1)
-        .await
-        .unwrap();
-
+    let data = pseudo_random(MIN_CHUNK_SIZE as usize * 4, 0xBEEF);
     let server = BlobServer::new(session.clone(), prefix.clone());
     server
-        .register(manifest, Arc::new(BytesSource(data.clone())))
-        .await;
-    tokio::spawn(server.run());
-    tokio::time::sleep(Duration::from_millis(150)).await;
+        .register_source(
+            BlobSpec::new("blob-y").chunk_size(MIN_CHUNK_SIZE),
+            Arc::new(MemoryBlobSource::new(data)),
+        )
+        .await
+        .unwrap();
+    let handle = server.spawn().await.unwrap();
 
-    let client = BlobClient::new(session.clone(), prefix.clone());
+    let client = test_client(session.clone(), &prefix);
     let token = CancelToken::new();
     let sink = CancelAfterFirst {
         token: token.clone(),
     };
     let _ = client
-        .download_cancellable("blob-y", dir.path(), &sink, &token)
+        .download_to(&DownloadRequest::new("blob-y"), &dest, &sink, &token)
         .await;
-    assert!(dir.path().join("blob-y.part").exists());
+    assert!(dir.path().join("d.bin.part").exists());
 
-    client.delete_partial("blob-y", dir.path()).await;
-    assert!(!dir.path().join("blob-y.part").exists());
-    assert!(!dir.path().join("blob-y.part.meta").exists());
+    client.delete_partial(&dest).await;
+    assert!(!dir.path().join("d.bin.part").exists());
+    assert!(!dir.path().join("d.bin.part.meta").exists());
+
+    handle.shutdown().await.unwrap();
+    session.close().await.unwrap();
 }

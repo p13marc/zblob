@@ -27,7 +27,7 @@ fastcdc = "4"
 blake3 = "1.8"
 bao-tree = { version = "0.16", default-features = false, features = ["fs", "validate"] }
 postcard = { version = "1.1", features = ["use-std"] }
+tempfile = "3"
 
 [dev-dependencies]
-tempfile = "3"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "time"] }

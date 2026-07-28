@@ -1,38 +1,98 @@
 //! Chunking policy.
 //!
-//! [`Chunker`] decides where chunk boundaries fall. Tier 1 uses
-//! [`FixedSizeChunker`] (constant size → resume + identical-chunk dedup, and the
-//! offset addressing the Tier-1 wire protocol needs). Tier 2 directory sync can
-//! additionally use [`FastCdcChunker`] (content-defined boundaries → cross-version
-//! dedup) behind the same trait via [`Chunker::split`], without touching the
-//! transport.
+//! Two unrelated kinds of "chunk" exist in this crate, and v2 keeps them apart
+//! by construction (they were one trait in v1, which let a content-defined
+//! chunker be handed to the offset-addressed Tier-1 protocol and silently
+//! produce a broken manifest):
+//!
+//! - **Transfer chunks** ([`TransferChunks`]) — Tier 1's fixed-size wire unit.
+//!   Pure arithmetic over `(chunk_size, total_len)`; the client addresses
+//!   chunks by index without seeing the bytes, so the size *must* be constant
+//!   and agreed via the manifest. Sizes are **validated, never clamped**: a
+//!   peer whose manifest carries an out-of-range size gets an error, not a
+//!   silently different geometry (v1's clamp made peers agree with each other
+//!   but disagree with the manifest, wedging the transfer forever).
+//! - **Content-defined chunks** ([`Chunker::split`]) — Tier 2's dedup unit,
+//!   where boundaries are derived from the data itself (FastCDC) so edits
+//!   re-chunk only their neighborhood.
 
-/// Smallest allowed chunk size (256 KiB) — keeps progress fine-grained.
-pub const MIN_CHUNK_SIZE: u32 = 256 * 1024;
-/// Largest allowed chunk size (1 MiB) — keeps per-chunk RAM bounded.
-pub const MAX_CHUNK_SIZE: u32 = 1024 * 1024;
-/// Default chunk size (512 KiB).
+use std::ops::Range;
+
+use crate::error::{BlobError, Result};
+use crate::verify::GROUP_SIZE;
+
+/// Smallest allowed transfer chunk size (64 KiB).
+pub const MIN_CHUNK_SIZE: u32 = 64 * 1024;
+/// Largest allowed transfer chunk size (4 MiB) — bounds per-reply RAM.
+pub const MAX_CHUNK_SIZE: u32 = 4 * 1024 * 1024;
+/// Default transfer chunk size (512 KiB = 32 bao verification groups).
 pub const DEFAULT_CHUNK_SIZE: u32 = 512 * 1024;
 
-/// A validated chunk size, clamped to `[MIN_CHUNK_SIZE, MAX_CHUNK_SIZE]`.
+/// Fixed-size transfer-chunk arithmetic for one blob: `(chunk_size, total_len)`
+/// fully determine every chunk's index, byte range, and count.
+///
+/// Constructed via [`TransferChunks::new`], which **validates** the size:
+/// it must be a multiple of the 16 KiB bao group (so every chunk maps to a
+/// whole range of verification groups) and lie in
+/// [`MIN_CHUNK_SIZE`]..=[`MAX_CHUNK_SIZE`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct ChunkSize(u32);
-
-impl ChunkSize {
-    /// Build a chunk size, clamping into the allowed range.
-    pub fn new(bytes: u32) -> Self {
-        ChunkSize(bytes.clamp(MIN_CHUNK_SIZE, MAX_CHUNK_SIZE))
-    }
-
-    /// The size in bytes.
-    pub fn get(self) -> u32 {
-        self.0
-    }
+pub struct TransferChunks {
+    chunk_size: u32,
+    total_len: u64,
 }
 
-impl Default for ChunkSize {
-    fn default() -> Self {
-        ChunkSize(DEFAULT_CHUNK_SIZE)
+impl TransferChunks {
+    /// Validate `chunk_size` alone (range + 16 KiB alignment).
+    pub fn validate_chunk_size(chunk_size: u32) -> Result<()> {
+        if !(MIN_CHUNK_SIZE..=MAX_CHUNK_SIZE).contains(&chunk_size) {
+            return Err(BlobError::InvalidManifest(format!(
+                "chunk_size {chunk_size} outside [{MIN_CHUNK_SIZE}, {MAX_CHUNK_SIZE}]"
+            )));
+        }
+        if !(chunk_size as u64).is_multiple_of(GROUP_SIZE) {
+            return Err(BlobError::InvalidManifest(format!(
+                "chunk_size {chunk_size} is not a multiple of the {GROUP_SIZE}-byte bao group"
+            )));
+        }
+        Ok(())
+    }
+
+    /// Build the chunk geometry for a blob, validating `chunk_size`.
+    pub fn new(chunk_size: u32, total_len: u64) -> Result<Self> {
+        Self::validate_chunk_size(chunk_size)?;
+        Ok(TransferChunks {
+            chunk_size,
+            total_len,
+        })
+    }
+
+    /// The transfer chunk size in bytes.
+    pub fn chunk_size(&self) -> u32 {
+        self.chunk_size
+    }
+
+    /// Total blob length in bytes.
+    pub fn total_len(&self) -> u64 {
+        self.total_len
+    }
+
+    /// Number of chunks (`ceil(total_len / chunk_size)`; 0 for an empty blob).
+    pub fn count(&self) -> u32 {
+        self.total_len.div_ceil(self.chunk_size as u64) as u32
+    }
+
+    /// Byte range `[start, end)` of chunk `index` (the final chunk may be
+    /// short). Empty range if `index` is past the end.
+    pub fn byte_range(&self, index: u32) -> Range<u64> {
+        let start = (index as u64 * self.chunk_size as u64).min(self.total_len);
+        let end = (start + self.chunk_size as u64).min(self.total_len);
+        start..end
+    }
+
+    /// Length in bytes of chunk `index` (0 if past the end).
+    pub fn len_of(&self, index: u32) -> u32 {
+        let r = self.byte_range(index);
+        (r.end - r.start) as u32
     }
 }
 
@@ -88,24 +148,32 @@ pub trait Chunker: Send + Sync {
     }
 }
 
-/// Constant-size chunker (Tier 1 default).
-#[derive(Debug, Clone, Copy, Default)]
+/// Constant-size chunker (Tier-2 use; Tier 1 uses [`TransferChunks`]).
+#[derive(Debug, Clone, Copy)]
 pub struct FixedSizeChunker {
-    size: ChunkSize,
+    size: u32,
+}
+
+impl Default for FixedSizeChunker {
+    fn default() -> Self {
+        FixedSizeChunker {
+            size: DEFAULT_CHUNK_SIZE,
+        }
+    }
 }
 
 impl FixedSizeChunker {
     /// Build a fixed-size chunker; `bytes` is clamped to the allowed range.
     pub fn new(bytes: u32) -> Self {
         FixedSizeChunker {
-            size: ChunkSize::new(bytes),
+            size: bytes.clamp(MIN_CHUNK_SIZE, MAX_CHUNK_SIZE),
         }
     }
 }
 
 impl Chunker for FixedSizeChunker {
     fn chunk_size(&self) -> u32 {
-        self.size.get()
+        self.size
     }
 }
 
@@ -165,15 +233,51 @@ mod tests {
     use super::*;
 
     #[test]
-    fn chunk_size_clamps() {
-        assert_eq!(ChunkSize::new(1).get(), MIN_CHUNK_SIZE);
-        assert_eq!(ChunkSize::new(u32::MAX).get(), MAX_CHUNK_SIZE);
-        assert_eq!(ChunkSize::new(DEFAULT_CHUNK_SIZE).get(), DEFAULT_CHUNK_SIZE);
+    fn transfer_chunk_size_validated_never_clamped() {
+        // In range + group-aligned.
+        assert!(TransferChunks::new(DEFAULT_CHUNK_SIZE, 1).is_ok());
+        assert!(TransferChunks::new(MIN_CHUNK_SIZE, 1).is_ok());
+        assert!(TransferChunks::new(MAX_CHUNK_SIZE, 1).is_ok());
+        // Out of range → error, not clamp (v1's clamp wedged transfers, H2).
+        assert!(TransferChunks::new(MIN_CHUNK_SIZE - 1, 1).is_err());
+        assert!(TransferChunks::new(MAX_CHUNK_SIZE + 16 * 1024, 1).is_err());
+        assert!(TransferChunks::new(0, 1).is_err());
+        // In range but not a multiple of the 16 KiB bao group → error.
+        assert!(TransferChunks::new(MIN_CHUNK_SIZE + 1, 1).is_err());
+    }
+
+    #[test]
+    fn transfer_chunk_geometry() {
+        let size = DEFAULT_CHUNK_SIZE as u64;
+        // 3.5 chunks worth → 4 chunks, last one half-size.
+        let total = size * 3 + size / 2;
+        let c = TransferChunks::new(DEFAULT_CHUNK_SIZE, total).unwrap();
+        assert_eq!(c.count(), 4);
+        assert_eq!(c.byte_range(0), 0..size);
+        assert_eq!(c.byte_range(3), size * 3..total);
+        assert_eq!(c.len_of(3) as u64, size / 2);
+        assert_eq!(c.len_of(4), 0); // past the end
+        assert_eq!(c.byte_range(9), total..total);
+
+        // Empty blob → zero chunks.
+        let empty = TransferChunks::new(DEFAULT_CHUNK_SIZE, 0).unwrap();
+        assert_eq!(empty.count(), 0);
+
+        // Exact multiple → no short tail.
+        let exact = TransferChunks::new(DEFAULT_CHUNK_SIZE, size * 2).unwrap();
+        assert_eq!(exact.count(), 2);
+        assert_eq!(exact.len_of(1), DEFAULT_CHUNK_SIZE);
+    }
+
+    #[test]
+    fn fixed_chunker_clamps() {
+        assert_eq!(FixedSizeChunker::new(1).chunk_size(), MIN_CHUNK_SIZE);
+        assert_eq!(FixedSizeChunker::new(u32::MAX).chunk_size(), MAX_CHUNK_SIZE);
     }
 
     #[test]
     fn count_and_lengths() {
-        let c = FixedSizeChunker::new(MIN_CHUNK_SIZE); // 256 KiB
+        let c = FixedSizeChunker::new(MIN_CHUNK_SIZE);
         let size = MIN_CHUNK_SIZE as u64;
 
         assert_eq!(c.count(0), 0);

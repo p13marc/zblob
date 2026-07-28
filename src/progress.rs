@@ -2,17 +2,28 @@
 
 use std::path::PathBuf;
 
-/// A progress event emitted by [`crate::BlobClient::download`].
+/// A progress event emitted by a download.
+///
+/// `#[non_exhaustive]`: match with a wildcard arm — later releases may add
+/// variants (e.g. rate/ETA reporting) without a breaking change.
 #[derive(Clone, Debug)]
+#[non_exhaustive]
 pub enum Progress {
-    /// The manifest reply arrived; the total size and chunk count are now known.
-    ManifestReceived {
+    /// A fresh transfer began; the manifest arrived and sizing is known.
+    Started {
         /// Total blob length in bytes.
         total_len: u64,
-        /// Total number of chunks.
+        /// Total number of transfer chunks.
         chunk_count: u32,
     },
-    /// A chunk was written to the partial file.
+    /// An interrupted transfer resumed from persisted state.
+    Resumed {
+        /// Chunks already present before this attempt.
+        received: u32,
+        /// Total chunks expected.
+        total: u32,
+    },
+    /// A chunk was verified and written to the destination.
     Chunk {
         /// Index of the chunk just written.
         index: u32,
@@ -20,15 +31,27 @@ pub enum Progress {
         received: u32,
         /// Total chunks expected.
         total: u32,
+        /// Verified payload bytes on disk so far (excludes duplicates).
+        bytes_received: u64,
     },
-    /// All chunks are present; verifying the whole-blob hash.
+    /// All data is present; running a final integrity/materialization step
+    /// (Tier-2 tree reconstruction; Tier-1 completes without a second pass —
+    /// every byte was verified against the root as it was written).
     Verifying,
-    /// The download finished and verified; the file is at `path`.
+    /// The download finished and verified; the artifact is at `path`.
     Completed {
-        /// Final path of the assembled, verified blob.
+        /// Final path of the assembled, verified artifact.
         path: PathBuf,
     },
-    /// The download failed.
+    /// The caller cancelled the download; state was persisted for resume.
+    Cancelled {
+        /// Chunks received before cancellation.
+        received: u32,
+        /// Total chunks expected.
+        total: u32,
+    },
+    /// The download failed (cancellation is *not* a failure — see
+    /// [`Progress::Cancelled`]).
     Failed {
         /// Human-readable reason.
         error: String,

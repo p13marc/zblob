@@ -1,7 +1,12 @@
 //! Error type for blob transfer.
 
+use std::path::PathBuf;
+
+use crate::hash::Hash;
+
 /// Errors raised by the blob server and client.
 #[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
 pub enum BlobError {
     /// A Zenoh operation failed. `zenoh::Error` is a boxed `dyn Error`, so it is
     /// flattened to a string here.
@@ -16,34 +21,44 @@ pub enum BlobError {
     #[error("encode: {0}")]
     Encode(String),
 
-    /// The fully-downloaded blob's hash did not match the manifest (R4).
-    #[error("integrity: blob hash mismatch")]
-    HashMismatch,
+    /// A control message declared a schema version this crate does not speak
+    /// (this crate speaks [`crate::wire::WIRE_VERSION`]).
+    #[error("unsupported wire version {0}")]
+    UnsupportedVersion(u16),
 
-    /// A chunk reply had an unexpected length for its index.
-    #[error("integrity: chunk {index} length mismatch")]
-    ChunkLen {
-        /// The offending chunk index.
-        index: u32,
+    /// A manifest or index failed validation (bad chunk size, oversized blob,
+    /// malformed id, …). Carries a human-readable reason.
+    #[error("invalid manifest: {0}")]
+    InvalidManifest(String),
+
+    /// The transfer's root hash did not match the caller-pinned expectation.
+    /// Nothing was written for `expected == None` flows; for pinned flows the
+    /// mismatch is detected before any byte is fetched.
+    #[error("integrity: root mismatch (expected {expected}, got {actual})")]
+    RootMismatch {
+        /// The root the caller pinned.
+        expected: Hash,
+        /// The root the server offered.
+        actual: Hash,
     },
 
-    /// A resume was attempted but the source's manifest id/hash changed since the
-    /// partial download — splicing mismatched halves would corrupt the output
-    /// (see `docs/design/large-data-transfer.md` §5.8). The partial is discarded.
-    #[error("resume: manifest id/hash changed since partial download")]
-    ResumeMismatch,
+    /// A received chunk's content hash did not match its content-addressed key
+    /// (Tier 2), or a fully-reassembled artifact failed its digest check.
+    #[error("integrity: content hash mismatch")]
+    HashMismatch,
 
-    /// The query returned chunk replies but no manifest reply.
-    #[error("protocol: manifest reply missing")]
-    NoManifest,
+    /// A `ranges` selector parameter was malformed (unsorted, overlapping,
+    /// out of bounds, over the span/chunk caps, or missing the `v=2` marker).
+    #[error("invalid ranges: {0}")]
+    InvalidRanges(String),
 
     /// The server has no blob registered under the requested id (TTL expired or
     /// never existed).
     #[error("not found: {0}")]
     NotFound(String),
 
-    /// The download ended (link dropped / server stopped) before all chunks
-    /// arrived. State is persisted; call `download` again to resume.
+    /// The download could not finish within the configured retry budget. State
+    /// is persisted; call `download` again to resume from the holes.
     #[error("incomplete: {received}/{total} chunks received")]
     Incomplete {
         /// Chunks received so far.
@@ -61,6 +76,11 @@ pub enum BlobError {
         /// Total chunks expected.
         total: u32,
     },
+
+    /// The destination path already exists and the overwrite policy is
+    /// [`Refuse`](crate::Overwrite::Refuse). The finished `.part` file is kept.
+    #[error("destination exists: {0}")]
+    DestinationExists(PathBuf),
 
     /// A generic protocol violation (malformed key, bad selector, …).
     #[error("protocol: {0}")]

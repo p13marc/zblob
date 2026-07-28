@@ -402,7 +402,7 @@ impl TreeClient {
 
         let needed = index.needed_chunks();
         let total = needed.len() as u32;
-        sink.emit(Progress::ManifestReceived {
+        sink.emit(Progress::Started {
             total_len: index.total_size(),
             chunk_count: total,
         });
@@ -411,7 +411,9 @@ impl TreeClient {
         // counts hashes *resolved*, including ones already present, so a resume
         // reports its real starting point immediately.
         let mut received: u32 = 0;
-        for hash in needed {
+        let mut bytes_received: u64 = 0;
+        #[allow(clippy::explicit_counter_loop)] // `received` also feeds Cancelled
+        for (i, hash) in needed.into_iter().enumerate() {
             if cancel.is_cancelled() {
                 return Err(BlobError::Cancelled { received, total });
             }
@@ -421,13 +423,15 @@ impl TreeClient {
                 if Hash::of(&bytes) != hash {
                     return Err(BlobError::HashMismatch);
                 }
+                bytes_received += bytes.len() as u64;
                 store.put(&hash, &bytes)?;
             }
             received += 1;
             sink.emit(Progress::Chunk {
-                index: received - 1,
+                index: i as u32,
                 received,
                 total,
+                bytes_received,
             });
         }
 

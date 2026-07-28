@@ -12,12 +12,9 @@
 //! - a *bao chunk* ([`ChunkNum`]) is 1024 bytes — the BLAKE3 leaf;
 //! - a *group* is `2^4` bao chunks = 16 KiB — the verification granularity;
 //! - a *transfer chunk* (crate::chunk) is a multiple of 16 KiB — the wire unit.
-// Wired up across the v2 commit sequence; this allow is removed once the
-// server/client use these helpers.
-#![allow(dead_code)]
-
 use std::io::{Cursor, Read, Seek};
 use std::ops::Range;
+use std::path::Path;
 
 use bao_tree::io::BaoContentItem;
 use bao_tree::io::outboard::PreOrderOutboard;
@@ -42,6 +39,12 @@ pub(crate) fn compute_outboard(data: impl Read + Seek) -> std::io::Result<MemOut
     PreOrderOutboard::create(data, BAO_BLOCK)
 }
 
+/// Like [`compute_outboard`], for a sequential reader whose size is already
+/// known (saves the seek-to-end).
+pub(crate) fn compute_outboard_sized(data: impl Read, size: u64) -> std::io::Result<MemOutboard> {
+    PreOrderOutboard::create_sized(data, size, BAO_BLOCK)
+}
+
 /// The bao tree geometry for a blob of `total_len` bytes.
 pub(crate) fn tree_for(total_len: u64) -> BaoTree {
     BaoTree::new(total_len, BAO_BLOCK)
@@ -64,6 +67,82 @@ pub(crate) fn encode_slice(
     let mut out = Vec::new();
     encode_ranges_validated(data, outboard, &ranges, &mut out).map_err(std::io::Error::other)?;
     Ok(out)
+}
+
+/// Compute a pre-order outboard for a large blob into the file at `obao`,
+/// streaming `data` once. The returned outboard reads its parent hashes from
+/// that file, keeping server memory flat no matter the blob size.
+pub(crate) fn compute_outboard_file(
+    data: impl Read,
+    size: u64,
+    obao: &Path,
+) -> std::io::Result<PreOrderOutboard<std::fs::File>> {
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .open(obao)?;
+    let mut ob = PreOrderOutboard {
+        root: blake3::hash(&[]),
+        tree: BaoTree::new(size, BAO_BLOCK),
+        data: file,
+    };
+    ob.init_from(data)?;
+    ob.data.sync_all()?;
+    Ok(ob)
+}
+
+/// Where a registered blob's outboard lives: in memory for ordinary blobs, in
+/// a sibling `.obao4` file for very large ones (~0.4% of the blob size).
+pub(crate) enum OutboardStore {
+    /// Parent hashes held in memory.
+    Mem(MemOutboard),
+    /// Parent hashes in a file (large blobs).
+    File(PreOrderOutboard<std::fs::File>),
+}
+
+impl OutboardStore {
+    /// The blob's BLAKE3 bao root.
+    pub fn root(&self) -> blake3::Hash {
+        match self {
+            OutboardStore::Mem(ob) => ob.root,
+            OutboardStore::File(ob) => ob.root,
+        }
+    }
+
+    /// Encode the bao slice for `chunks` from `data` + this outboard.
+    pub fn encode_slice(
+        &self,
+        data: impl ReadAt,
+        chunks: Range<ChunkNum>,
+    ) -> std::io::Result<Vec<u8>> {
+        match self {
+            OutboardStore::Mem(ob) => encode_slice(data, ob, chunks),
+            OutboardStore::File(ob) => encode_slice(data, ob, chunks),
+        }
+    }
+}
+
+/// Adapt a positional reader into a sequential [`Read`] (for outboard
+/// creation, which streams the source once).
+pub(crate) struct ReadAtCursor<R> {
+    inner: R,
+    pos: u64,
+}
+
+impl<R: ReadAt> ReadAtCursor<R> {
+    pub fn new(inner: R) -> Self {
+        ReadAtCursor { inner, pos: 0 }
+    }
+}
+
+impl<R: ReadAt> Read for ReadAtCursor<R> {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        let n = self.inner.read_at(self.pos, buf)?;
+        self.pos += n as u64;
+        Ok(n)
+    }
 }
 
 /// Verify-decode the bao slice for `chunks` against `root`, invoking `on_leaf`

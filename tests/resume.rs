@@ -1,93 +1,218 @@
-//! Kill + resume: an interrupted transfer continues from the first missing chunk
-//! (`?from=K`) rather than restarting, and reassembles correctly.
+//! Resume: an interrupted transfer continues from its bitfield's holes — a
+//! *middle* hole is re-requested as a range, not by re-streaming a suffix —
+//! and reassembles correctly across client instances.
 
 mod common;
 
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use common::{BytesSource, content_hash, open_session, pseudo_random, unique_prefix};
+use common::{content_hash, open_session, pseudo_random, unique_prefix};
 use zblob::{
-    BlobClient, BlobError, BlobServer, FixedSizeChunker, MIN_CHUNK_SIZE, Manifest, Progress,
-    ProgressSink,
+    BlobClient, BlobError, BlobServer, BlobSpec, CancelToken, DownloadRequest, MIN_CHUNK_SIZE,
+    MemoryBlobSource, Progress, ProgressSink, RetryPolicy, manifest_key, parse_ranges, slice_key,
+    wire::{ENC_MANIFEST, ENC_SLICE, encode},
 };
 
-/// A progress sink that records every `Chunk` event's `received` counter.
-#[derive(Default, Clone)]
-struct RecordingSink(Arc<Mutex<Vec<u32>>>);
+fn test_client(session: Arc<zenoh::Session>, prefix: &str) -> BlobClient {
+    BlobClient::builder(session, prefix)
+        .query_timeout(Duration::from_secs(5))
+        .retry(RetryPolicy {
+            max_attempts: 3,
+            base_backoff: Duration::from_millis(50),
+            max_backoff: Duration::from_millis(200),
+        })
+        .build()
+}
 
-impl ProgressSink for RecordingSink {
+/// Cancels its token once `received` reaches a threshold.
+struct CancelAt {
+    token: CancelToken,
+    at: u32,
+}
+impl ProgressSink for CancelAt {
     fn emit(&self, p: Progress) {
-        if let Progress::Chunk { received, .. } = p {
-            self.0.lock().unwrap().push(received);
+        if let Progress::Chunk { received, .. } = p
+            && received >= self.at
+        {
+            self.token.cancel();
         }
     }
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn interrupt_then_resume() {
+async fn interrupt_then_resume_across_clients() {
     let session = open_session().await;
     let prefix = unique_prefix();
     let dir = tempfile::tempdir().unwrap();
+    let dest = dir.path().join("data.bin");
 
-    // 8 full chunks; the source for round 1 only has the first 5.
-    let chunk = MIN_CHUNK_SIZE as usize;
-    let data = Arc::new(pseudo_random(chunk * 8, 0x1234));
-    let truncated = Arc::new(data[..chunk * 5].to_vec());
-
-    let mut reader = std::io::Cursor::new(data.as_slice());
-    let chunker = FixedSizeChunker::new(MIN_CHUNK_SIZE);
-    let manifest = Manifest::compute(&mut reader, &chunker, "blob-r", "data.bin", 1)
+    let data = pseudo_random(MIN_CHUNK_SIZE as usize * 8, 0x1234);
+    let server = BlobServer::new(session.clone(), prefix.clone());
+    server
+        .register_source(
+            BlobSpec::new("blob-r").chunk_size(MIN_CHUNK_SIZE),
+            Arc::new(MemoryBlobSource::new(data.clone())),
+        )
         .await
         .unwrap();
-    assert_eq!(manifest.chunk_count, 8);
+    let handle = server.spawn().await.unwrap();
 
-    let server = BlobServer::new(session.clone(), prefix.clone());
-    // Round 1: a truncated source → the server errors mid-stream after 5 chunks.
-    server
-        .register(manifest.clone(), Arc::new(BytesSource(truncated)))
-        .await;
-    tokio::spawn(server.clone().run());
-    tokio::time::sleep(Duration::from_millis(150)).await;
-
-    let client = BlobClient::new(session.clone(), prefix.clone());
+    // Round 1: cancel after 3 chunks → Cancelled, partial + sidecar persisted.
+    let client = test_client(session.clone(), &prefix);
+    let token = CancelToken::new();
+    let sink = CancelAt {
+        token: token.clone(),
+        at: 3,
+    };
     let err = client
-        .download("blob-r", dir.path(), &())
+        .download_to(&DownloadRequest::new("blob-r"), &dest, &sink, &token)
         .await
-        .unwrap_err();
-    match err {
-        BlobError::Incomplete { received, total } => {
-            assert_eq!(received, 5);
-            assert_eq!(total, 8);
-        }
-        other => panic!("expected Incomplete, got {other:?}"),
-    }
+        .expect_err("must cancel");
+    assert!(matches!(err, BlobError::Cancelled { .. }), "{err}");
+    assert!(dir.path().join("data.bin.part").exists());
+    assert!(dir.path().join("data.bin.part.meta").exists());
 
-    // Round 2: re-register the full source; resume should pull only chunks 5..7.
-    server
-        .register(manifest.clone(), Arc::new(BytesSource(data.clone())))
-        .await;
-
-    let sink = RecordingSink::default();
-    let path = tokio::time::timeout(
+    // Round 2: a *fresh client* (as after a process restart) resumes from the
+    // sidecar instead of starting over.
+    let events: Arc<Mutex<Vec<Progress>>> = Arc::new(Mutex::new(Vec::new()));
+    let ev = events.clone();
+    let sink = move |p: Progress| ev.lock().unwrap().push(p);
+    let client2 = test_client(session.clone(), &prefix);
+    tokio::time::timeout(
         Duration::from_secs(20),
-        client.download("blob-r", dir.path(), &sink),
+        client2.download_to(
+            &DownloadRequest::new("blob-r"),
+            &dest,
+            &sink,
+            &CancelToken::new(),
+        ),
     )
     .await
-    .expect("resume timed out")
+    .expect("timed out")
     .expect("resume failed");
 
-    // Final bytes verify.
-    let got = tokio::fs::read(&path).await.unwrap();
-    assert_eq!(content_hash(&got), content_hash(&data));
-
-    // Resume pulled exactly the 3 missing chunks, and the first one bumped the
-    // received counter to 6 (proving 5 were already on disk → `?from=5`).
-    let events = sink.0.lock().unwrap().clone();
-    assert_eq!(events.len(), 3, "should re-fetch only the 3 missing chunks");
     assert_eq!(
-        events[0], 6,
-        "resume should start from chunk 5 (received→6)"
+        content_hash(&std::fs::read(&dest).unwrap()),
+        content_hash(&data)
     );
-    assert_eq!(events.last(), Some(&8));
+    {
+        let events = events.lock().unwrap();
+        let resumed = events
+            .iter()
+            .find_map(|e| match e {
+                Progress::Resumed { received, .. } => Some(*received),
+                _ => None,
+            })
+            .expect("must emit Resumed, not Started");
+        assert!(resumed >= 3, "resume starts from persisted progress");
+        let refetched = events
+            .iter()
+            .filter(|e| matches!(e, Progress::Chunk { .. }))
+            .count() as u32;
+        assert_eq!(refetched, 8 - resumed, "only the holes are re-fetched");
+    }
+
+    handle.shutdown().await.unwrap();
+    session.close().await.unwrap();
+}
+
+/// A fake server that *skips* one middle chunk on the first slice query, then
+/// serves everything on later queries — and records each query's `ranges`
+/// parameter so the test can prove the client re-requested exactly the hole.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn middle_hole_is_refetched_as_a_range() {
+    let session = open_session().await;
+    let prefix = unique_prefix();
+    let dir = tempfile::tempdir().unwrap();
+    let dest = dir.path().join("holey.bin");
+
+    let chunk = MIN_CHUNK_SIZE;
+    let data = Arc::new(pseudo_random(chunk as usize * 6, 0x9999));
+    let count = 6u32;
+    let skipped = 2u32;
+
+    let ob = common::bao::outboard(&data);
+    let manifest = zblob::Manifest {
+        version: 2,
+        id: "holey".into(),
+        filename: None,
+        total_len: data.len() as u64,
+        chunk_size: chunk,
+        root: ob.root.into(),
+        created_ms: 0,
+    };
+
+    let pinned_root = manifest.root;
+    let params_log: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+    let plog = params_log.clone();
+    let (srv_session, srv_prefix, srv_data) = (session.clone(), prefix.clone(), data.clone());
+    // Declare before spawning so the client can query immediately.
+    let q = srv_session
+        .declare_queryable(format!("{srv_prefix}/**"))
+        .await
+        .unwrap();
+    let server = tokio::spawn(async move {
+        let mut slice_queries = 0u32;
+        while let Ok(query) = q.recv_async().await {
+            let key = query.key_expr().as_str().to_string();
+            if key.ends_with("/manifest") {
+                let _ = query
+                    .reply(
+                        manifest_key(&srv_prefix, "holey"),
+                        encode(&manifest).unwrap(),
+                    )
+                    .encoding(ENC_MANIFEST)
+                    .await;
+                continue;
+            }
+            let params = query.parameters().as_str().to_string();
+            plog.lock().unwrap().push(params.clone());
+            slice_queries += 1;
+            let ranges = parse_ranges(&params, count, 512).unwrap();
+            for range in ranges {
+                for index in range {
+                    if slice_queries == 1 && index == skipped {
+                        continue; // manufacture a middle hole
+                    }
+                    let payload = common::bao::slice(&srv_data, &ob, chunk, index);
+                    let _ = query
+                        .reply(slice_key(&srv_prefix, "holey", index), payload)
+                        .encoding(ENC_SLICE)
+                        .await;
+                }
+            }
+        }
+    });
+
+    let client = test_client(session.clone(), &prefix);
+    tokio::time::timeout(
+        Duration::from_secs(20),
+        client.download_to(
+            &DownloadRequest::pinned("holey", pinned_root),
+            &dest,
+            &(),
+            &CancelToken::new(),
+        ),
+    )
+    .await
+    .expect("timed out")
+    .expect("download");
+
+    assert_eq!(std::fs::read(&dest).unwrap(), *data);
+    {
+        let log = params_log.lock().unwrap();
+        assert!(
+            log.len() >= 2,
+            "needed a second query for the hole: {log:?}"
+        );
+        assert!(
+            log[1].contains(&format!("ranges={skipped}")),
+            "second query must request exactly the middle hole, got {:?}",
+            log[1]
+        );
+    }
+
+    server.abort();
+    session.close().await.unwrap();
 }
