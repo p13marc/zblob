@@ -4,6 +4,7 @@
 # Empty workspace table so this is unambiguously its own workspace root
 # (never captured by a parent directory's workspace).
 [workspace]
+exclude = ["fuzz"]
 
 [package]
 name = "zblob"
@@ -16,6 +17,7 @@ repository = "https://github.com/p13marc/zblob"
 readme = "README.md"
 keywords = ["zenoh", "transfer", "chunked", "resume", "content-addressed"]
 categories = ["network-programming", "filesystem"]
+exclude = ["fuzz/", ".forgejo/", ".github/"]
 
 [dependencies]
 zenoh = { version = "1.9", features = ["unstable"] }
@@ -45,3 +47,8 @@ encryption = ["dep:chacha20poly1305"]
 
 [dev-dependencies]
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "time"] }
+criterion = "0.5"
+
+[[bench]]
+name = "throughput"
+harness = false

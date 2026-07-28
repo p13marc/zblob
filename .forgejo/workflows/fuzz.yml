@@ -1,0 +1,20 @@
+name: Fuzz
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "17 3 * * 1" # weekly, Monday 03:17
+
+jobs:
+  fuzz:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: https://data.forgejo.org/actions/checkout@v7.0.1
+      - uses: https://github.com/dtolnay/rust-toolchain@nightly
+      - uses: https://github.com/taiki-e/install-action@v2
+        with:
+          tool: cargo-fuzz
+      - name: Fuzz each parser for 90 seconds
+        run: |
+          for target in hash_from_str parse_ranges decode_manifest decode_index; do
+            cargo +nightly fuzz run "$target" -- -max_total_time=90
+          done

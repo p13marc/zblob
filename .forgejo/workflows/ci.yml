@@ -11,9 +11,6 @@ concurrency:
 env:
   CARGO_TERM_COLOR: always
   RUSTFLAGS: -D warnings
-  # shared compiler cache: sccache (mounted from the runner VM) -> garage S3
-  # on vm-runner-01; S3 endpoint+credentials come from the runner's env_file
-  RUSTC_WRAPPER: /srv/cache/bin/sccache
   CARGO_INCREMENTAL: "0"
 
 jobs:
@@ -36,6 +33,13 @@ jobs:
       - uses: https://github.com/Swatinem/rust-cache@v2
         with:
           cache-targets: false
+      # Shared compiler cache on the self-hosted runner; absent on forks.
+      - name: Enable sccache if available
+        run: |
+          if [ -x /srv/cache/bin/sccache ]; then
+            echo "RUSTC_WRAPPER=/srv/cache/bin/sccache" >> "$GITHUB_ENV"
+          fi
+      - run: cargo clippy --all-targets --all-features --locked -- -D warnings
       - run: cargo clippy --all-targets --locked -- -D warnings
 
   test:
@@ -46,10 +50,20 @@ jobs:
       - uses: https://github.com/Swatinem/rust-cache@v2
         with:
           cache-targets: false
+      - name: Enable sccache if available
+        run: |
+          if [ -x /srv/cache/bin/sccache ]; then
+            echo "RUSTC_WRAPPER=/srv/cache/bin/sccache" >> "$GITHUB_ENV"
+          fi
       - run: cargo build --all-targets --locked
       - run: cargo test --locked
+      - run: cargo test --all-features --locked
       - name: sccache stats
-        run: /srv/cache/bin/sccache --show-stats
+        if: always()
+        run: |
+          if [ -x /srv/cache/bin/sccache ]; then
+            /srv/cache/bin/sccache --show-stats
+          fi
 
   msrv:
     runs-on: ubuntu-24.04
@@ -61,7 +75,12 @@ jobs:
       - uses: https://github.com/Swatinem/rust-cache@v2
         with:
           cache-targets: false
-      - run: cargo check --all-targets --locked
+      - name: Enable sccache if available
+        run: |
+          if [ -x /srv/cache/bin/sccache ]; then
+            echo "RUSTC_WRAPPER=/srv/cache/bin/sccache" >> "$GITHUB_ENV"
+          fi
+      - run: cargo check --all-targets --all-features --locked
 
   docs:
     runs-on: ubuntu-24.04
@@ -73,7 +92,52 @@ jobs:
       - uses: https://github.com/Swatinem/rust-cache@v2
         with:
           cache-targets: false
-      - run: cargo doc --no-deps --locked
+      - name: Enable sccache if available
+        run: |
+          if [ -x /srv/cache/bin/sccache ]; then
+            echo "RUSTC_WRAPPER=/srv/cache/bin/sccache" >> "$GITHUB_ENV"
+          fi
+      - run: cargo doc --no-deps --all-features --locked
+
+  audit:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: https://data.forgejo.org/actions/checkout@v7.0.1
+      - uses: https://github.com/dtolnay/rust-toolchain@stable
+      - uses: https://github.com/taiki-e/install-action@v2
+        with:
+          tool: cargo-audit
+      - run: cargo audit
+
+  coverage:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: https://data.forgejo.org/actions/checkout@v7.0.1
+      - uses: https://github.com/dtolnay/rust-toolchain@stable
+        with:
+          components: llvm-tools-preview
+      - uses: https://github.com/Swatinem/rust-cache@v2
+        with:
+          cache-targets: false
+      - uses: https://github.com/taiki-e/install-action@v2
+        with:
+          tool: cargo-llvm-cov
+      - run: cargo llvm-cov --all-features --locked --summary-only
+
+  bench-build:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: https://data.forgejo.org/actions/checkout@v7.0.1
+      - uses: https://github.com/dtolnay/rust-toolchain@stable
+      - uses: https://github.com/Swatinem/rust-cache@v2
+        with:
+          cache-targets: false
+      - name: Enable sccache if available
+        run: |
+          if [ -x /srv/cache/bin/sccache ]; then
+            echo "RUSTC_WRAPPER=/srv/cache/bin/sccache" >> "$GITHUB_ENV"
+          fi
+      - run: cargo bench --no-run --locked
 
   publish-dry-run:
     runs-on: ubuntu-24.04
@@ -83,4 +147,9 @@ jobs:
       - uses: https://github.com/Swatinem/rust-cache@v2
         with:
           cache-targets: false
+      - name: Enable sccache if available
+        run: |
+          if [ -x /srv/cache/bin/sccache ]; then
+            echo "RUSTC_WRAPPER=/srv/cache/bin/sccache" >> "$GITHUB_ENV"
+          fi
       - run: cargo publish --dry-run

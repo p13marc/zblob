@@ -1,0 +1,40 @@
+[package]
+name = "zblob-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2024"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+zblob = { path = ".." }
+
+[[bin]]
+name = "hash_from_str"
+path = "fuzz_targets/hash_from_str.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "parse_ranges"
+path = "fuzz_targets/parse_ranges.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "decode_manifest"
+path = "fuzz_targets/decode_manifest.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "decode_index"
+path = "fuzz_targets/decode_index.rs"
+test = false
+doc = false
+bench = false
