@@ -20,6 +20,17 @@
 
 use crate::error::{BlobError, Result};
 
+/// Why a chunk container could not be decoded.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ContainerError {
+    /// The frame uses a format this build cannot read (missing cargo feature
+    /// or, at rest, a sealed chunk without the store key). Not corruption —
+    /// the bytes must be left alone.
+    Unsupported,
+    /// The frame is malformed or fails to decode: at-rest corruption.
+    Corrupt,
+}
+
 /// Compression policy for produced chunk containers.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 #[non_exhaustive]
@@ -35,8 +46,10 @@ pub enum ChunkCompression {
     },
 }
 
-const TAG_RAW: u8 = 0x00;
-const TAG_ZSTD: u8 = 0x01;
+pub(crate) const TAG_RAW: u8 = 0x00;
+pub(crate) const TAG_ZSTD: u8 = 0x01;
+/// XChaCha20-Poly1305 sealed container (at rest only; see `crate::crypt`).
+pub(crate) const TAG_SEALED: u8 = 0x02;
 
 /// Largest uncompressed chunk a frame may declare (matches the CDC `max` cap).
 const MAX_UNPACKED: usize = 16 * 1024 * 1024;
@@ -71,43 +84,47 @@ pub(crate) fn pack(bytes: &[u8], compression: ChunkCompression) -> Result<Vec<u8
 }
 
 /// Unframe a chunk container back to its raw bytes.
-pub(crate) fn unpack(packed: &[u8]) -> Result<Vec<u8>> {
+pub(crate) fn try_unpack(packed: &[u8]) -> std::result::Result<Vec<u8>, ContainerError> {
     match packed.split_first() {
         Some((&TAG_RAW, rest)) => Ok(rest.to_vec()),
         Some((&TAG_ZSTD, rest)) => {
             if rest.len() < 4 {
-                return Err(BlobError::Protocol("truncated zstd chunk frame".into()));
+                return Err(ContainerError::Corrupt);
             }
             let (len_bytes, frame) = rest.split_at(4);
             let declared = u32::from_le_bytes(len_bytes.try_into().expect("4 bytes")) as usize;
             if declared > MAX_UNPACKED {
-                return Err(BlobError::Protocol(format!(
-                    "zstd chunk frame declares {declared} bytes (limit {MAX_UNPACKED})"
-                )));
+                return Err(ContainerError::Corrupt);
             }
             #[cfg(feature = "zstd")]
             {
-                let out = zstd::bulk::decompress(frame, declared)
-                    .map_err(|e| BlobError::Protocol(format!("zstd decompress: {e}")))?;
+                let out =
+                    zstd::bulk::decompress(frame, declared).map_err(|_| ContainerError::Corrupt)?;
                 if out.len() != declared {
-                    return Err(BlobError::Protocol(
-                        "zstd chunk frame length mismatch".into(),
-                    ));
+                    return Err(ContainerError::Corrupt);
                 }
                 Ok(out)
             }
             #[cfg(not(feature = "zstd"))]
             {
                 let _ = frame;
-                Err(BlobError::Protocol(
-                    "received a zstd-compressed chunk but zblob was built without the `zstd` \
-                     feature"
-                        .into(),
-                ))
+                Err(ContainerError::Unsupported)
             }
         }
-        _ => Err(BlobError::Protocol("empty or unknown chunk frame".into())),
+        Some((&TAG_SEALED, _)) => Err(ContainerError::Unsupported), // wire never carries sealed
+        _ => Err(ContainerError::Corrupt),
     }
+}
+
+/// Unframe for the wire path, mapping both failure kinds to a protocol error.
+pub(crate) fn unpack(packed: &[u8]) -> Result<Vec<u8>> {
+    try_unpack(packed).map_err(|e| match e {
+        ContainerError::Unsupported => BlobError::Protocol(
+            "chunk container uses a format this build does not support (missing cargo feature?)"
+                .into(),
+        ),
+        ContainerError::Corrupt => BlobError::Protocol("malformed chunk container".into()),
+    })
 }
 
 #[cfg(test)]

@@ -49,6 +49,8 @@ mod cancel;
 mod chunk;
 mod client;
 mod compress;
+#[cfg(feature = "encryption")]
+mod crypt;
 mod error;
 #[cfg(feature = "fanout")]
 pub mod fanout;
@@ -71,6 +73,8 @@ pub use cancel::CancelToken;
 pub use chunk::{CdcParams, DEFAULT_CHUNK_SIZE, MAX_CHUNK_SIZE, MIN_CHUNK_SIZE, TransferChunks};
 pub use client::{BlobClient, BlobClientBuilder, DownloadRequest, Overwrite, RetryPolicy};
 pub use compress::ChunkCompression;
+#[cfg(feature = "encryption")]
+pub use crypt::StoreKey;
 pub use error::{BlobError, Result};
 pub use hash::{Hash, HashParseError};
 pub use manifest::{BlobSpec, Manifest};

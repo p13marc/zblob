@@ -10,7 +10,7 @@ use std::io::Write;
 use std::path::PathBuf;
 use std::sync::{Mutex, MutexGuard};
 
-use crate::compress::{ChunkCompression, pack, unpack};
+use crate::compress::{ChunkCompression, ContainerError, TAG_SEALED, pack, try_unpack};
 use crate::hash::Hash;
 use crate::paths::fsync_dir;
 
@@ -93,6 +93,8 @@ pub struct DirStore {
     root: PathBuf,
     verify_on_read: bool,
     compression: ChunkCompression,
+    #[cfg(feature = "encryption")]
+    encryption: Option<crate::crypt::StoreKey>,
 }
 
 impl DirStore {
@@ -104,7 +106,20 @@ impl DirStore {
             root,
             verify_on_read: false,
             compression: ChunkCompression::default(),
+            #[cfg(feature = "encryption")]
+            encryption: None,
         })
+    }
+
+    /// Seal every chunk at rest with XChaCha20-Poly1305 under `key` (see
+    /// [`StoreKey`](crate::StoreKey) and the `crypt` module docs for the
+    /// dedup-membership caveat). Reading understands sealed and plain chunks
+    /// side by side; a sealed chunk read without the key reports missing —
+    /// never deleted, never garbage.
+    #[cfg(feature = "encryption")]
+    pub fn with_encryption(mut self, key: crate::crypt::StoreKey) -> Self {
+        self.encryption = Some(key);
+        self
     }
 
     /// Compress chunks at rest (see [`ChunkCompression`]; requires the `zstd`
@@ -133,19 +148,53 @@ impl DirStore {
         self.algo_dir().join(&hex[..2]).join(hex)
     }
 
+    /// Decode an at-rest chunk container: unseal (if sealed and a key is
+    /// configured), then unframe compression. `strict_seal` decides what a
+    /// failed unseal means: on the read path it is *not* treated as
+    /// corruption (a wrong key is indistinguishable from tampering, and reads
+    /// must never destroy data they cannot decrypt); a keyed [`scrub`] passes
+    /// `true` to actually detect sealed-chunk tampering.
+    fn decode_at_rest(
+        &self,
+        packed: &[u8],
+        hash: &Hash,
+        strict_seal: bool,
+    ) -> std::result::Result<Vec<u8>, ContainerError> {
+        let _ = (hash, strict_seal);
+        if packed.first() == Some(&TAG_SEALED) {
+            #[cfg(feature = "encryption")]
+            if let Some(key) = &self.encryption {
+                return match crate::crypt::open(key, hash, packed) {
+                    Some(inner) => try_unpack(&inner),
+                    None if strict_seal => Err(ContainerError::Corrupt),
+                    None => Err(ContainerError::Unsupported),
+                };
+            }
+            return Err(ContainerError::Unsupported);
+        }
+        try_unpack(packed)
+    }
+
     /// Re-hash every chunk; delete and report the corrupted ones. The store
-    /// heals on the next download (missing chunks are re-fetched).
+    /// heals on the next download (missing chunks are re-fetched). Chunks in
+    /// a format this build cannot read (missing feature / no key) are
+    /// skipped — but **run a keyed scrub only with the store's correct key**:
+    /// with the right key a sealed chunk that fails to open is reported (and
+    /// removed) as tampering.
     pub fn scrub(&self) -> std::io::Result<Vec<Hash>> {
         let mut corrupted = Vec::new();
         for hash in self.hashes()? {
             let path = self.path(&hash);
-            let ok = std::fs::read(&path)
-                .ok()
-                .and_then(|packed| unpack(&packed).ok())
-                .is_some_and(|bytes| Hash::of(&bytes) == hash);
-            if !ok {
-                let _ = std::fs::remove_file(&path);
-                corrupted.push(hash);
+            let verdict = std::fs::read(&path)
+                .map_err(|_| ContainerError::Corrupt)
+                .and_then(|packed| self.decode_at_rest(&packed, &hash, true));
+            match verdict {
+                Ok(bytes) if Hash::of(&bytes) == hash => {}
+                Err(ContainerError::Unsupported) => {}
+                Ok(_) | Err(ContainerError::Corrupt) => {
+                    let _ = std::fs::remove_file(&path);
+                    corrupted.push(hash);
+                }
             }
         }
         Ok(corrupted)
@@ -160,11 +209,16 @@ impl ContentStore for DirStore {
     fn get(&self, hash: &Hash) -> Option<Vec<u8>> {
         let path = self.path(hash);
         let packed = std::fs::read(&path).ok()?;
-        let Ok(bytes) = unpack(&packed) else {
-            // Undecodable frame = at-rest corruption: report missing so the
-            // caller re-fetches instead of materializing garbage.
-            let _ = std::fs::remove_file(&path);
-            return None;
+        let bytes = match self.decode_at_rest(&packed, hash, false) {
+            Ok(bytes) => bytes,
+            // A format this build can't read (missing feature / no key) must
+            // be left alone; corruption is reported missing so the caller
+            // re-fetches instead of materializing garbage.
+            Err(ContainerError::Unsupported) => return None,
+            Err(ContainerError::Corrupt) => {
+                let _ = std::fs::remove_file(&path);
+                return None;
+            }
         };
         if self.verify_on_read && Hash::of(&bytes) != *hash {
             let _ = std::fs::remove_file(&path);
@@ -174,7 +228,12 @@ impl ContentStore for DirStore {
     }
 
     fn put(&self, hash: &Hash, bytes: &[u8]) -> std::io::Result<()> {
-        let packed = pack(bytes, self.compression).map_err(std::io::Error::other)?;
+        #[allow(unused_mut)]
+        let mut packed = pack(bytes, self.compression).map_err(std::io::Error::other)?;
+        #[cfg(feature = "encryption")]
+        if let Some(key) = &self.encryption {
+            packed = crate::crypt::seal(key, hash, &packed)?;
+        }
         let dst = self.path(hash);
         let dir = dst.parent().expect("fanout dir");
         std::fs::create_dir_all(dir)?;
@@ -273,6 +332,49 @@ mod tests {
         std::fs::write(&path, b"garbage").unwrap();
         // Verified read reports it missing and removes it → refetch heals.
         assert!(s.get(&hash).is_none());
+        assert!(!path.exists());
+    }
+
+    #[cfg(feature = "encryption")]
+    #[test]
+    fn encrypted_store_roundtrip_and_key_required() {
+        use crate::crypt::StoreKey;
+        let dir = tempfile::tempdir().unwrap();
+        let key = StoreKey([7u8; 32]);
+        let s = DirStore::open(dir.path())
+            .unwrap()
+            .with_encryption(key.clone());
+        let plaintext = b"very secret chunk contents".to_vec();
+        let hash = h(&plaintext);
+        s.put(&hash, &plaintext).unwrap();
+        assert_eq!(s.get(&hash).unwrap(), plaintext);
+
+        // The on-disk file is sealed: no plaintext, sealed tag first.
+        let hex = hash.to_string();
+        let path = dir.path().join("blake3").join(&hex[..2]).join(&hex);
+        let on_disk = std::fs::read(&path).unwrap();
+        assert_eq!(on_disk[0], 0x02);
+        assert!(!on_disk.windows(plaintext.len()).any(|w| w == plaintext));
+
+        // Opening the store without the key: chunk reads as missing but the
+        // sealed file is never deleted or mistaken for corruption.
+        let no_key = DirStore::open(dir.path()).unwrap();
+        assert!(no_key.get(&hash).is_none());
+        assert!(path.exists(), "sealed chunk must not be deleted");
+        assert!(no_key.scrub().unwrap().is_empty(), "scrub must skip sealed");
+
+        // Wrong key: same safety.
+        let wrong = DirStore::open(dir.path())
+            .unwrap()
+            .with_encryption(StoreKey([8u8; 32]));
+        assert!(wrong.get(&hash).is_none());
+
+        // Tampered ciphertext: detected as corruption by a keyed scrub.
+        let mut bytes = std::fs::read(&path).unwrap();
+        let n = bytes.len();
+        bytes[n - 1] ^= 0xff;
+        std::fs::write(&path, &bytes).unwrap();
+        assert_eq!(s.scrub().unwrap(), vec![hash]);
         assert!(!path.exists());
     }
 
