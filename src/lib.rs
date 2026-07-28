@@ -58,6 +58,7 @@ mod paths;
 mod progress;
 mod publish;
 mod resume;
+pub mod seed;
 mod server;
 mod store;
 mod tree;
