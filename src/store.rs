@@ -10,7 +10,7 @@ use std::io::Write;
 use std::path::PathBuf;
 use std::sync::{Mutex, MutexGuard};
 
-use crate::compress::{ChunkCompression, ContainerError, TAG_SEALED, pack, try_unpack};
+use crate::compress::{ChunkCompression, ContainerError, TAG_RAW, TAG_SEALED, pack, try_unpack};
 use crate::hash::Hash;
 use crate::paths::fsync_dir;
 
@@ -203,34 +203,33 @@ impl DirStore {
 
 impl ContentStore for DirStore {
     fn has(&self, hash: &Hash) -> bool {
-        // Presence must mean "get() can decode this" for *format* reasons, or
-        // a sealed/compressed store opened without the matching feature/key
-        // would skip fetching chunks it can never read (a permanently wedged
-        // download). One-byte header sniff keeps this cheap; content-level
-        // rot detection remains verify_on_read/scrub territory.
+        // Presence must mean "get() will hand these bytes back". The download
+        // path calls `has` to decide *not* to fetch, so a chunk this store
+        // cannot decode — missing cargo feature, missing key, *wrong* key —
+        // has to report absent, or the transfer wedges with no way to heal.
+        // A raw chunk costs one header byte; a compressed or sealed one costs
+        // a read plus its decode, which is the only honest answer available
+        // (a wrong AEAD key is indistinguishable from tampering without it).
+        // Content-level rot remains verify_on_read/scrub territory; `has`
+        // never deletes.
         use std::io::Read;
-        let Ok(mut f) = std::fs::File::open(self.path(hash)) else {
+        let path = self.path(hash);
+        let Ok(mut f) = std::fs::File::open(&path) else {
             return false;
         };
         let mut tag = [0u8; 1];
         if f.read_exact(&mut tag).is_err() {
-            // Zero-length file: only valid as a raw frame of nothing — never
-            // produced; treat as missing so it gets re-fetched.
+            // Zero-length file: not even a raw frame; re-fetch it.
             return false;
         }
-        match tag[0] {
-            TAG_SEALED => {
-                #[cfg(feature = "encryption")]
-                {
-                    self.encryption.is_some()
-                }
-                #[cfg(not(feature = "encryption"))]
-                {
-                    false
-                }
-            }
-            _ => true, // raw always readable; zstd readability checked by get
+        if tag[0] == TAG_RAW {
+            return true;
         }
+        drop(f);
+        let Ok(packed) = std::fs::read(&path) else {
+            return false;
+        };
+        self.decode_at_rest(&packed, hash, false).is_ok()
     }
 
     fn get(&self, hash: &Hash) -> Option<Vec<u8>> {

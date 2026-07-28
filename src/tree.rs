@@ -570,6 +570,8 @@ impl TreeServer {
     }
 
     async fn declare(&self) -> Result<(FifoQueryable, FifoQueryable)> {
+        crate::paths::validate_key_prefix(&self.inner.store_prefix)?;
+        crate::paths::validate_key_prefix(&self.inner.tree_prefix)?;
         let store_q = self
             .inner
             .session
@@ -800,6 +802,8 @@ impl TreeClient {
         id: &str,
         expected_root: Option<Hash>,
     ) -> Result<TreeIndex> {
+        crate::paths::validate_key_prefix(&self.store_prefix)?;
+        crate::paths::validate_key_prefix(&self.tree_prefix)?;
         validate_id(id)?;
         let key = tree_key(&self.tree_prefix, id);
         let replies = self

@@ -202,6 +202,101 @@ impl CdcParams {
 }
 
 #[cfg(test)]
+mod properties {
+    use super::*;
+    use proptest::prelude::*;
+
+    /// Generate a valid transfer chunk size (16 KiB-aligned, in bounds).
+    fn valid_chunk_size() -> impl Strategy<Value = u32> {
+        (MIN_CHUNK_SIZE / (16 * 1024)..=MAX_CHUNK_SIZE / (16 * 1024)).prop_map(|k| k * 16 * 1024)
+    }
+
+    proptest! {
+        /// The chunk grid must tile the blob exactly: contiguous, gapless,
+        /// non-overlapping, summing to `total_len`. Every offset the client
+        /// writes to and every range the server reads from comes from here.
+        #[test]
+        fn chunks_tile_the_blob_exactly(
+            chunk_size in valid_chunk_size(),
+            total_len in 0u64..(64 * 1024 * 1024),
+        ) {
+            let c = TransferChunks::new(chunk_size, total_len).unwrap();
+            let count = c.count();
+            let mut cursor = 0u64;
+            let mut summed = 0u64;
+            for i in 0..count {
+                let r = c.byte_range(i);
+                prop_assert_eq!(r.start, cursor, "gap or overlap at chunk {}", i);
+                prop_assert!(r.end > r.start, "empty chunk {} within count", i);
+                prop_assert_eq!(c.len_of(i) as u64, r.end - r.start);
+                prop_assert!(c.len_of(i) <= chunk_size);
+                cursor = r.end;
+                summed += c.len_of(i) as u64;
+            }
+            prop_assert_eq!(cursor, total_len, "tiling does not reach the end");
+            prop_assert_eq!(summed, total_len);
+            // Past the end is empty, never a panic or a wild range.
+            prop_assert_eq!(c.len_of(count), 0);
+            prop_assert_eq!(c.len_of(u32::MAX), 0);
+        }
+
+        /// Chunk boundaries must be 16 KiB-group aligned, or a bao slice
+        /// cannot cover a chunk exactly (the whole verification model
+        /// depends on this).
+        #[test]
+        fn chunk_starts_are_group_aligned(
+            chunk_size in valid_chunk_size(),
+            total_len in 0u64..(16 * 1024 * 1024),
+            index in 0u32..64,
+        ) {
+            let c = TransferChunks::new(chunk_size, total_len).unwrap();
+            let start = c.byte_range(index).start;
+            prop_assert!(
+                start.is_multiple_of(crate::verify::GROUP_SIZE) || start == total_len,
+                "chunk {} starts at {} which is not group-aligned", index, start
+            );
+        }
+
+        /// Validation is total: no input panics, and acceptance implies the
+        /// documented rules hold.
+        #[test]
+        fn chunk_size_validation_is_total(size in any::<u32>()) {
+            match TransferChunks::validate_chunk_size(size) {
+                Ok(()) => {
+                    prop_assert!((MIN_CHUNK_SIZE..=MAX_CHUNK_SIZE).contains(&size));
+                    prop_assert!((size as u64).is_multiple_of(crate::verify::GROUP_SIZE));
+                }
+                Err(_) => {
+                    prop_assert!(
+                        !(MIN_CHUNK_SIZE..=MAX_CHUNK_SIZE).contains(&size)
+                            || !(size as u64).is_multiple_of(crate::verify::GROUP_SIZE)
+                    );
+                }
+            }
+        }
+
+        /// CDC chunking must reproduce the input exactly, whatever the
+        /// parameters or data — a lost or duplicated byte here silently
+        /// corrupts every tree built with it.
+        #[test]
+        fn cdc_chunking_is_lossless(
+            data in prop::collection::vec(any::<u8>(), 0..70_000),
+            seed in any::<u64>(),
+        ) {
+            let params = CdcParams { min: 2048, avg: 8192, max: 32768, normalization: 2, gear_seed: seed };
+            let mut rebuilt = Vec::new();
+            for chunk in params.chunk_reader(std::io::Cursor::new(&data)) {
+                let bytes = chunk.map_err(|e| TestCaseError::fail(e.to_string()))?;
+                prop_assert!(!bytes.is_empty(), "CDC must not emit empty chunks");
+                prop_assert!(bytes.len() <= params.max as usize, "chunk exceeds declared max");
+                rebuilt.extend_from_slice(&bytes);
+            }
+            prop_assert_eq!(rebuilt, data);
+        }
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use crate::hash::Hash;

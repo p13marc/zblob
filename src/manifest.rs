@@ -95,11 +95,19 @@ impl Manifest {
 
 /// A blob id must be a single non-empty Zenoh key segment of sane length: no
 /// `/` or `\` (ids are joined into spool/tag file names), no wildcard/param
-/// characters, no `..`.
+/// characters, no `..`, and **no leading `@`**.
+///
+/// The `@` rule is not cosmetic: Zenoh treats a segment beginning with `@` as
+/// *verbatim*, and `**` does not match it. A server declares its queryable on
+/// `<prefix>/**`, so an id like `@thing` would register successfully and then
+/// never be servable — every download would time out as `NotFound` with
+/// nothing in any log to explain it. Reject it at the door instead.
+/// (`x@y` is fine; only the leading position is special.)
 pub(crate) fn validate_id(id: &str) -> Result<()> {
     let ok = !id.is_empty()
         && id.len() <= 200
         && id != ".."
+        && !id.starts_with('@')
         && !id.contains(['/', '\\', '*', '?', '#', '$'])
         && !id.chars().any(char::is_whitespace);
     if ok {
@@ -218,13 +226,40 @@ mod tests {
 
     #[test]
     fn bad_ids_rejected() {
-        for bad in ["", "a/b", "a*", "a?x", "..", "a b"] {
+        for bad in [
+            "",
+            "a/b",
+            "a*",
+            "a?x",
+            "..",
+            "a b",
+            "@verbatim",
+            "a\\b",
+            "@",
+        ] {
             let m = Manifest {
                 id: bad.into(),
                 ..manifest()
             };
             assert!(m.validate(u64::MAX).is_err(), "id {bad:?}");
         }
+    }
+
+    /// The `@` rule exists because Zenoh's `**` does not match verbatim
+    /// segments — assert the actual matching behaviour so the rule cannot be
+    /// "simplified away" by someone who doesn't know why it is there.
+    #[test]
+    fn leading_at_ids_would_be_unservable() {
+        let pattern: zenoh::key_expr::KeyExpr = "p/**".try_into().unwrap();
+        let verbatim: zenoh::key_expr::KeyExpr = "p/@id/manifest".try_into().unwrap();
+        let ordinary: zenoh::key_expr::KeyExpr = "p/x@y/manifest".try_into().unwrap();
+        assert!(
+            !pattern.intersects(&verbatim),
+            "if this ever passes, the leading-@ id rule can be relaxed"
+        );
+        assert!(pattern.intersects(&ordinary));
+        assert!(validate_id("@id").is_err());
+        assert!(validate_id("x@y").is_ok());
     }
 
     #[test]

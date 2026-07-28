@@ -168,6 +168,153 @@ pub(crate) fn decode_slice(
 }
 
 #[cfg(test)]
+mod properties {
+    use super::*;
+    use proptest::prelude::*;
+
+    /// Encode the slice for transfer chunk `index` of `data` at `chunk_size`.
+    fn slice_for(data: &[u8], chunk_size: u64, index: u64) -> Option<(Vec<u8>, Range<u64>)> {
+        let total = data.len() as u64;
+        let start = index * chunk_size;
+        if start >= total && total > 0 {
+            return None;
+        }
+        let end = (start + chunk_size).min(total);
+        if start == end {
+            return None;
+        }
+        let ob = compute_outboard(Cursor::new(data)).ok()?;
+        let enc = encode_slice(data, &ob, chunk_range(start..end)).ok()?;
+        Some((enc, start..end))
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(64))]
+
+        /// The integrity core: a slice must decode to *exactly* the byte range
+        /// it claims, for any blob length, chunk size, and index — including
+        /// the short final chunk and sub-group blobs. Everything the client
+        /// writes to disk comes out of this.
+        #[test]
+        fn slice_round_trips_to_its_exact_byte_range(
+            data in prop::collection::vec(any::<u8>(), 0..300_000),
+            size_groups in 1u64..8,
+            index in 0u64..20,
+        ) {
+            let chunk_size = size_groups * GROUP_SIZE;
+            let Some((enc, range)) = slice_for(&data, chunk_size, index) else {
+                return Ok(()); // past the end / empty blob: nothing to verify
+            };
+            let root = blake3::hash(&data);
+            let mut got = Vec::new();
+            let mut first_offset = None;
+            decode_slice(&root, data.len() as u64, chunk_range(range.clone()), &enc, |off, d| {
+                first_offset.get_or_insert(off);
+                got.extend_from_slice(d);
+                Ok(())
+            })
+            .map_err(|e| TestCaseError::fail(format!("honest slice rejected: {e}")))?;
+            prop_assert_eq!(first_offset, Some(range.start), "slice landed at the wrong offset");
+            prop_assert_eq!(
+                got.as_slice(),
+                &data[range.start as usize..range.end as usize],
+                "decoded bytes differ from the source range"
+            );
+        }
+
+        /// Tampering anywhere in a slice must be caught. This is the property
+        /// the whole "a bad reply poisons nothing" claim rests on, so it is
+        /// asserted over generated mutation positions rather than one example.
+        #[test]
+        fn any_single_byte_mutation_is_rejected(
+            data in prop::collection::vec(any::<u8>(), 1..120_000),
+            size_groups in 1u64..4,
+            index in 0u64..8,
+            mutate_at in any::<prop::sample::Index>(),
+            xor in 1u8..=255,
+        ) {
+            let chunk_size = size_groups * GROUP_SIZE;
+            let Some((enc, range)) = slice_for(&data, chunk_size, index) else {
+                return Ok(());
+            };
+            let root = blake3::hash(&data);
+            let pos = mutate_at.index(enc.len());
+            let mut bad = enc.clone();
+            bad[pos] ^= xor;
+
+            let mut leaked = Vec::new();
+            let verdict = decode_slice(&root, data.len() as u64, chunk_range(range.clone()), &bad, |_, d| {
+                leaked.extend_from_slice(d);
+                Ok(())
+            });
+            let honest = &data[range.start as usize..range.end as usize];
+            // Either the decode fails, or (if the mutation hit a byte that
+            // does not affect this range's proof) what it yields is still the
+            // genuine content — never attacker-chosen bytes.
+            if verdict.is_ok() {
+                prop_assert_eq!(
+                    leaked.as_slice(), honest,
+                    "a mutated slice was accepted with different bytes"
+                );
+            } else {
+                prop_assert!(
+                    honest.starts_with(&leaked),
+                    "bytes emitted before rejection must be a genuine prefix"
+                );
+            }
+        }
+
+        /// A slice is bound to the range it was cut for: replaying it under a
+        /// different chunk index must not verify (otherwise a server could
+        /// answer every index with chunk 0 and the client would assemble
+        /// garbage that still "verified").
+        #[test]
+        fn a_slice_cannot_be_replayed_at_another_index(
+            data in prop::collection::vec(any::<u8>(), 40_000..200_000),
+            size_groups in 1u64..3,
+        ) {
+            let chunk_size = size_groups * GROUP_SIZE;
+            let Some((enc0, _)) = slice_for(&data, chunk_size, 0) else {
+                return Ok(());
+            };
+            let Some((_, range1)) = slice_for(&data, chunk_size, 1) else {
+                return Ok(());
+            };
+            let root = blake3::hash(&data);
+            let mut got = Vec::new();
+            let verdict = decode_slice(&root, data.len() as u64, chunk_range(range1.clone()), &enc0, |_, d| {
+                got.extend_from_slice(d);
+                Ok(())
+            });
+            if verdict.is_ok() {
+                prop_assert_eq!(
+                    got.as_slice(),
+                    &data[range1.start as usize..range1.end as usize],
+                    "chunk 0's slice was accepted as chunk 1"
+                );
+            }
+        }
+
+        /// Arbitrary bytes presented as a slice must never panic.
+        #[test]
+        fn arbitrary_slice_bytes_never_panic(
+            junk in prop::collection::vec(any::<u8>(), 0..4096),
+            total_len in 0u64..200_000,
+            index in 0u64..8,
+        ) {
+            let root = blake3::hash(b"unrelated");
+            let chunk_size = GROUP_SIZE;
+            let start = (index * chunk_size).min(total_len);
+            let end = (start + chunk_size).min(total_len);
+            if start == end {
+                return Ok(());
+            }
+            let _ = decode_slice(&root, total_len, chunk_range(start..end), &junk, |_, _| Ok(()));
+        }
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
 

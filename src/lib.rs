@@ -278,6 +278,71 @@ pub fn tree_key(prefix: &str, id: &str) -> String {
 }
 
 #[cfg(test)]
+mod range_properties {
+    use super::*;
+    use proptest::prelude::*;
+
+    proptest! {
+        /// Whatever `parse_ranges` accepts must satisfy every documented
+        /// invariant — this is the contract the server relies on to bound its
+        /// work, so it is asserted over generated input rather than examples.
+        #[test]
+        fn accepted_ranges_always_satisfy_the_contract(
+            params in ".{0,120}",
+            chunk_count in 0u32..5000,
+            max_chunks in 1u32..1000,
+        ) {
+            if let Ok(ranges) = parse_ranges(&params, chunk_count, max_chunks) {
+                prop_assert!(!ranges.is_empty());
+                prop_assert!(ranges.len() <= MAX_RANGE_SPANS);
+                let mut prev_end = 0u32;
+                let mut total = 0u64;
+                for r in &ranges {
+                    prop_assert!(r.start < r.end, "empty/inverted span {r:?}");
+                    prop_assert!(r.start >= prev_end, "unsorted or overlapping {r:?}");
+                    prop_assert!(r.end <= chunk_count, "out of bounds {r:?}");
+                    prev_end = r.end;
+                    total += (r.end - r.start) as u64;
+                }
+                prop_assert!(total <= max_chunks as u64, "over the chunk cap");
+            }
+        }
+
+        /// Arbitrary bytes in the parameter position must never panic — the
+        /// server parses this straight off the wire.
+        #[test]
+        fn parse_ranges_never_panics(params in prop::collection::vec(any::<u8>(), 0..200)) {
+            let s = String::from_utf8_lossy(&params);
+            let _ = parse_ranges(&s, 1000, 512);
+            let _ = parse_ranges(&format!("v=2&ranges={s}"), 1000, 512);
+        }
+
+        /// Any legal hole set the client can produce must survive the round
+        /// trip through the selector grammar unchanged (this is what makes
+        /// resume exact rather than approximate).
+        #[test]
+        fn hole_sets_round_trip(seed in prop::collection::vec((0u32..200, 1u32..20), 1..40)) {
+            // Build sorted, disjoint, non-empty spans from the generated gaps.
+            let mut ranges: Vec<std::ops::Range<u32>> = Vec::new();
+            let mut cursor = 0u32;
+            for (gap, len) in seed {
+                let start = cursor + gap;
+                let end = start + len;
+                ranges.push(start..end);
+                cursor = end;
+            }
+            ranges.truncate(MAX_RANGE_SPANS);
+            let chunk_count = cursor + 1;
+            let total: u32 = ranges.iter().map(|r| r.end - r.start).sum();
+            let rendered = format!("v=2&ranges={}", format_ranges(&ranges));
+            let parsed = parse_ranges(&rendered, chunk_count, total)
+                .map_err(|e| TestCaseError::fail(format!("rejected own output {rendered:?}: {e}")))?;
+            prop_assert_eq!(parsed, ranges);
+        }
+    }
+}
+
+#[cfg(test)]
 mod key_tests {
     use super::*;
 

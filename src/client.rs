@@ -228,6 +228,7 @@ impl BlobClient {
         id: &str,
         expected_root: Option<Hash>,
     ) -> Result<Manifest> {
+        crate::paths::validate_key_prefix(&self.prefix)?;
         validate_id(id)?;
         let key = manifest_key(&self.prefix, id);
         let replies = self
@@ -306,6 +307,7 @@ impl BlobClient {
     /// caller sees the swarm (with reply consolidation disabled, ordinary
     /// downloads already accept whichever replica answers each chunk first).
     pub async fn fetch_availability(&self, id: &str) -> Result<Vec<Availability>> {
+        crate::paths::validate_key_prefix(&self.prefix)?;
         validate_id(id)?;
         let key = availability_key(&self.prefix, id);
         let replies = self
@@ -358,6 +360,7 @@ impl BlobClient {
         cancel: &CancelToken,
     ) -> Result<Manifest> {
         use crate::verify::{MemOutboard, chunk_range};
+        crate::paths::validate_key_prefix(&self.prefix)?;
         let path = path.into();
 
         // Hash the source once: outboard + manifest, exactly like server-side

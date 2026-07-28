@@ -82,6 +82,39 @@ pub(crate) fn assert_parent_within(canonical_root: &Path, path: &Path) -> Result
     Ok(())
 }
 
+/// Validate a caller-supplied Zenoh key prefix before it is used to build
+/// keys or declare a queryable.
+///
+/// Rejects: empty, leading/trailing `/`, anything Zenoh itself rejects, and
+/// **wildcards** (`*`, `**`, `$*`). A wildcard prefix would make a server
+/// declare a far wider queryable than intended and would make client keys
+/// unresolvable — silent, confusing failures either way. Verbatim (`@`)
+/// segments *are* allowed here: they sit in the literal part of both the
+/// declaration and the keys, which is exactly how a keyspace convention
+/// namespaces a bulk plane.
+pub(crate) fn validate_key_prefix(prefix: &str) -> Result<()> {
+    if prefix.is_empty() {
+        return Err(BlobError::Protocol("empty key prefix".into()));
+    }
+    if prefix.starts_with('/') || prefix.ends_with('/') {
+        return Err(BlobError::Protocol(format!(
+            "key prefix {prefix:?} must not start or end with '/'"
+        )));
+    }
+    if prefix.split('/').any(|seg| seg.contains('*')) {
+        return Err(BlobError::Protocol(format!(
+            "key prefix {prefix:?} must not contain wildcards"
+        )));
+    }
+    // Must be a key expression Zenoh accepts, and must still be one once the
+    // crate appends its own segments.
+    zenoh::key_expr::KeyExpr::try_from(prefix)
+        .map_err(|e| BlobError::Protocol(format!("invalid key prefix {prefix:?}: {e}")))?;
+    zenoh::key_expr::KeyExpr::try_from(format!("{prefix}/**"))
+        .map_err(|e| BlobError::Protocol(format!("unusable key prefix {prefix:?}: {e}")))?;
+    Ok(())
+}
+
 /// Create `root.join(rel)` (and its ancestors) one component at a time,
 /// refusing to traverse any pre-existing symlink component — `create_dir_all`
 /// happily follows a symlinked directory *out* of the root before any
@@ -134,6 +167,33 @@ mod tests {
         assert_eq!(sanitize_rel_path("x").unwrap(), Path::new("x"));
         for bad in ["", "/etc/passwd", "../x", "a/../../x", "a/..", ".", "./"] {
             assert!(sanitize_rel_path(bad).is_err(), "should reject {bad:?}");
+        }
+    }
+
+    #[test]
+    fn key_prefixes_validated() {
+        // Ordinary and convention-style (verbatim-segment) prefixes are fine.
+        for good in [
+            "demo/blobs",
+            "v1/h-0011223344ff/@blob/artifact",
+            "a",
+            "a/b/c",
+        ] {
+            validate_key_prefix(good).unwrap_or_else(|e| panic!("{good:?} rejected: {e}"));
+        }
+        for bad in [
+            "",            // empty
+            "/leading",    // leading slash
+            "trailing/",   // trailing slash
+            "wild/*/card", // single wildcard
+            "wild/**",     // double wildcard
+            "a/$*/b",      // dollar wildcard
+            "a//b",        // empty segment
+        ] {
+            assert!(
+                validate_key_prefix(bad).is_err(),
+                "{bad:?} should be rejected"
+            );
         }
     }
 

@@ -74,6 +74,18 @@ deployments fail closed instead of corrupting).
 - **Observability** (#32): `TransferStats` from every download, server
   `on_error` callbacks, optional `tracing` feature.
 
+### Test methodology
+
+The scenario suite did not find the defects below — a code audit did. The
+suite now has three layers (see CLAUDE.md): property tests over generated
+inputs for the range grammar, chunk geometry, resume bitfield, CDC, and the
+bao verification core; a hostile-peer harness that sweeps reply mutations
+against the oracle "succeed with exactly the right bytes or fail cleanly";
+and a `ContentStore` contract run against every configuration. Suites assert
+their own discriminating power so a broken harness cannot pass vacuously.
+The contract suite immediately found a residual bug in one of the audit
+fixes (`DirStore::has` still claimed chunks sealed under a *wrong* key).
+
 ### Hardening from the post-implementation audit
 
 - Push protocol: an offer can no longer hijack an already-registered id
@@ -101,6 +113,12 @@ deployments fail closed instead of corrupting).
   overwrite policy and clean up their partial on failure.
 - `Manifest`/tag ids reject `\\` and are length-bounded (Windows spool/tag
   traversal); resume bitfield counting masks padding bits.
+- Ids may no longer begin with `@`, and key prefixes are validated (non-empty,
+  no wildcards, a real Zenoh key expression). Zenoh's `**` does not match
+  verbatim (`@`-leading) segments, so such an id registered successfully and
+  was then unservable forever — a silent total failure with nothing in any log
+  to explain it. Verbatim segments inside a *prefix* stay legal, which is what
+  a keyspace convention needs.
 
 ### Filesystem fidelity
 

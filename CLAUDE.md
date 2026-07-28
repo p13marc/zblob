@@ -98,9 +98,30 @@ All key expressions are built through the helpers in `lib.rs` (`manifest_key`,
 
 ## Tests
 
-Integration tests live in `tests/`, one file per concern (roundtrip, resume,
-cancel, tamper, tree, tree_security, storage, push, multisource, coverage,
-minifuzz, compression, fanout). Shared helpers are in `tests/common/mod.rs`:
+Three layers, because the first one alone is what let real defects through:
+
+1. **Scenario tests** (`tests/{roundtrip,resume,cancel,tamper,tree,
+   tree_security,storage,push,multisource,coverage,compression,fanout}.rs`) —
+   one file per concern. Useful, but they only ever assert outcomes for inputs
+   *the author chose*, so they confirm the implementation rather than
+   interrogate it.
+2. **Property tests** (`proptest`, in `#[cfg(test)] mod properties` inside
+   `src/{lib,chunk,resume,verify}.rs`) — invariants over generated inputs:
+   the range grammar's accept-set, chunk-grid tiling, bitfield view coherence,
+   CDC losslessness, and the bao core (a slice decodes to exactly its byte
+   range; any mutation is caught; a slice cannot be replayed at another index).
+3. **Adversarial + contract suites** (`tests/hostile_peer.rs`,
+   `tests/store_contract.rs`, `tests/minifuzz.rs`) — a peer that mutates every
+   reply against a fixed oracle ("succeed with exactly the right bytes, or
+   fail cleanly"), and one contract executed against *every* `ContentStore`
+   configuration. These found bugs the scenario tests could not: they are
+   where new invariants belong.
+
+**When adding a defence, add it at layer 2 or 3.** A scenario test for the one
+input that motivated the fix is not coverage — it is a regression pin. Also
+assert the test's own discriminating power (the honest control must pass and
+the hostile case must fail), or a harness bug can make the suite vacuous;
+`hostile_peer.rs` and `tree_security.rs` both do this explicitly. Shared helpers are in `tests/common/mod.rs`:
 `open_session()` opens an isolated in-process session with scouting disabled
 (the loopback pattern — tests must not discover each other or the LAN),
 `unique_prefix()` namespaces keys per test, `pseudo_random()` gives

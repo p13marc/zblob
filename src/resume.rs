@@ -181,6 +181,136 @@ impl ResumeState {
 }
 
 #[cfg(test)]
+mod properties {
+    use super::*;
+    use crate::chunk::DEFAULT_CHUNK_SIZE;
+    use proptest::prelude::*;
+
+    fn manifest_for(chunk_count: u32) -> Manifest {
+        Manifest {
+            version: WIRE_VERSION,
+            id: "prop".into(),
+            filename: None,
+            total_len: DEFAULT_CHUNK_SIZE as u64 * chunk_count as u64,
+            chunk_size: DEFAULT_CHUNK_SIZE,
+            root: Hash::of(b"prop"),
+            created_ms: 0,
+        }
+    }
+
+    proptest! {
+        /// The bitfield's three views must never disagree: `is_set`,
+        /// `received`, `missing_ranges`, and `is_complete` are all consulted
+        /// independently by the download loop, and any drift between them
+        /// either re-fetches forever or renames a holey partial into place.
+        #[test]
+        fn bitfield_views_agree(
+            chunk_count in 1u32..300,
+            marks in prop::collection::vec(0u32..300, 0..300),
+        ) {
+            let m = manifest_for(chunk_count);
+            let mut state = ResumeState::fresh(&m, chunk_count);
+            let mut expected: std::collections::BTreeSet<u32> = Default::default();
+            for i in marks {
+                let newly = state.mark(i);
+                if i < chunk_count {
+                    prop_assert_eq!(newly, expected.insert(i), "mark({}) reported wrongly", i);
+                } else {
+                    prop_assert!(!newly, "out-of-range mark({}) must be refused", i);
+                }
+            }
+            // received == |set|
+            prop_assert_eq!(state.received() as usize, expected.len());
+            // is_set agrees index by index
+            for i in 0..chunk_count {
+                prop_assert_eq!(state.is_set(i), expected.contains(&i));
+            }
+            // missing_ranges is exactly the complement, coalesced and sorted
+            let holes = state.missing_ranges(chunk_count);
+            let mut from_holes: std::collections::BTreeSet<u32> = Default::default();
+            let mut prev_end = 0u32;
+            for r in &holes {
+                prop_assert!(r.start < r.end && r.end <= chunk_count);
+                prop_assert!(r.start >= prev_end, "holes must be sorted and disjoint");
+                // Coalesced: a hole must not start exactly where the previous ended.
+                prop_assert!(r.start > prev_end || prev_end == 0, "holes not coalesced");
+                prev_end = r.end;
+                for i in r.clone() {
+                    from_holes.insert(i);
+                }
+            }
+            let complement: std::collections::BTreeSet<u32> =
+                (0..chunk_count).filter(|i| !expected.contains(i)).collect();
+            prop_assert_eq!(from_holes, complement);
+            // is_complete ⟺ no holes ⟺ every index set
+            prop_assert_eq!(
+                state.is_complete(chunk_count),
+                holes.is_empty(),
+                "is_complete disagrees with missing_ranges"
+            );
+            prop_assert_eq!(
+                state.is_complete(chunk_count),
+                (0..chunk_count).all(|i| state.is_set(i)),
+                "is_complete disagrees with is_set"
+            );
+        }
+
+        /// A sidecar that survives save→load must describe the same progress.
+        /// (Persistence is the whole point; a lossy round trip silently
+        /// re-downloads or, worse, claims chunks it doesn't have.)
+        #[test]
+        fn sidecar_round_trips(
+            chunk_count in 1u32..200,
+            marks in prop::collection::vec(0u32..200, 0..100),
+        ) {
+            let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+            rt.block_on(async {
+                let dir = tempfile::tempdir().unwrap();
+                let part = dir.path().join("x.part");
+                let m = manifest_for(chunk_count);
+                let mut state = ResumeState::fresh(&m, chunk_count);
+                for i in marks {
+                    state.mark(i);
+                }
+                state.save_atomic(&part).await.unwrap();
+                let loaded = ResumeState::load(&part).await.expect("sidecar must load");
+                assert!(loaded.matches(&m, chunk_count));
+                assert_eq!(loaded.received(), state.received());
+                assert_eq!(loaded.missing_ranges(chunk_count), state.missing_ranges(chunk_count));
+            });
+        }
+
+        /// Arbitrary sidecar bytes must never panic and never be mistaken for
+        /// valid progress (the file is on disk where anything could corrupt
+        /// or forge it).
+        #[test]
+        fn arbitrary_sidecar_bytes_never_trusted(
+            bytes in prop::collection::vec(any::<u8>(), 0..300),
+            chunk_count in 1u32..100,
+        ) {
+            let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+            rt.block_on(async {
+                let dir = tempfile::tempdir().unwrap();
+                let part = dir.path().join("y.part");
+                tokio::fs::write(ResumeState::sidecar_path(&part), &bytes).await.unwrap();
+                let m = manifest_for(chunk_count);
+                if let Some(state) = ResumeState::load(&part).await {
+                    // Anything that loads must still be internally coherent and
+                    // must not claim completion it cannot back with set bits.
+                    if state.matches(&m, chunk_count) {
+                        assert_eq!(
+                            state.is_complete(chunk_count),
+                            (0..chunk_count).all(|i| state.is_set(i)),
+                            "a forged sidecar claimed completion it cannot back"
+                        );
+                    }
+                }
+            });
+        }
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use crate::chunk::DEFAULT_CHUNK_SIZE;

@@ -288,3 +288,75 @@ async fn file_outboard_spill_roundtrip() {
     handle.shutdown().await.unwrap();
     session.close().await.unwrap();
 }
+
+/// A key prefix or blob id that cannot work must fail loudly at first use,
+/// not silently never serve. (`@`-leading ids are the trap: Zenoh's `**`
+/// does not match verbatim segments, so a server would register happily and
+/// answer nothing, forever.)
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn unusable_prefixes_and_ids_fail_loudly() {
+    let session = open_session().await;
+
+    // Wildcard / malformed prefixes are refused when the server declares.
+    for bad_prefix in ["", "wild/*/card", "trailing/", "/leading", "a//b"] {
+        let server = BlobServer::new(session.clone(), bad_prefix);
+        let err = server
+            .spawn()
+            .await
+            .err()
+            .unwrap_or_else(|| panic!("prefix {bad_prefix:?} should be refused"));
+        assert!(
+            matches!(err, zblob::BlobError::Protocol(_)),
+            "{bad_prefix:?}: {err}"
+        );
+        // …and by clients, before any query goes out.
+        let client = BlobClient::new(session.clone(), bad_prefix);
+        assert!(
+            client.fetch_manifest("x").await.is_err(),
+            "client accepted prefix {bad_prefix:?}"
+        );
+    }
+
+    // A convention-style verbatim prefix must keep working.
+    let good = format!("{}/@blob/artifact", unique_prefix());
+    let server = BlobServer::new(session.clone(), good.clone());
+    let data = pseudo_random(MIN_CHUNK_SIZE as usize, 60);
+    let manifest = server
+        .register_source(
+            BlobSpec::new("ok").chunk_size(MIN_CHUNK_SIZE),
+            Arc::new(MemoryBlobSource::new(data.clone())),
+        )
+        .await
+        .unwrap();
+    let handle = server
+        .clone()
+        .spawn()
+        .await
+        .expect("verbatim prefix must work");
+    let dir = tempfile::tempdir().unwrap();
+    let dest = dir.path().join("out.bin");
+    let client = test_client(session.clone(), &good);
+    client
+        .download_to(
+            &DownloadRequest::pinned("ok", manifest.root),
+            &dest,
+            &(),
+            &CancelToken::new(),
+        )
+        .await
+        .expect("download under a verbatim-segment prefix");
+    assert_eq!(std::fs::read(&dest).unwrap(), data);
+
+    // A leading-@ id is refused at registration rather than silently unservable.
+    let err = server
+        .register_source(
+            BlobSpec::new("@unservable").chunk_size(MIN_CHUNK_SIZE),
+            Arc::new(MemoryBlobSource::new(data)),
+        )
+        .await
+        .expect_err("leading-@ id must be refused");
+    assert!(matches!(err, zblob::BlobError::InvalidManifest(_)), "{err}");
+
+    handle.shutdown().await.unwrap();
+    session.close().await.unwrap();
+}
