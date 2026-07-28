@@ -79,7 +79,7 @@ async fn interrupt_then_resume_across_clients() {
     let ev = events.clone();
     let sink = move |p: Progress| ev.lock().unwrap().push(p);
     let client2 = test_client(session.clone(), &prefix);
-    tokio::time::timeout(
+    let stats = tokio::time::timeout(
         Duration::from_secs(20),
         client2.download_to(
             &DownloadRequest::new("blob-r"),
@@ -91,6 +91,8 @@ async fn interrupt_then_resume_across_clients() {
     .await
     .expect("timed out")
     .expect("resume failed");
+    assert!(stats.chunks_resumed >= 3, "resume head start recorded");
+    assert_eq!(stats.chunks_fetched + stats.chunks_resumed, 8);
 
     assert_eq!(
         content_hash(&std::fs::read(&dest).unwrap()),

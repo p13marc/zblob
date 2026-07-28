@@ -53,6 +53,7 @@ mod error;
 pub mod gc;
 mod hash;
 mod manifest;
+mod obs;
 mod paths;
 mod progress;
 mod publish;
@@ -70,6 +71,7 @@ pub use compress::ChunkCompression;
 pub use error::{BlobError, Result};
 pub use hash::{Hash, HashParseError};
 pub use manifest::{BlobSpec, Manifest};
+pub use obs::TransferStats;
 pub use progress::{Progress, ProgressSink};
 pub use publish::{publish_chunk, publish_index, publish_snapshot, publish_store};
 pub use server::{

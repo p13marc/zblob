@@ -18,6 +18,7 @@ use tokio::sync::{Notify, RwLock, Semaphore};
 use crate::chunk::TransferChunks;
 use crate::error::{BlobError, Result};
 use crate::manifest::{BlobSpec, Manifest, validate_id};
+use crate::obs::{zdebug, zwarn};
 use crate::verify::{self, OutboardStore, ReadAtCursor};
 use crate::wire::{ENC_MANIFEST, ENC_SLICE, encode};
 use crate::{manifest_key, parse_id, parse_ranges, slice_key};
@@ -107,11 +108,15 @@ struct Registered {
     outboard: Arc<OutboardStore>,
 }
 
-#[derive(Debug, Clone)]
+/// Callback invoked with every error raised while serving a query.
+pub type ErrorCallback = Arc<dyn Fn(&BlobError) + Send + Sync>;
+
+#[derive(Clone)]
 struct ServerConfig {
     max_inflight: usize,
     max_chunks_per_query: u32,
     outboard_mem_limit: u64,
+    on_error: Option<ErrorCallback>,
 }
 
 impl Default for ServerConfig {
@@ -122,6 +127,7 @@ impl Default for ServerConfig {
             // ~16 MiB of outboard ≈ a 4 GiB blob; larger file-backed blobs
             // keep their outboard in a sibling file.
             outboard_mem_limit: 16 * 1024 * 1024,
+            on_error: None,
         }
     }
 }
@@ -167,6 +173,13 @@ impl BlobServerBuilder {
     /// (default 16 MiB of outboard ≈ a 4 GiB blob).
     pub fn outboard_mem_limit(mut self, bytes: u64) -> Self {
         self.cfg.outboard_mem_limit = bytes;
+        self
+    }
+
+    /// Invoke `cb` with every serve error (default: a `tracing` warn event
+    /// with the `tracing` feature, else stderr in debug builds only).
+    pub fn on_error(mut self, cb: ErrorCallback) -> Self {
+        self.cfg.on_error = Some(cb);
         self
     }
 
@@ -308,6 +321,7 @@ impl BlobServer {
             root: outboard.root().into(),
             created_ms: spec.created_ms,
         };
+        zdebug!(id = %manifest.id, total_len, root = %manifest.root, "blob registered");
         self.inner.registry.write().await.insert(
             spec.id,
             Registered {
@@ -363,7 +377,7 @@ impl BlobServer {
                     let inner = self.inner.clone();
                     tokio::spawn(async move {
                         if let Err(e) = serve_one(&inner, query).await {
-                            tracing_error(&e);
+                            report_error(&inner.cfg.on_error, &e);
                         }
                     });
                 }
@@ -373,11 +387,16 @@ impl BlobServer {
     }
 }
 
-pub(crate) fn tracing_error(e: &BlobError) {
-    // The crate has no logging dependency; surface serve errors on stderr in debug
-    // builds without pulling `tracing` into a would-be-published library.
-    #[cfg(debug_assertions)]
-    eprintln!("zblob: serve error: {e}");
+/// Surface a serve error: the configured callback wins; otherwise a `tracing`
+/// warn event (with the feature) or stderr in debug builds.
+pub(crate) fn report_error(cb: &Option<ErrorCallback>, e: &BlobError) {
+    zwarn!(error = %e, "serve error");
+    if let Some(cb) = cb {
+        cb(e);
+    } else {
+        #[cfg(all(debug_assertions, not(feature = "tracing")))]
+        eprintln!("zblob: serve error: {e}");
+    }
     let _ = e;
 }
 

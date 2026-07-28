@@ -59,7 +59,7 @@ async fn roundtrip_file_multichunk_pinned() {
     let sink = move |p: Progress| sink_events.lock().unwrap().push(p);
 
     let client = test_client(session.clone(), &prefix);
-    tokio::time::timeout(
+    let stats = tokio::time::timeout(
         Duration::from_secs(20),
         client.download_to(
             &DownloadRequest::pinned("blob-1", manifest.root),
@@ -71,6 +71,10 @@ async fn roundtrip_file_multichunk_pinned() {
     .await
     .expect("timed out")
     .expect("download");
+    assert_eq!(stats.chunks_fetched, 5);
+    assert_eq!(stats.chunks_resumed, 0);
+    assert_eq!(stats.bytes_fetched, data.len() as u64);
+    assert_eq!(stats.rejected, 0);
 
     assert_eq!(std::fs::read(&dest).unwrap(), data);
     // .part and sidecar are gone after completion.

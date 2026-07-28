@@ -32,9 +32,10 @@ use crate::compress::{ChunkCompression, pack, unpack};
 use crate::error::{BlobError, Result};
 use crate::hash::Hash;
 use crate::manifest::validate_id;
+use crate::obs::{TransferStats, zdebug};
 use crate::paths::{assert_parent_within, sanitize_rel_path, sanitize_symlink_target};
 use crate::progress::{Progress, ProgressSink};
-use crate::server::{FifoQueryable, ServerHandle, tracing_error};
+use crate::server::{ErrorCallback, FifoQueryable, ServerHandle, report_error};
 use crate::store::ContentStore;
 use crate::wire::{ENC_CHUNK, ENC_INDEX, WIRE_VERSION, decode, encode};
 use crate::{store_key, tree_key};
@@ -458,6 +459,7 @@ struct TreeInner {
     index: tokio::sync::RwLock<std::collections::HashMap<String, TreeIndex>>,
     inflight: Semaphore,
     compression: ChunkCompression,
+    on_error: Option<ErrorCallback>,
 }
 
 /// Builder for a [`TreeServer`] (see [`TreeServer::builder`]).
@@ -468,6 +470,7 @@ pub struct TreeServerBuilder {
     store: Arc<dyn ContentStore>,
     max_inflight: usize,
     compression: ChunkCompression,
+    on_error: Option<ErrorCallback>,
 }
 
 impl TreeServerBuilder {
@@ -484,6 +487,13 @@ impl TreeServerBuilder {
         self
     }
 
+    /// Invoke `cb` with every serve error (default: a `tracing` warn event
+    /// with the `tracing` feature, else stderr in debug builds only).
+    pub fn on_error(mut self, cb: ErrorCallback) -> Self {
+        self.on_error = Some(cb);
+        self
+    }
+
     /// Build the server.
     pub fn build(self) -> TreeServer {
         TreeServer {
@@ -495,6 +505,7 @@ impl TreeServerBuilder {
                 index: tokio::sync::RwLock::new(std::collections::HashMap::new()),
                 inflight: Semaphore::new(self.max_inflight),
                 compression: self.compression,
+                on_error: self.on_error,
             }),
         }
     }
@@ -516,6 +527,7 @@ impl TreeServer {
             store,
             max_inflight: 8,
             compression: ChunkCompression::default(),
+            on_error: None,
         }
     }
 
@@ -593,7 +605,7 @@ impl TreeServer {
                     let inner = self.inner.clone();
                     tokio::spawn(async move {
                         if let Err(e) = serve_chunk_query(&inner, query).await {
-                            tracing_error(&e);
+                            report_error(&inner.on_error, &e);
                         }
                     });
                 }
@@ -602,7 +614,7 @@ impl TreeServer {
                     let inner = self.inner.clone();
                     tokio::spawn(async move {
                         if let Err(e) = serve_index_query(&inner, query).await {
-                            tracing_error(&e);
+                            report_error(&inner.on_error, &e);
                         }
                     });
                 }
@@ -815,7 +827,8 @@ impl TreeClient {
         store: &Arc<dyn ContentStore>,
         sink: &dyn ProgressSink,
         cancel: &CancelToken,
-    ) -> Result<()> {
+    ) -> Result<TransferStats> {
+        let started_at = tokio::time::Instant::now();
         let index = self.fetch_index(&req.id).await?;
         if let Some(expected) = req.expected_root
             && index.root_hash != expected
@@ -833,7 +846,9 @@ impl TreeClient {
             chunk_count: total,
         });
 
-        self.fetch_missing(&needed, store, sink, cancel, total)
+        zdebug!(id = %index.id, chunks = total, "tree download start");
+        let mut stats = self
+            .fetch_missing(&needed, store, sink, cancel, total)
             .await?;
 
         // Materialize (all blocking fs work on the blocking pool).
@@ -848,7 +863,9 @@ impl TreeClient {
         sink.emit(Progress::Completed {
             path: dest_root.to_path_buf(),
         });
-        Ok(())
+        stats.elapsed = started_at.elapsed();
+        zdebug!(id = %index.id, fetched = stats.chunks_fetched, "tree download complete");
+        Ok(stats)
     }
 
     /// Resolve every needed hash: count present ones immediately, fetch the
@@ -861,11 +878,12 @@ impl TreeClient {
         sink: &dyn ProgressSink,
         cancel: &CancelToken,
         total: u32,
-    ) -> Result<()> {
+    ) -> Result<TransferStats> {
+        let mut stats = TransferStats::default();
         let mut received: u32 = 0;
         let mut bytes_received: u64 = 0;
         let mut iter = needed.iter().copied().enumerate();
-        let mut join: tokio::task::JoinSet<Result<(usize, u64)>> = tokio::task::JoinSet::new();
+        let mut join: tokio::task::JoinSet<Result<(usize, u64, u32)>> = tokio::task::JoinSet::new();
 
         loop {
             // Keep the pipeline full.
@@ -873,6 +891,7 @@ impl TreeClient {
                 let Some((i, hash)) = iter.next() else { break };
                 if store.has(&hash) {
                     received += 1;
+                    stats.chunks_resumed += 1;
                     sink.emit(Progress::Chunk {
                         index: i as u32,
                         received,
@@ -886,13 +905,13 @@ impl TreeClient {
                 let timeout = self.cfg.query_timeout;
                 let store = store.clone();
                 join.spawn(async move {
-                    let bytes = fetch_one_chunk(&session, &key, &hash, timeout).await?;
+                    let (bytes, rejected) = fetch_one_chunk(&session, &key, &hash, timeout).await?;
                     let len = bytes.len() as u64;
                     let put_store = store.clone();
                     tokio::task::spawn_blocking(move || put_store.put(&hash, &bytes))
                         .await
                         .map_err(|e| BlobError::Protocol(format!("store put task: {e}")))??;
-                    Ok((i, len))
+                    Ok((i, len, rejected))
                 });
             }
             if join.is_empty() {
@@ -908,10 +927,13 @@ impl TreeClient {
                 Err(_) => continue, // timeout tick → re-check cancel
                 Ok(None) => break,
                 Ok(Some(res)) => {
-                    let (i, len) =
+                    let (i, len, rejected) =
                         res.map_err(|e| BlobError::Protocol(format!("fetch task: {e}")))??;
                     received += 1;
                     bytes_received += len;
+                    stats.chunks_fetched += 1;
+                    stats.bytes_fetched += len;
+                    stats.rejected += rejected;
                     sink.emit(Progress::Chunk {
                         index: i as u32,
                         received,
@@ -921,7 +943,7 @@ impl TreeClient {
                 }
             }
         }
-        Ok(())
+        Ok(stats)
     }
 }
 
@@ -932,7 +954,8 @@ async fn fetch_one_chunk(
     key: &str,
     hash: &Hash,
     timeout: Duration,
-) -> Result<Vec<u8>> {
+) -> Result<(Vec<u8>, u32)> {
+    let mut rejected = 0u32;
     let replies = session
         .get(key)
         .consolidation(ConsolidationMode::None)
@@ -945,12 +968,14 @@ async fn fetch_one_chunk(
             continue;
         }
         let Ok(bytes) = unpack(&sample.payload().to_bytes()) else {
+            rejected += 1;
             continue; // malformed frame; wait for a good replier.
         };
         if Hash::of(&bytes) != *hash {
+            rejected += 1;
             continue; // hostile or corrupt replier; wait for a good one.
         }
-        return Ok(bytes);
+        return Ok((bytes, rejected));
     }
     Err(BlobError::NotFound(hash.to_string()))
 }

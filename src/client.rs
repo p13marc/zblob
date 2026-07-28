@@ -24,6 +24,7 @@ use crate::chunk::TransferChunks;
 use crate::error::{BlobError, Result};
 use crate::hash::Hash;
 use crate::manifest::{Manifest, validate_id};
+use crate::obs::{TransferStats, zdebug};
 use crate::progress::{Progress, ProgressSink};
 use crate::resume::ResumeState;
 use crate::wire::{ENC_MANIFEST, ENC_SLICE, decode};
@@ -235,6 +236,7 @@ impl BlobClient {
     /// Download a blob to the file at `dest` (written via `<dest>.part` + a
     /// resume sidecar, then atomically renamed into place). Progress events go
     /// to `sink`; a set `cancel` stops cooperatively with state persisted.
+    /// Returns per-call [`TransferStats`].
     ///
     /// Call again with the same arguments to resume after `Incomplete`,
     /// `Cancelled`, or a crash.
@@ -244,10 +246,10 @@ impl BlobClient {
         dest: &Path,
         sink: &dyn ProgressSink,
         cancel: &CancelToken,
-    ) -> Result<()> {
+    ) -> Result<TransferStats> {
         let result = self.download_to_inner(req, dest, sink, cancel).await;
         match &result {
-            Err(BlobError::Cancelled { .. }) | Ok(()) => {}
+            Err(BlobError::Cancelled { .. }) | Ok(_) => {}
             Err(e) => sink.emit(Progress::Failed {
                 error: e.to_string(),
             }),
@@ -269,9 +271,11 @@ impl BlobClient {
         dest: &Path,
         sink: &dyn ProgressSink,
         cancel: &CancelToken,
-    ) -> Result<()> {
+    ) -> Result<TransferStats> {
+        let started_at = tokio::time::Instant::now();
         let (manifest, chunks) = self.start(req).await?;
         let count = chunks.count();
+        zdebug!(id = %manifest.id, total_len = manifest.total_len, chunks = count, "download start");
 
         if let Some(parent) = dest.parent()
             && !parent.as_os_str().is_empty()
@@ -311,8 +315,12 @@ impl BlobClient {
             .open(&part)
             .await?;
 
+        let mut stats = TransferStats {
+            chunks_resumed: state.received(),
+            ..Default::default()
+        };
         self.fill_holes(
-            &manifest, &chunks, &mut file, &mut state, &part, sink, cancel,
+            &manifest, &chunks, &mut file, &mut state, &part, sink, cancel, &mut stats,
         )
         .await?;
 
@@ -328,7 +336,9 @@ impl BlobClient {
         sink.emit(Progress::Completed {
             path: dest.to_path_buf(),
         });
-        Ok(())
+        stats.elapsed = started_at.elapsed();
+        zdebug!(id = %manifest.id, fetched = stats.chunks_fetched, rejected = stats.rejected, "download complete");
+        Ok(stats)
     }
 
     /// Fetch + validate the manifest and enforce root pinning.
@@ -366,6 +376,7 @@ impl BlobClient {
         part: &Path,
         sink: &dyn ProgressSink,
         cancel: &CancelToken,
+        stats: &mut TransferStats,
     ) -> Result<()> {
         let count = chunks.count();
         let root: blake3::Hash = manifest.root.into();
@@ -434,6 +445,8 @@ impl BlobClient {
                     },
                 );
                 if decoded.is_err() {
+                    stats.rejected += 1;
+                    zdebug!(id = %manifest.id, index, "rejected unverifiable slice");
                     continue;
                 }
                 for (off, data) in leaves {
@@ -442,6 +455,8 @@ impl BlobClient {
                 }
                 if state.mark(index) {
                     bytes_received += chunks.len_of(index) as u64;
+                    stats.chunks_fetched += 1;
+                    stats.bytes_fetched += chunks.len_of(index) as u64;
                     marks_since_save += 1;
                     sink.emit(Progress::Chunk {
                         index,
@@ -465,6 +480,8 @@ impl BlobClient {
             }
             if state.received() == before {
                 no_progress += 1;
+                stats.retries += 1;
+                zdebug!(id = %manifest.id, attempt = no_progress, "no progress; backing off");
                 if no_progress >= self.cfg.retry.max_attempts {
                     file.sync_data().await?;
                     state.save_atomic(part).await?;
