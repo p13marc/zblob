@@ -23,6 +23,7 @@ use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 use tokio::sync::{Notify, Semaphore};
+use zenoh::qos::Priority;
 use zenoh::query::ConsolidationMode;
 
 use crate::cancel::CancelToken;
@@ -570,8 +571,8 @@ impl TreeServer {
     }
 
     async fn declare(&self) -> Result<(FifoQueryable, FifoQueryable)> {
-        crate::paths::validate_key_prefix(&self.inner.store_prefix)?;
-        crate::paths::validate_key_prefix(&self.inner.tree_prefix)?;
+        crate::paths::validate_serve_prefix(&self.inner.store_prefix)?;
+        crate::paths::validate_serve_prefix(&self.inner.tree_prefix)?;
         let store_q = self
             .inner
             .session
@@ -712,6 +713,7 @@ struct TreeClientConfig {
     query_timeout: Duration,
     fetch_concurrency: usize,
     max_index_bytes: usize,
+    priority: Priority,
 }
 
 impl Default for TreeClientConfig {
@@ -720,6 +722,8 @@ impl Default for TreeClientConfig {
             query_timeout: Duration::from_secs(30),
             fetch_concurrency: 16,
             max_index_bytes: 64 * 1024 * 1024,
+            // Bulk transfer yields — see `BlobClientBuilder::priority`.
+            priority: Priority::DataLow,
         }
     }
 }
@@ -750,6 +754,15 @@ impl TreeClientBuilder {
     /// allocation bound against a hostile index reply.
     pub fn max_index_bytes(mut self, n: usize) -> Self {
         self.cfg.max_index_bytes = n;
+        self
+    }
+
+    /// Zenoh priority for every query this client issues
+    /// (default [`Priority::DataLow`]); see
+    /// [`BlobClientBuilder::priority`](crate::BlobClientBuilder::priority) for
+    /// why bulk transfers must yield.
+    pub fn priority(mut self, priority: Priority) -> Self {
+        self.cfg.priority = priority;
         self
     }
 
@@ -802,14 +815,15 @@ impl TreeClient {
         id: &str,
         expected_root: Option<Hash>,
     ) -> Result<TreeIndex> {
-        crate::paths::validate_key_prefix(&self.store_prefix)?;
-        crate::paths::validate_key_prefix(&self.tree_prefix)?;
+        crate::paths::validate_query_prefix(&self.store_prefix)?;
+        crate::paths::validate_query_prefix(&self.tree_prefix)?;
         validate_id(id)?;
         let key = tree_key(&self.tree_prefix, id);
         let replies = self
             .session
             .get(&key)
             .consolidation(ConsolidationMode::None)
+            .priority(self.cfg.priority)
             .timeout(self.cfg.query_timeout)
             .await
             .map_err(BlobError::zenoh)?;
@@ -973,9 +987,11 @@ impl TreeClient {
                 let session = self.session.clone();
                 let key = store_key(&self.store_prefix, Hash::ALGO, &hash);
                 let timeout = self.cfg.query_timeout;
+                let priority = self.cfg.priority;
                 let store = store.clone();
                 join.spawn(async move {
-                    let (bytes, rejected) = fetch_one_chunk(&session, &key, &hash, timeout).await?;
+                    let (bytes, rejected) =
+                        fetch_one_chunk(&session, &key, &hash, timeout, priority).await?;
                     let len = bytes.len() as u64;
                     let put_store = store.clone();
                     tokio::task::spawn_blocking(move || put_store.put(&hash, &bytes))
@@ -1024,11 +1040,13 @@ async fn fetch_one_chunk(
     key: &str,
     hash: &Hash,
     timeout: Duration,
+    priority: Priority,
 ) -> Result<(Vec<u8>, u32)> {
     let mut rejected = 0u32;
     let replies = session
         .get(key)
         .consolidation(ConsolidationMode::None)
+        .priority(priority)
         .timeout(timeout)
         .await
         .map_err(BlobError::zenoh)?;

@@ -360,3 +360,72 @@ async fn unusable_prefixes_and_ids_fail_loudly() {
     handle.shutdown().await.unwrap();
     session.close().await.unwrap();
 }
+
+/// A wildcard-origin prefix is a legal *probe* (ask every holder), so clients
+/// must accept it — while servers and publishers must not, since they would
+/// answer for or write to keys they do not own. Getting this backwards breaks
+/// a sanctioned multi-holder pattern.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn wildcard_prefixes_are_queryable_but_not_servable() {
+    let session = open_session().await;
+    let base = unique_prefix();
+    let concrete = format!("{base}/host-a/@blob/artifact");
+    let wildcard = format!("{base}/*/@blob/artifact");
+
+    // A server on the concrete prefix.
+    let server = BlobServer::new(session.clone(), concrete.clone());
+    let data = pseudo_random(MIN_CHUNK_SIZE as usize, 61);
+    let manifest = server
+        .register_source(
+            BlobSpec::new("probed").chunk_size(MIN_CHUNK_SIZE),
+            Arc::new(MemoryBlobSource::new(data.clone())),
+        )
+        .await
+        .unwrap();
+    let handle = server.spawn().await.unwrap();
+
+    // Probing across origins with a wildcard prefix finds it…
+    let prober = test_client(session.clone(), &wildcard);
+    let found = prober
+        .fetch_manifest("probed")
+        .await
+        .expect("a wildcard-origin probe must be allowed");
+    assert_eq!(found.root, manifest.root);
+
+    // …and then the bulk fetch happens from the chosen concrete origin.
+    let dir = tempfile::tempdir().unwrap();
+    let dest = dir.path().join("out.bin");
+    test_client(session.clone(), &concrete)
+        .download_to(
+            &DownloadRequest::pinned("probed", manifest.root),
+            &dest,
+            &(),
+            &CancelToken::new(),
+        )
+        .await
+        .expect("concrete fetch");
+    assert_eq!(std::fs::read(&dest).unwrap(), data);
+
+    // Serving under a wildcard prefix is refused.
+    let bad = BlobServer::new(session.clone(), wildcard.clone());
+    assert!(
+        bad.spawn().await.is_err(),
+        "a server must not declare under a wildcard prefix"
+    );
+
+    handle.shutdown().await.unwrap();
+    session.close().await.unwrap();
+}
+
+/// Bulk transfers must yield: replies inherit the querier's QoS, so the
+/// client is the only place priority can be set — and the default must sit
+/// below `Data` or a large transfer starves telemetry on a shared link.
+#[test]
+fn bulk_transfers_default_to_a_yielding_priority() {
+    // Zenoh numbers priorities so that a *greater* discriminant is a *lower*
+    // priority. If that ever flips, the crate's bulk default must be revisited.
+    assert!(
+        zblob::Priority::DataLow as u8 > zblob::Priority::Data as u8,
+        "Priority ordering changed; revisit the bulk default"
+    );
+}

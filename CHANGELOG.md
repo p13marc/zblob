@@ -74,6 +74,27 @@ deployments fail closed instead of corrupting).
 - **Observability** (#32): `TransferStats` from every download, server
   `on_error` callbacks, optional `tracing` feature.
 
+### Keyspace-convention alignment
+
+Checked against zenkey RFC 07 (`@blob`), which names zblob as its reference
+client — three gaps closed:
+
+- **Bulk transfers now yield.** RFC 07 §2 makes QoS a *caller* obligation
+  (Zenoh replies inherit the querier's QoS; server-side reply-QoS setters are
+  no-ops), and zblob set no priority at all — every transfer competed with
+  telemetry in the default `Data` lane. All queries and publications now
+  default to `Priority::DataLow`, tunable via `BlobClientBuilder::priority` /
+  `TreeClientBuilder::priority`; `Priority` is re-exported.
+- **Wildcard-origin probes work.** `parse_id` matched the prefix by literal
+  string stripping, so a server could never answer a `v1/*/@blob/...` query —
+  the multi-holder probe RFC 07 §2 explicitly sanctions was unimplementable.
+  It now matches positionally, accepting single-segment wildcards. `**` is
+  refused for both roles, because a blob id is resolved by position and
+  nothing could answer past an unbounded span.
+- **Prefix validation is role-aware**: clients may query wildcard prefixes
+  (probing), servers and publishers may not (they would answer for, or write
+  to, keys they do not own).
+
 ### Test methodology
 
 The scenario suite did not find the defects below — a code audit did. The

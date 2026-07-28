@@ -20,7 +20,7 @@ use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncSeekExt, AsyncWriteExt, SeekFrom};
-use zenoh::qos::{CongestionControl, Reliability};
+use zenoh::qos::{CongestionControl, Priority, Reliability};
 use zenoh_ext::{
     AdvancedPublisherBuilderExt, AdvancedSubscriberBuilderExt, CacheConfig, HistoryConfig,
     MissDetectionConfig, RecoveryConfig,
@@ -151,6 +151,9 @@ pub async fn fanout_file(
             // (reliable delivery is the point of this tier).
             .congestion_control(CongestionControl::Block)
             .reliability(Reliability::Reliable)
+            // Bulk rollout yields to telemetry on shared links (see
+            // `BlobClientBuilder::priority`).
+            .priority(Priority::DataLow)
             .cache(CacheConfig::default().max_samples(count as usize + 1))
             .sample_miss_detection(MissDetectionConfig::default().heartbeat(cfg.heartbeat))
             // Liveliness token: lets subscribers' `detect_late_publishers`

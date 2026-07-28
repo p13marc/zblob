@@ -448,7 +448,7 @@ impl BlobServer {
     }
 
     async fn declare(&self) -> Result<FifoQueryable> {
-        crate::paths::validate_key_prefix(&self.inner.prefix)?;
+        crate::paths::validate_serve_prefix(&self.inner.prefix)?;
         let key = format!("{}/**", self.inner.prefix);
         self.inner
             .session

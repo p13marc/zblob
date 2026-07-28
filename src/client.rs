@@ -17,6 +17,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use tokio::io::{AsyncSeekExt, AsyncWriteExt, SeekFrom};
+use zenoh::qos::Priority;
 use zenoh::query::ConsolidationMode;
 
 use crate::cancel::CancelToken;
@@ -81,6 +82,7 @@ struct ClientConfig {
     max_chunks_per_query: u32,
     max_blob_size: u64,
     overwrite: Overwrite,
+    priority: Priority,
 }
 
 impl Default for ClientConfig {
@@ -91,6 +93,12 @@ impl Default for ClientConfig {
             max_chunks_per_query: 512,
             max_blob_size: 1 << 40, // 1 TiB — a remote peer must not size our disk.
             overwrite: Overwrite::default(),
+            // Bulk transfer yields. Replies inherit the *query's* QoS (a
+            // server cannot set it), so the only place this can be decided is
+            // here — and a multi-megabyte transfer at the default `Data`
+            // priority shares a lane with telemetry and alerts, starving them
+            // on a constrained link. See `BlobClientBuilder::priority`.
+            priority: Priority::DataLow,
         }
     }
 }
@@ -182,6 +190,20 @@ impl BlobClientBuilder {
         self
     }
 
+    /// Zenoh priority for every query this client issues
+    /// (default [`Priority::DataLow`]).
+    ///
+    /// **This is the only place bulk QoS can be set.** Zenoh replies inherit
+    /// the querier's QoS — server-side reply-QoS setters are no-ops — so a
+    /// blob transfer competes with telemetry unless the *client* yields. The
+    /// default deliberately sits below `Priority::Data` so a large transfer
+    /// cannot starve an alert on a constrained link. Raise it only if you
+    /// know the link is not shared.
+    pub fn priority(mut self, priority: Priority) -> Self {
+        self.cfg.priority = priority;
+        self
+    }
+
     /// Build the client.
     pub fn build(self) -> BlobClient {
         BlobClient {
@@ -228,13 +250,14 @@ impl BlobClient {
         id: &str,
         expected_root: Option<Hash>,
     ) -> Result<Manifest> {
-        crate::paths::validate_key_prefix(&self.prefix)?;
+        crate::paths::validate_query_prefix(&self.prefix)?;
         validate_id(id)?;
         let key = manifest_key(&self.prefix, id);
         let replies = self
             .session
             .get(&key)
             .consolidation(ConsolidationMode::None)
+            .priority(self.cfg.priority)
             .timeout(self.cfg.query_timeout)
             .await
             .map_err(BlobError::zenoh)?;
@@ -307,13 +330,14 @@ impl BlobClient {
     /// caller sees the swarm (with reply consolidation disabled, ordinary
     /// downloads already accept whichever replica answers each chunk first).
     pub async fn fetch_availability(&self, id: &str) -> Result<Vec<Availability>> {
-        crate::paths::validate_key_prefix(&self.prefix)?;
+        crate::paths::validate_query_prefix(&self.prefix)?;
         validate_id(id)?;
         let key = availability_key(&self.prefix, id);
         let replies = self
             .session
             .get(&key)
             .consolidation(ConsolidationMode::None)
+            .priority(self.cfg.priority)
             .timeout(self.cfg.query_timeout)
             .await
             .map_err(BlobError::zenoh)?;
@@ -360,7 +384,7 @@ impl BlobClient {
         cancel: &CancelToken,
     ) -> Result<Manifest> {
         use crate::verify::{MemOutboard, chunk_range};
-        crate::paths::validate_key_prefix(&self.prefix)?;
+        crate::paths::validate_query_prefix(&self.prefix)?;
         let path = path.into();
 
         // Hash the source once: outboard + manifest, exactly like server-side
@@ -393,6 +417,7 @@ impl BlobClient {
             .session
             .get(&offer_key)
             .consolidation(ConsolidationMode::None)
+            .priority(self.cfg.priority)
             .timeout(self.cfg.query_timeout)
             .payload(crate::wire::encode(&manifest)?);
         if let Some(tok) = &token {
@@ -483,6 +508,7 @@ impl BlobClient {
                     .session
                     .get(push_slice_key(&self.prefix, &manifest.id, index))
                     .consolidation(ConsolidationMode::None)
+                    .priority(self.cfg.priority)
                     .timeout(self.cfg.query_timeout)
                     .payload(slice);
                 if let Some(tok) = &token {
@@ -726,6 +752,7 @@ impl BlobClient {
                 .session
                 .get(&selector)
                 .consolidation(ConsolidationMode::None)
+                .priority(self.cfg.priority)
                 .timeout(self.cfg.query_timeout)
                 .await
                 .map_err(BlobError::zenoh)?;

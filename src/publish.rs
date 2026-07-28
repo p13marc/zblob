@@ -20,6 +20,7 @@
 
 use std::time::Duration;
 
+use zenoh::qos::Priority;
 use zenoh::query::ConsolidationMode;
 
 use crate::compress::{ChunkCompression, pack};
@@ -43,7 +44,7 @@ pub async fn publish_chunk(
     bytes: &[u8],
     compression: ChunkCompression,
 ) -> Result<()> {
-    crate::paths::validate_key_prefix(store_prefix)?;
+    crate::paths::validate_serve_prefix(store_prefix)?;
     session
         .put(
             store_key(store_prefix, Hash::ALGO, hash),
@@ -81,11 +82,12 @@ pub async fn publish_index(
     tree_prefix: &str,
     index: &TreeIndex,
 ) -> Result<()> {
-    crate::paths::validate_key_prefix(tree_prefix)?;
+    crate::paths::validate_serve_prefix(tree_prefix)?;
     let payload = encode(index)?;
     session
         .put(tree_key(tree_prefix, &index.id), payload)
         .encoding(ENC_INDEX)
+        .priority(Priority::DataLow)
         .await
         .map_err(BlobError::zenoh)
 }
@@ -144,6 +146,7 @@ async fn probe_key(session: &zenoh::Session, key: &str) -> Result<bool> {
     let replies = session
         .get(key)
         .consolidation(ConsolidationMode::None)
+        .priority(Priority::DataLow)
         .timeout(Duration::from_secs(2))
         .await
         .map_err(BlobError::zenoh)?;

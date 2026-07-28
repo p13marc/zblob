@@ -99,6 +99,8 @@ pub use tree::{
     ChunkRef, Entry, TreeClient, TreeClientBuilder, TreeIndex, TreeServer, TreeServerBuilder,
     build_tree,
 };
+#[doc(no_inline)]
+pub use zenoh::qos::Priority;
 
 /// Key of the manifest reply for blob `id` under `prefix`.
 pub fn manifest_key(prefix: &str, id: &str) -> String {
@@ -254,12 +256,33 @@ pub fn parse_ranges(
     Ok(out)
 }
 
-/// Extract the blob `id` from a query key expression seen by a server declared on
-/// `<prefix>/**`. The id is the single segment following the prefix.
+/// Extract the blob `id` from a query key expression seen by a server
+/// declared on `<prefix>/**`.
+///
+/// Matched **positionally**, not by literal string stripping: a client may
+/// legitimately query a *wildcard* prefix (e.g. `v1/*/@blob/artifact/<id>/…`
+/// to ask every origin which one holds a blob), and the server still has to
+/// recognise its own id segment in that query. Single-segment wildcards (`*`,
+/// `$*…`) therefore match a literal prefix segment. A `**` inside the prefix
+/// region is refused instead: it can span any number of segments, so the id's
+/// position is genuinely ambiguous and guessing would mis-parse.
 pub fn parse_id(prefix: &str, key_expr: &str) -> Option<String> {
-    let rest = key_expr.strip_prefix(prefix)?.strip_prefix('/')?;
-    let id = rest.split('/').next()?;
-    if id.is_empty() || id == "**" {
+    let p: Vec<&str> = prefix.split('/').collect();
+    let k: Vec<&str> = key_expr.split('/').collect();
+    if k.len() <= p.len() {
+        return None;
+    }
+    for (want, got) in p.iter().zip(k.iter()) {
+        if got == &"**" {
+            return None; // ambiguous span: the id's position is unknowable
+        }
+        let single_wildcard = got.contains('*');
+        if want != got && !single_wildcard {
+            return None;
+        }
+    }
+    let id = k[p.len()];
+    if id.is_empty() || id.contains('*') {
         None
     } else {
         Some(id.to_string())
@@ -365,6 +388,36 @@ mod key_tests {
         assert_eq!(parse_id("p", "p/A/manifest").as_deref(), Some("A"));
         assert_eq!(parse_id("p", "p/**"), None);
         assert_eq!(parse_id("other", "p/A/**"), None);
+        // Multi-segment prefixes align positionally.
+        assert_eq!(
+            parse_id(
+                "v1/host-a/@blob/artifact",
+                "v1/host-a/@blob/artifact/A/manifest"
+            )
+            .as_deref(),
+            Some("A")
+        );
+        // A wildcard-origin probe must still resolve to this server's id: the
+        // `*` stands in for the literal origin segment.
+        assert_eq!(
+            parse_id("v1/host-a/@blob/artifact", "v1/*/@blob/artifact/A/manifest").as_deref(),
+            Some("A")
+        );
+        // …but a `**` in the prefix region is ambiguous and refused.
+        assert_eq!(
+            parse_id("v1/host-a/@blob/artifact", "v1/**/A/manifest"),
+            None
+        );
+        // A non-matching literal segment still fails.
+        assert_eq!(
+            parse_id(
+                "v1/host-a/@blob/artifact",
+                "v1/host-b/@blob/artifact/A/manifest"
+            ),
+            None
+        );
+        // The id itself may never be a wildcard.
+        assert_eq!(parse_id("p", "p/*/manifest"), None);
     }
 
     #[test]
