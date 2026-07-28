@@ -20,6 +20,9 @@ type StoreFactory = Box<dyn Fn(&std::path::Path) -> Arc<dyn ContentStore>>;
 
 /// Every store configuration under test, by name.
 fn stores() -> Vec<(&'static str, StoreFactory)> {
+    // `mut` is only exercised by the feature-gated pushes below; with default
+    // features there are none.
+    #[allow(unused_mut)]
     let mut v: Vec<(&'static str, StoreFactory)> = vec![
         (
             "memory",

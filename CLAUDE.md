@@ -16,13 +16,25 @@ a zensight build until published (see `../CLAUDE.md` for the cross-repo
 ## Commands
 
 ```bash
-cargo test                      # all tests (integration tests open in-process Zenoh sessions; no router needed)
-cargo test --all-features      # zstd + encryption + fanout + tracing paths
 cargo test --test roundtrip     # one integration test binary
 cargo test key_builders         # one test by name
-cargo clippy --all-targets --all-features -- -D warnings   # zero-warnings policy (CI gate)
-cargo fmt --all --check
 cargo bench                     # criterion benches (CI only compiles them)
+```
+
+**Run the gates exactly as CI does before pushing** — CI sets
+`RUSTFLAGS: -D warnings` globally and builds *both* feature sets, so a plain
+`cargo test` locally can pass while CI fails (feature-gated code makes a
+binding unused, a `#[cfg]` arm goes dead, …). This is the full sequence:
+
+```bash
+export RUSTFLAGS="-D warnings"
+cargo fmt --all --check
+cargo clippy --all-targets --all-features --locked -- -D warnings
+cargo clippy --all-targets --locked -- -D warnings   # default features too
+cargo test --locked
+cargo test --all-features --locked
+RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --all-features --locked
+cargo publish --dry-run
 ```
 
 CI (`.forgejo/workflows/ci.yml`) runs build + test (default and all-features)
