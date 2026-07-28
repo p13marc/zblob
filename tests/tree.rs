@@ -669,6 +669,11 @@ async fn concurrent_tree_downloads_share_one_dirstore() {
 }
 
 /// Non-UTF-8 file names are a loud build error, not silent mangling.
+///
+/// Only some unix filesystems permit such a name at all — APFS (macOS) and
+/// Windows reject it at the OS layer — so the fixture is best-effort: where
+/// the name cannot be created there is nothing for `build_tree` to mishandle
+/// and the test has no subject.
 #[cfg(unix)]
 #[test]
 fn non_utf8_names_error_on_build() {
@@ -677,7 +682,10 @@ fn non_utf8_names_error_on_build() {
 
     let src = tempfile::tempdir().unwrap();
     let bad = src.path().join(OsStr::from_bytes(b"bad-\xff-name"));
-    std::fs::write(&bad, b"data").unwrap();
+    if std::fs::write(&bad, b"data").is_err() {
+        eprintln!("skipping: this filesystem refuses non-UTF-8 names");
+        return;
+    }
     let store = MemoryStore::new();
     let err = build_tree(src.path(), "bad", &small_cdc(), &store).expect_err("must error");
     assert!(err.to_string().contains("non-UTF-8"), "{err}");

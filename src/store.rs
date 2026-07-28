@@ -268,7 +268,19 @@ impl ContentStore for DirStore {
         let mut tmp = tempfile::NamedTempFile::new_in(dir)?;
         tmp.write_all(&packed)?;
         tmp.as_file().sync_all()?;
-        tmp.persist(&dst).map_err(|e| e.error)?;
+        if let Err(e) = tmp.persist(&dst) {
+            // Losing the race to another writer is success, not failure: the
+            // address determines the bytes, so whoever landed first wrote
+            // exactly what we would have. POSIX rename silently replaces, but
+            // Windows refuses when the destination exists or is open by
+            // another handle — without this, concurrent puts of one chunk
+            // (the normal case when several downloads share a store) fail on
+            // Windows only.
+            if dst.exists() {
+                return fsync_dir(dir);
+            }
+            return Err(e.error);
+        }
         fsync_dir(dir)
     }
 

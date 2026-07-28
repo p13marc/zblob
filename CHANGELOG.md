@@ -74,6 +74,20 @@ deployments fail closed instead of corrupting).
 - **Observability** (#32): `TransferStats` from every download, server
   `on_error` callbacks, optional `tracing` feature.
 
+### Portability
+
+- `DirStore::put` treats losing a concurrent-put race as success: the address
+  determines the bytes, so whoever landed first wrote what we would have.
+  POSIX `rename` replaces silently, but Windows refuses when the destination
+  exists or is open elsewhere — so concurrent puts of one chunk (the normal
+  case when several downloads share a store) failed **on Windows only**.
+- The non-UTF-8 filename test skips where the filesystem refuses such a name
+  (APFS, Windows) instead of failing: there is no subject to test.
+
+Both were found by a Windows+macOS CI matrix that has since been removed —
+the mirror runs no CI by policy (see CLAUDE.md). These paths are consequently
+not covered by CI going forward.
+
 ### Content-addressed snapshots
 
 - `TreeIndex::keyed_by_root()` re-keys a snapshot by its own root hash, and

@@ -41,8 +41,19 @@ CI (`.forgejo/workflows/ci.yml`) runs build + test (default and all-features)
 with `--locked`, fmt, clippy `-D warnings`, MSRV 1.97 check, docs, cargo-audit,
 llvm-cov, bench compile, and a `cargo publish --dry-run` — keep `Cargo.lock`
 committed and the crate publishable. A weekly fuzz workflow runs the `fuzz/`
-targets; the GitHub mirror runs a Windows+macOS matrix
-(`.github/workflows/ci.yml`). MSRV stays **1.97** (fleet policy).
+targets. MSRV stays **1.97** (fleet policy).
+
+**There is deliberately no `.github/workflows/`** — workflows live in
+`.forgejo/` only and the GitHub mirror runs no CI (commit `287341a`). Do not
+add one "to get cross-platform coverage": that was tried, and a permanently
+red mirror CI is worse than none. The consequence is real and should be
+stated rather than papered over — **the `#[cfg(windows)]` / `#[cfg(not(unix))]`
+branches are not exercised by CI**, because the Forgejo runner is Linux-only
+and cross-checking needs toolchains it does not have (`ring` fails for
+`x86_64-pc-windows-msvc` without a C toolchain; macOS needs osxcross). If
+cross-platform coverage becomes a requirement, decide it explicitly: provision
+mingw on the runner for `x86_64-pc-windows-gnu` compile checks, or re-enable a
+GitHub matrix on purpose.
 
 ## Architecture (wire v2)
 
