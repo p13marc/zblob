@@ -987,9 +987,11 @@ fn reconstruct_tree(dest_root: &Path, entries: &[Entry], store: &dyn ContentStor
     std::fs::create_dir_all(dest_root)?;
     let root = dest_root.canonicalize()?;
 
-    // Pass 1: directories (DFS order → parents first).
+    // Pass 1: directories (DFS order → parents first). Modes are NOT applied
+    // yet — a read-only directory would break writing its own children; like
+    // tar/casync, directory permissions land last.
     for e in entries {
-        if let Entry::Dir { path, mode, .. } = e {
+        if let Entry::Dir { path, .. } = e {
             let p = root.join(sanitize_rel_path(path)?);
             std::fs::create_dir_all(&p)?;
             if !p.canonicalize()?.starts_with(&root) {
@@ -997,7 +999,6 @@ fn reconstruct_tree(dest_root: &Path, entries: &[Entry], store: &dyn ContentStor
                     "dir {path:?} resolves outside the destination root"
                 )));
             }
-            set_mode(&p, *mode);
         }
     }
 
@@ -1066,14 +1067,20 @@ fn reconstruct_tree(dest_root: &Path, entries: &[Entry], store: &dyn ContentStor
         }
     }
 
-    // Pass 4: directory mtimes, children-first so parents aren't re-dirtied.
+    // Pass 4: directory mtimes and modes, children-first (deepest last in
+    // DFS order → reverse), so restoring a read-only or dated directory never
+    // interferes with materializing its contents.
     for e in entries.iter().rev() {
-        if let Entry::Dir { path, mtime, .. } = e
-            && *mtime > 0
+        if let Entry::Dir { path, mode, mtime } = e
             && let Ok(rel) = sanitize_rel_path(path)
-            && let Ok(f) = std::fs::File::open(root.join(rel))
         {
-            set_mtime(&f, *mtime);
+            let p = root.join(rel);
+            if *mtime > 0
+                && let Ok(f) = std::fs::File::open(&p)
+            {
+                set_mtime(&f, *mtime);
+            }
+            set_mode(&p, *mode);
         }
     }
     Ok(())

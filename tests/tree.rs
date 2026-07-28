@@ -473,3 +473,212 @@ async fn hardlinks_roundtrip() {
     handle.shutdown().await.unwrap();
     session.close().await.unwrap();
 }
+
+/// Empty files, empty directories, and an empty tree all round-trip.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn empty_file_dir_and_tree_roundtrip() {
+    let session = common::open_session().await;
+    let p = unique_prefix();
+    let store_prefix = format!("{p}/store");
+    let tree_prefix = format!("{p}/tree");
+
+    let src = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(src.path().join("empty-dir")).unwrap();
+    std::fs::write(src.path().join("empty-file"), b"").unwrap();
+    std::fs::write(src.path().join("real"), b"content").unwrap();
+
+    let server_store: Arc<dyn ContentStore> = Arc::new(MemoryStore::new());
+    let index = build_tree(src.path(), "edges", &small_cdc(), &*server_store).unwrap();
+    let server = TreeServer::new(
+        session.clone(),
+        store_prefix.clone(),
+        tree_prefix.clone(),
+        server_store.clone(),
+    );
+    server.register(index).await;
+
+    // A fully-empty tree too.
+    let empty_src = tempfile::tempdir().unwrap();
+    let empty_index = build_tree(empty_src.path(), "void", &small_cdc(), &*server_store).unwrap();
+    assert!(empty_index.entries.is_empty());
+    server.register(empty_index).await;
+    let handle = server.spawn().await.unwrap();
+
+    let client = test_client(session.clone(), &store_prefix, &tree_prefix);
+    let store: Arc<dyn ContentStore> = Arc::new(MemoryStore::new());
+
+    let dest = tempfile::tempdir().unwrap();
+    client
+        .download_tree(
+            &DownloadRequest::new("edges"),
+            dest.path(),
+            &store,
+            &(),
+            &CancelToken::new(),
+        )
+        .await
+        .expect("edges tree");
+    assert_dirs_equal(src.path(), dest.path());
+    assert_eq!(std::fs::read(dest.path().join("empty-file")).unwrap(), b"");
+    assert!(dest.path().join("empty-dir").is_dir());
+
+    let void_dest = tempfile::tempdir().unwrap();
+    client
+        .download_tree(
+            &DownloadRequest::new("void"),
+            void_dest.path(),
+            &store,
+            &(),
+            &CancelToken::new(),
+        )
+        .await
+        .expect("empty tree");
+    assert_eq!(std::fs::read_dir(void_dest.path()).unwrap().count(), 0);
+
+    handle.shutdown().await.unwrap();
+    session.close().await.unwrap();
+}
+
+/// A read-only directory must not block materializing its own children —
+/// directory modes are restored last (the tar/casync ordering).
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn readonly_dir_roundtrips_with_mode_restored() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let session = common::open_session().await;
+    let p = unique_prefix();
+    let store_prefix = format!("{p}/store");
+    let tree_prefix = format!("{p}/tree");
+
+    let src = tempfile::tempdir().unwrap();
+    std::fs::create_dir(src.path().join("locked")).unwrap();
+    std::fs::write(src.path().join("locked/inside.txt"), b"still writable").unwrap();
+    std::fs::set_permissions(
+        src.path().join("locked"),
+        std::fs::Permissions::from_mode(0o555),
+    )
+    .unwrap();
+
+    let server_store: Arc<dyn ContentStore> = Arc::new(MemoryStore::new());
+    let index = build_tree(src.path(), "ro", &small_cdc(), &*server_store).unwrap();
+    let server = TreeServer::new(
+        session.clone(),
+        store_prefix.clone(),
+        tree_prefix.clone(),
+        server_store,
+    );
+    server.register(index).await;
+    let handle = server.spawn().await.unwrap();
+
+    let dest = tempfile::tempdir().unwrap();
+    let client = test_client(session.clone(), &store_prefix, &tree_prefix);
+    let store: Arc<dyn ContentStore> = Arc::new(MemoryStore::new());
+    client
+        .download_tree(
+            &DownloadRequest::new("ro"),
+            dest.path(),
+            &store,
+            &(),
+            &CancelToken::new(),
+        )
+        .await
+        .expect("read-only dir tree");
+    assert_eq!(
+        std::fs::read(dest.path().join("locked/inside.txt")).unwrap(),
+        b"still writable"
+    );
+    let mode = std::fs::metadata(dest.path().join("locked"))
+        .unwrap()
+        .permissions()
+        .mode()
+        & 0o777;
+    assert_eq!(mode, 0o555, "read-only mode restored");
+
+    // Restore writability so the tempdir can be cleaned up.
+    std::fs::set_permissions(
+        src.path().join("locked"),
+        std::fs::Permissions::from_mode(0o755),
+    )
+    .unwrap();
+    std::fs::set_permissions(
+        dest.path().join("locked"),
+        std::fs::Permissions::from_mode(0o755),
+    )
+    .unwrap();
+
+    handle.shutdown().await.unwrap();
+    session.close().await.unwrap();
+}
+
+/// Two concurrent tree downloads sharing one DirStore (the v1 fixed-name
+/// temp-file race) both succeed with identical results.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn concurrent_tree_downloads_share_one_dirstore() {
+    let session = common::open_session().await;
+    let p = unique_prefix();
+    let store_prefix = format!("{p}/store");
+    let tree_prefix = format!("{p}/tree");
+
+    let src = tempfile::tempdir().unwrap();
+    make_tree(src.path());
+    let server_store: Arc<dyn ContentStore> = Arc::new(MemoryStore::new());
+    let index = build_tree(src.path(), "shared", &small_cdc(), &*server_store).unwrap();
+    let total = index.needed_chunks().len();
+    let server = TreeServer::new(
+        session.clone(),
+        store_prefix.clone(),
+        tree_prefix.clone(),
+        server_store,
+    );
+    server.register(index).await;
+    let handle = server.spawn().await.unwrap();
+
+    let store_dir = tempfile::tempdir().unwrap();
+    let shared_store: Arc<dyn ContentStore> = Arc::new(DirStore::open(store_dir.path()).unwrap());
+    let client = Arc::new(test_client(session.clone(), &store_prefix, &tree_prefix));
+
+    let mut joins = Vec::new();
+    let dests: Vec<_> = (0..2).map(|_| tempfile::tempdir().unwrap()).collect();
+    for dest in &dests {
+        let client = client.clone();
+        let store = shared_store.clone();
+        let path = dest.path().to_path_buf();
+        joins.push(tokio::spawn(async move {
+            client
+                .download_tree(
+                    &DownloadRequest::new("shared"),
+                    &path,
+                    &store,
+                    &(),
+                    &CancelToken::new(),
+                )
+                .await
+        }));
+    }
+    for join in joins {
+        join.await.unwrap().expect("concurrent tree download");
+    }
+    for dest in &dests {
+        assert_dirs_equal(src.path(), dest.path());
+    }
+    assert_eq!(shared_store.hashes().unwrap().len(), total);
+
+    handle.shutdown().await.unwrap();
+    session.close().await.unwrap();
+}
+
+/// Non-UTF-8 file names are a loud build error, not silent mangling.
+#[cfg(unix)]
+#[test]
+fn non_utf8_names_error_on_build() {
+    use std::ffi::OsStr;
+    use std::os::unix::ffi::OsStrExt;
+
+    let src = tempfile::tempdir().unwrap();
+    let bad = src.path().join(OsStr::from_bytes(b"bad-\xff-name"));
+    std::fs::write(&bad, b"data").unwrap();
+    let store = MemoryStore::new();
+    let err = build_tree(src.path(), "bad", &small_cdc(), &store).expect_err("must error");
+    assert!(err.to_string().contains("non-UTF-8"), "{err}");
+}
