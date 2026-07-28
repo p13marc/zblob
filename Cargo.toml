@@ -12,8 +12,10 @@ version = "0.1.0"
 edition = "2024"
 rust-version = "1.97"
 license = "MIT"
-description = "Generic resumable chunked blob & directory transfer over Zenoh (progress, SHA-256, resume)"
+description = "Resumable verified-streaming blob & directory transfer over Zenoh (BLAKE3/bao, range resume, content-addressed dedup)"
 repository = "https://github.com/p13marc/zblob"
+documentation = "https://docs.rs/zblob"
+homepage = "https://github.com/p13marc/zblob"
 readme = "README.md"
 keywords = ["zenoh", "transfer", "chunked", "resume", "content-addressed"]
 categories = ["network-programming", "filesystem"]
@@ -52,3 +54,6 @@ criterion = "0.5"
 [[bench]]
 name = "throughput"
 harness = false
+
+[package.metadata.docs.rs]
+all-features = true

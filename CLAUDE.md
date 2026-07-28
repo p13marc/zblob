@@ -5,78 +5,103 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 ## What this is
 
 `zblob` is a single-crate Cargo workspace: generic, resumable, chunked blob and
-directory transfer over Zenoh (progress, SHA-256 integrity, range resume,
-bounded memory). It carries no application-specific types. It graduated from the
-ZenSight monorepo in 2026-07 (formerly the in-tree `zenoh-blob` crate);
-ZenSight consumes it as a git dependency, so local edits here are not picked up
-by a zensight build until pushed (see `../CLAUDE.md` for the cross-repo
+directory transfer over Zenoh — **wire v2**: BLAKE3 + bao verified streaming,
+range-set resume, postcard control messages, content-addressed directory trees.
+It carries no application-specific types. It graduated from the ZenSight
+monorepo in 2026-07 (formerly the in-tree `zenoh-blob` crate); ZenSight
+consumes it as a crates.io dependency, so local edits here are not picked up by
+a zensight build until published (see `../CLAUDE.md` for the cross-repo
 `[patch]` workflow and `docs/graduation.md` for history).
 
 ## Commands
 
 ```bash
 cargo test                      # all tests (integration tests open in-process Zenoh sessions; no router needed)
-cargo test --test roundtrip     # one integration test binary (cancel, resume, roundtrip, storage, tamper, tree)
+cargo test --all-features      # zstd + encryption + fanout + tracing paths
+cargo test --test roundtrip     # one integration test binary
 cargo test key_builders         # one test by name
-cargo clippy --all-targets -- -D warnings   # zero-warnings policy (CI gate)
+cargo clippy --all-targets --all-features -- -D warnings   # zero-warnings policy (CI gate)
 cargo fmt --all --check
+cargo bench                     # criterion benches (CI only compiles them)
 ```
 
-CI (`.github/workflows/ci.yml`) runs build + test with `--locked`, fmt, clippy
-`-D warnings`, and a `cargo publish --dry-run` — keep `Cargo.lock` committed and
-the crate publishable (no path dependencies).
+CI (`.forgejo/workflows/ci.yml`) runs build + test (default and all-features)
+with `--locked`, fmt, clippy `-D warnings`, MSRV 1.97 check, docs, cargo-audit,
+llvm-cov, bench compile, and a `cargo publish --dry-run` — keep `Cargo.lock`
+committed and the crate publishable. A weekly fuzz workflow runs the `fuzz/`
+targets; the GitHub mirror runs a Windows+macOS matrix
+(`.github/workflows/ci.yml`). MSRV stays **1.97** (fleet policy).
 
-## Architecture
+## Architecture (wire v2)
 
-Two independent transfer tiers share the pluggable primitives (`Digest`/`Hash` in
-`hash.rs`, `Chunker` fixed-size or FastCDC in `chunk.rs`, `Format` JSON/CBOR in
-`format.rs`, `ProgressSink`, `CancelToken`).
+Both tiers share the primitives: `hash.rs` (BLAKE3-only `Hash`), `verify.rs`
+(bao outboard/slice encode + verified decode — the integrity core), `wire.rs`
+(postcard + `Encoding` tags + `WIRE_VERSION`), `chunk.rs` (`TransferChunks`
+fixed-size arithmetic for Tier 1; `CdcParams` seedable FastCDC for Tier 2),
+`paths.rs` (traversal-safe path/symlink sanitization), `compress.rs`
+(self-describing chunk containers, optional zstd), `resume.rs` (crash-safe
+bitfield sidecar), `progress.rs`, `cancel.rs`, `obs.rs` (TransferStats +
+optional tracing).
 
-**Tier 1 — single blob by id** (`server.rs`, `client.rs`, `manifest.rs`,
-`resume.rs`): one `BlobServer` queryable on `<prefix>/**` serves every registered
-blob. A download is exactly two GETs: manifest first (`<prefix>/<id>/manifest`),
-then chunks (`<prefix>/<id>/**?from=K`). Manifest-first is load-bearing: Zenoh
-does not order query replies, and knowing `chunk_size` up front lets the client
-write each out-of-order chunk at its byte offset into a `.part` file — memory
-stays O(chunk_size). Resume state is a JSON sidecar (`.part.meta`, `resume.rs`)
-bound to id + whole-blob hash + chunking, so a regenerated source can never
-splice mismatched halves. The whole-blob SHA-256 is verified before the rename
-into place. Servers stream chunks lazily from a `BlobSource` reader — never
-`read_to_end`.
+**Tier 1 — single blob by id** (`server.rs`, `client.rs`, `manifest.rs`): one
+`BlobServer` queryable on `<prefix>/**`. Registration streams the source once
+to build the bao outboard (mem, or sibling `.obao4` file for huge blobs) and
+derives the manifest — a served manifest can't disagree with the bytes. A
+download is a manifest GET then range-set slice GETs
+(`?v=2&ranges=…`, `ConsolidationMode::None`, explicit timeout, retry with
+backoff); every reply is a self-verifying bao slice checked against the
+(pinnable) root *before* hitting the `.part` — no final hash pass, tampered
+slices are dropped alone. The server also answers `…/have` availability
+bitfields and (opt-in via `accept_push` + `PushPolicy`) verified resumable
+uploads spooled server-side. The caller always chooses the destination
+(`download_to`); the manifest filename is advisory only.
 
 **Tier 2 — content-addressed directory trees** (`tree.rs`, `store.rs`,
-`publish.rs`): the casync model. A snapshot is a `TreeIndex` (depth-first entry
-list; files reference chunks by content hash) plus a `ContentStore` of chunks
-keyed `<prefix>/<algo>/<hex>`. The client fetches only missing hashes
-(`needed − have`), re-hashing each on receipt; progress *is* the set of hashes
-on disk, so resume and cross-file/cross-version dedup fall out for free. Chunks
-can be served live (`TreeServer`) or PUT into a router-hosted Zenoh storage via
-`publish_snapshot` so the producer can exit (see `docs/router-storage.md`).
-Chunk keys are immutable, so re-publishing is idempotent.
+`publish.rs`, `seed.rs`, `gc.rs`): the casync model. A snapshot is a
+`TreeIndex` (depth-first entries; files reference chunks by BLAKE3 hash, CDC
+parameters recorded in the index) plus a `ContentStore` keyed
+`<prefix>/blake3/<hex>`. `root_hash` is a canonical versioned postcard digest
+with mtime excluded. The client validates the index fully (paths, sizes, root
+recomputation, optional pinning) before fetching missing chunks concurrently
+and materializing defensively: sanitized paths, symlinks last with confined
+targets, canonical-parent checks, dir modes/mtimes restored last. `DirStore`
+is fanned out (`blake3/<xx>/<hex>`), atomic + fsynced, with optional
+verify-on-read, `scrub()`, zstd at rest, and (feature) XChaCha20-Poly1305
+sealing. `publish_snapshot` PUTs into a router storage and **read-back
+settles** before returning. `seed.rs` satisfies chunks from prior local copies
+and zero regions; `gc.rs` does tag-based mark-and-sweep.
+
+**Fanout tier** (`fanout.rs`, feature-gated): one-to-many rollout over
+zenoh-ext `AdvancedPublisher` (cached bao-slice sample stream; late joiners
+replay history; every receiver verifies).
 
 All key expressions are built through the helpers in `lib.rs` (`manifest_key`,
-`chunk_key`, `download_selector`, `store_key`, `tree_key`, `parse_id`,
-`parse_from`) — don't format keys ad hoc.
+`slice_key`, `slice_selector`, `availability_key`, `push_*_key`, `store_key`,
+`tree_key`, `parse_id`, `parse_ranges`) — don't format keys ad hoc.
 
 ### Two Zenoh facts the design relies on (from `lib.rs`)
 
 1. **Backpressure is automatic.** `Session::get` defaults to
-   `CongestionControl::Block` and replies inherit it. The crate deliberately sets
-   no congestion control and does not enable Zenoh's `internal` feature — do not
-   "fix" this by enabling it.
+   `CongestionControl::Block` and replies inherit it. The crate deliberately
+   sets no congestion control and does not enable Zenoh's `internal` feature —
+   do not "fix" this by enabling it. (Reply *consolidation* is different:
+   clients set `ConsolidationMode::None` so replies stream.)
 2. **Reply keys must match the query.** Clients must GET the `<prefix>/<id>/**`
-   wildcard or chunk replies are silently rejected
-   (`ReplyKeyExpr::MatchingQuery`). `download_selector` enforces this.
+   wildcard or slice replies are silently rejected
+   (`ReplyKeyExpr::MatchingQuery`). `slice_selector` enforces this.
 
 ## Tests
 
 Integration tests live in `tests/`, one file per concern (roundtrip, resume,
-cancel, tamper, storage, tree). Shared helpers are in `tests/common/mod.rs`:
+cancel, tamper, tree, tree_security, storage, push, multisource, coverage,
+minifuzz, fanout). Shared helpers are in `tests/common/mod.rs`:
 `open_session()` opens an isolated in-process session with scouting disabled
 (the loopback pattern — tests must not discover each other or the LAN),
 `unique_prefix()` namespaces keys per test, `pseudo_random()` gives
-deterministic data without a rand dependency, and `BytesSource` is an in-memory
-`BlobSource`. Follow these patterns for new tests.
+deterministic data without a rand dependency, and `common::bao` crafts real
+(or deliberately tampered) bao slices for adversarial fake servers. Servers
+are started with `spawn().await` (queryables are declared before it returns)
+— never sleep-and-hope. Follow these patterns for new tests.
 
 ## Conventions
 
@@ -85,6 +110,5 @@ deterministic data without a rand dependency, and `BytesSource` is an in-memory
 - Rust edition 2024, Zenoh 1.9 with only the `unstable` feature.
 - Every public item is documented; module docs explain the *why* (several
   design invariants live only there — read them before changing behavior).
-- Some links in `docs/` still point at monorepo-relative paths
-  (`../../docs/design/large-data-transfer.md`) — the design doc lives in the
-  zensight repo.
+- Wire changes bump `WIRE_VERSION` (postcard is positional — schema shape
+  changes are otherwise silent corruption).

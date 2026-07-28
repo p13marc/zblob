@@ -120,7 +120,7 @@ pub fn push_slice_key(prefix: &str, id: &str, index: u32) -> String {
 ///
 /// Always ends in the `/**` wildcard so the `slice/<i>` replies match the
 /// query (see the crate docs, fact 2). `ranges` must be sorted and disjoint —
-/// [`crate::resume`]'s hole computation produces exactly that.
+/// the resume bitfield's hole computation produces exactly that.
 pub fn slice_selector(prefix: &str, id: &str, ranges: &[std::ops::Range<u32>]) -> String {
     format!(
         "{prefix}/{id}/**?v={}&ranges={}",

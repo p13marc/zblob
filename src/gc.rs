@@ -1,6 +1,6 @@
 //! Content-store lifecycle: tags + mark-and-sweep garbage collection.
 //!
-//! A [`ContentStore`](crate::ContentStore) accumulates chunks forever on its
+//! A [`ContentStore`] accumulates chunks forever on its
 //! own — client caches and router-hosted stores both grow without bound. The
 //! model here is iroh's, cut down:
 //!
