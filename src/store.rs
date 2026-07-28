@@ -10,6 +10,7 @@ use std::io::Write;
 use std::path::PathBuf;
 use std::sync::{Mutex, MutexGuard};
 
+use crate::compress::{ChunkCompression, pack, unpack};
 use crate::hash::Hash;
 use crate::paths::fsync_dir;
 
@@ -91,6 +92,7 @@ impl ContentStore for MemoryStore {
 pub struct DirStore {
     root: PathBuf,
     verify_on_read: bool,
+    compression: ChunkCompression,
 }
 
 impl DirStore {
@@ -101,7 +103,16 @@ impl DirStore {
         Ok(DirStore {
             root,
             verify_on_read: false,
+            compression: ChunkCompression::default(),
         })
+    }
+
+    /// Compress chunks at rest (see [`ChunkCompression`]; requires the `zstd`
+    /// feature for [`ChunkCompression::Zstd`]). Reading understands both
+    /// compressed and raw frames regardless of this setting.
+    pub fn with_compression(mut self, compression: ChunkCompression) -> Self {
+        self.compression = compression;
+        self
     }
 
     /// Re-hash every chunk on [`get`](ContentStore::get); a corrupted chunk is
@@ -128,12 +139,13 @@ impl DirStore {
         let mut corrupted = Vec::new();
         for hash in self.hashes()? {
             let path = self.path(&hash);
-            match std::fs::read(&path) {
-                Ok(bytes) if Hash::of(&bytes) == hash => {}
-                Ok(_) | Err(_) => {
-                    let _ = std::fs::remove_file(&path);
-                    corrupted.push(hash);
-                }
+            let ok = std::fs::read(&path)
+                .ok()
+                .and_then(|packed| unpack(&packed).ok())
+                .is_some_and(|bytes| Hash::of(&bytes) == hash);
+            if !ok {
+                let _ = std::fs::remove_file(&path);
+                corrupted.push(hash);
             }
         }
         Ok(corrupted)
@@ -147,7 +159,13 @@ impl ContentStore for DirStore {
 
     fn get(&self, hash: &Hash) -> Option<Vec<u8>> {
         let path = self.path(hash);
-        let bytes = std::fs::read(&path).ok()?;
+        let packed = std::fs::read(&path).ok()?;
+        let Ok(bytes) = unpack(&packed) else {
+            // Undecodable frame = at-rest corruption: report missing so the
+            // caller re-fetches instead of materializing garbage.
+            let _ = std::fs::remove_file(&path);
+            return None;
+        };
         if self.verify_on_read && Hash::of(&bytes) != *hash {
             let _ = std::fs::remove_file(&path);
             return None;
@@ -156,13 +174,14 @@ impl ContentStore for DirStore {
     }
 
     fn put(&self, hash: &Hash, bytes: &[u8]) -> std::io::Result<()> {
+        let packed = pack(bytes, self.compression).map_err(std::io::Error::other)?;
         let dst = self.path(hash);
         let dir = dst.parent().expect("fanout dir");
         std::fs::create_dir_all(dir)?;
         // Unique temp name (concurrent puts of the same chunk must not clobber
         // each other's temp file) → fsync → atomic rename → dir fsync.
         let mut tmp = tempfile::NamedTempFile::new_in(dir)?;
-        tmp.write_all(bytes)?;
+        tmp.write_all(&packed)?;
         tmp.as_file().sync_all()?;
         tmp.persist(&dst).map_err(|e| e.error)?;
         fsync_dir(dir)

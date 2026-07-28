@@ -94,6 +94,7 @@ async fn publish_to_storage_then_download_without_server() {
         &tree_prefix,
         &index,
         &producer_store,
+        zblob::ChunkCompression::default(),
         Duration::from_secs(10),
     )
     .await

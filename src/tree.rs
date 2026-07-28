@@ -28,6 +28,7 @@ use zenoh::query::ConsolidationMode;
 use crate::cancel::CancelToken;
 use crate::chunk::CdcParams;
 use crate::client::DownloadRequest;
+use crate::compress::{ChunkCompression, pack, unpack};
 use crate::error::{BlobError, Result};
 use crate::hash::Hash;
 use crate::manifest::validate_id;
@@ -456,27 +457,76 @@ struct TreeInner {
     store: Arc<dyn ContentStore>,
     index: tokio::sync::RwLock<std::collections::HashMap<String, TreeIndex>>,
     inflight: Semaphore,
+    compression: ChunkCompression,
+}
+
+/// Builder for a [`TreeServer`] (see [`TreeServer::builder`]).
+pub struct TreeServerBuilder {
+    session: Arc<zenoh::Session>,
+    store_prefix: String,
+    tree_prefix: String,
+    store: Arc<dyn ContentStore>,
+    max_inflight: usize,
+    compression: ChunkCompression,
+}
+
+impl TreeServerBuilder {
+    /// Max concurrent in-flight queries served at once (default 8).
+    pub fn max_inflight(mut self, n: usize) -> Self {
+        self.max_inflight = n.max(1);
+        self
+    }
+
+    /// Compression for chunk replies (default none; requires the `zstd`
+    /// feature for [`ChunkCompression::Zstd`]).
+    pub fn compression(mut self, c: ChunkCompression) -> Self {
+        self.compression = c;
+        self
+    }
+
+    /// Build the server.
+    pub fn build(self) -> TreeServer {
+        TreeServer {
+            inner: Arc::new(TreeInner {
+                session: self.session,
+                store_prefix: self.store_prefix,
+                tree_prefix: self.tree_prefix,
+                store: self.store,
+                index: tokio::sync::RwLock::new(std::collections::HashMap::new()),
+                inflight: Semaphore::new(self.max_inflight),
+                compression: self.compression,
+            }),
+        }
+    }
 }
 
 impl TreeServer {
-    /// Build a server. `store_prefix` serves `<prefix>/<algo>/<hash>`;
+    /// Start building a server. `store_prefix` serves `<prefix>/<algo>/<hash>`;
     /// `tree_prefix` serves `<prefix>/<id>`.
+    pub fn builder(
+        session: Arc<zenoh::Session>,
+        store_prefix: impl Into<String>,
+        tree_prefix: impl Into<String>,
+        store: Arc<dyn ContentStore>,
+    ) -> TreeServerBuilder {
+        TreeServerBuilder {
+            session,
+            store_prefix: store_prefix.into(),
+            tree_prefix: tree_prefix.into(),
+            store,
+            max_inflight: 8,
+            compression: ChunkCompression::default(),
+        }
+    }
+
+    /// Build a server with default configuration.
     pub fn new(
         session: Arc<zenoh::Session>,
         store_prefix: impl Into<String>,
         tree_prefix: impl Into<String>,
         store: Arc<dyn ContentStore>,
     ) -> Self {
-        TreeServer {
-            inner: Arc::new(TreeInner {
-                session,
-                store_prefix: store_prefix.into(),
-                tree_prefix: tree_prefix.into(),
-                store,
-                index: tokio::sync::RwLock::new(std::collections::HashMap::new()),
-                inflight: Semaphore::new(8),
-            }),
-        }
+        Self::builder(session, store_prefix, tree_prefix, store).build()
     }
 
     /// Register a snapshot index (its chunks must already be in the store).
@@ -573,12 +623,15 @@ async fn serve_chunk_query(inner: &TreeInner, query: zenoh::query::Query) -> Res
         return Ok(()); // not a chunk key (or foreign algo); ignore.
     };
     let store = inner.store.clone();
-    let bytes = tokio::task::spawn_blocking(move || store.get(&hash))
-        .await
-        .map_err(|e| BlobError::Protocol(format!("store get task: {e}")))?;
-    if let Some(bytes) = bytes {
+    let compression = inner.compression;
+    let packed = tokio::task::spawn_blocking(move || {
+        store.get(&hash).map(|bytes| pack(&bytes, compression))
+    })
+    .await
+    .map_err(|e| BlobError::Protocol(format!("store get task: {e}")))?;
+    if let Some(packed) = packed {
         query
-            .reply(query.key_expr().clone(), bytes)
+            .reply(query.key_expr().clone(), packed?)
             .encoding(ENC_CHUNK)
             .await
             .map_err(BlobError::zenoh)?;
@@ -891,7 +944,9 @@ async fn fetch_one_chunk(
         if sample.encoding().to_string() != ENC_CHUNK {
             continue;
         }
-        let bytes = sample.payload().to_bytes().to_vec();
+        let Ok(bytes) = unpack(&sample.payload().to_bytes()) else {
+            continue; // malformed frame; wait for a good replier.
+        };
         if Hash::of(&bytes) != *hash {
             continue; // hostile or corrupt replier; wait for a good one.
         }

@@ -22,6 +22,7 @@ use std::time::Duration;
 
 use zenoh::query::ConsolidationMode;
 
+use crate::compress::{ChunkCompression, pack};
 use crate::error::{BlobError, Result};
 use crate::hash::Hash;
 use crate::store::ContentStore;
@@ -38,9 +39,13 @@ pub async fn publish_chunk(
     store_prefix: &str,
     hash: &Hash,
     bytes: &[u8],
+    compression: ChunkCompression,
 ) -> Result<()> {
     session
-        .put(store_key(store_prefix, Hash::ALGO, hash), bytes.to_vec())
+        .put(
+            store_key(store_prefix, Hash::ALGO, hash),
+            pack(bytes, compression)?,
+        )
         .encoding(ENC_CHUNK)
         .await
         .map_err(BlobError::zenoh)
@@ -52,13 +57,14 @@ pub async fn publish_store(
     session: &zenoh::Session,
     store_prefix: &str,
     store: &dyn ContentStore,
+    compression: ChunkCompression,
 ) -> Result<u32> {
     let mut published = 0u32;
     for hash in store.hashes()? {
         let bytes = store
             .get(&hash)
             .ok_or_else(|| BlobError::NotFound(hash.to_string()))?;
-        publish_chunk(session, store_prefix, &hash, &bytes).await?;
+        publish_chunk(session, store_prefix, &hash, &bytes, compression).await?;
         published += 1;
     }
     Ok(published)
@@ -89,9 +95,10 @@ pub async fn publish_snapshot(
     tree_prefix: &str,
     index: &TreeIndex,
     store: &dyn ContentStore,
+    compression: ChunkCompression,
     settle: Duration,
 ) -> Result<()> {
-    publish_store(session, store_prefix, store).await?;
+    publish_store(session, store_prefix, store, compression).await?;
     publish_index(session, tree_prefix, index).await?;
 
     // Read-back: the index, plus a bounded sample of chunk keys (first, last,
