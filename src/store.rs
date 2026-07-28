@@ -24,6 +24,10 @@ pub trait ContentStore: Send + Sync {
     /// Every chunk hash currently in the store (a snapshot; used to publish a
     /// store into a Zenoh storage and by garbage collection).
     fn hashes(&self) -> std::io::Result<Vec<Hash>>;
+    /// Remove chunk `hash`; returns whether it was present. Content-addressed
+    /// removal is only safe from [`crate::gc::sweep`] or an equivalent
+    /// liveness analysis — a chunk may be shared by many files and snapshots.
+    fn remove(&self, hash: &Hash) -> std::io::Result<bool>;
 }
 
 /// An in-memory [`ContentStore`] (tests, ephemeral caches).
@@ -73,6 +77,9 @@ impl ContentStore for MemoryStore {
     }
     fn hashes(&self) -> std::io::Result<Vec<Hash>> {
         Ok(self.map().keys().copied().collect())
+    }
+    fn remove(&self, hash: &Hash) -> std::io::Result<bool> {
+        Ok(self.map().remove(hash).is_some())
     }
 }
 
@@ -159,6 +166,14 @@ impl ContentStore for DirStore {
         tmp.as_file().sync_all()?;
         tmp.persist(&dst).map_err(|e| e.error)?;
         fsync_dir(dir)
+    }
+
+    fn remove(&self, hash: &Hash) -> std::io::Result<bool> {
+        match std::fs::remove_file(self.path(hash)) {
+            Ok(()) => Ok(true),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(false),
+            Err(e) => Err(e),
+        }
     }
 
     fn hashes(&self) -> std::io::Result<Vec<Hash>> {

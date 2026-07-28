@@ -49,6 +49,7 @@ mod cancel;
 mod chunk;
 mod client;
 mod error;
+pub mod gc;
 mod hash;
 mod manifest;
 mod paths;
