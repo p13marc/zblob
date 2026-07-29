@@ -19,7 +19,7 @@ homepage = "https://github.com/p13marc/zblob"
 readme = "README.md"
 keywords = ["zenoh", "transfer", "chunked", "resume", "content-addressed"]
 categories = ["network-programming", "filesystem"]
-exclude = ["fuzz/", ".forgejo/", ".github/"]
+exclude = ["fuzz/", ".forgejo/"]
 
 [dependencies]
 zenoh = { version = "1.9", features = ["unstable"] }

@@ -3,7 +3,7 @@
 All notable changes to `zblob` are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/); versions follow SemVer.
 
-## [0.2.0] — 2026-07-28 "wire v2"
+## [0.2.0] — 2026-07-29 "wire v2"
 
 A ground-up redesign of the wire protocol and integrity model
 ([analysis](docs/analysis-2026-07.md), epic #37). **Breaking throughout** —
