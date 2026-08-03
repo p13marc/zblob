@@ -10,7 +10,7 @@ jobs:
     steps:
       - uses: https://data.forgejo.org/actions/checkout@v7.0.1
       - uses: https://github.com/dtolnay/rust-toolchain@nightly
-      - uses: https://github.com/taiki-e/install-action@v2
+      - uses: https://github.com/taiki-e/install-action@v2.85.7
         with:
           tool: cargo-fuzz
       - name: Fuzz each parser for 90 seconds

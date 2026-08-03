@@ -34,7 +34,7 @@ tempfile = "3"
 zstd = { version = "0.13", optional = true }
 tracing = { version = "0.1", optional = true }
 zenoh-ext = { version = "1.9", features = ["unstable"], optional = true }
-chacha20poly1305 = { version = "0.10", optional = true }
+chacha20poly1305 = { version = "0.11", optional = true }
 
 [features]
 # Per-chunk zstd compression for Tier-2 chunk containers (wire + at rest).
@@ -50,7 +50,7 @@ encryption = ["dep:chacha20poly1305"]
 serde_json = "1"
 proptest = "1"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "time"] }
-criterion = "0.5"
+criterion = "0.8"
 
 [[bench]]
 name = "throughput"
