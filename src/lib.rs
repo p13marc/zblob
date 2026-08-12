@@ -96,8 +96,8 @@ pub use server::{
 };
 pub use store::{ContentStore, DirStore, MemoryStore};
 pub use tree::{
-    ChunkRef, Entry, TreeClient, TreeClientBuilder, TreeIndex, TreeServer, TreeServerBuilder,
-    build_tree,
+    ChunkRef, Entry, MaterializePolicy, TreeClient, TreeClientBuilder, TreeIndex, TreeServer,
+    TreeServerBuilder, build_tree,
 };
 #[doc(no_inline)]
 pub use zenoh::qos::Priority;

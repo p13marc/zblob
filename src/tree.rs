@@ -28,7 +28,7 @@
 
 use std::collections::HashMap;
 use std::io::Write;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -281,8 +281,24 @@ impl TreeIndex {
         }
         validate_id(&self.id)?;
         self.cdc.validate()?;
+        // Two entries claiming one path let a snapshot destroy its own output
+        // (and, with `Entry::Dir` first, turn a directory into a file). The
+        // comparison is on the sanitized path, which is what actually lands on
+        // disk — though `sanitize_rel_path` has already refused the aliasing
+        // spellings (`.`, `..`) by this point, so in practice this catches an
+        // exact repeat.
+        let mut seen: std::collections::HashSet<PathBuf> = std::collections::HashSet::new();
+        // Declared symlinks, collected for the whole-index containment check
+        // below — a single link's target cannot be judged on its own.
+        let mut links: std::collections::BTreeMap<Vec<String>, String> = Default::default();
         for e in &self.entries {
             let rel = sanitize_rel_path(e.path())?;
+            if !seen.insert(rel.clone()) {
+                return Err(BlobError::InvalidManifest(format!(
+                    "duplicate entry path {:?}",
+                    e.path()
+                )));
+            }
             match e {
                 Entry::File { size, chunks, .. } => {
                     let sum: u64 = chunks.iter().map(|c| c.len as u64).sum();
@@ -306,6 +322,12 @@ impl TreeIndex {
                 }
                 Entry::Symlink { target, .. } => {
                     sanitize_symlink_target(&rel, target)?;
+                    links.insert(
+                        rel.components()
+                            .map(|c| c.as_os_str().to_string_lossy().into_owned())
+                            .collect(),
+                        target.clone(),
+                    );
                 }
                 Entry::Hardlink { target, .. } => {
                     sanitize_rel_path(target)?;
@@ -313,6 +335,9 @@ impl TreeIndex {
                 Entry::Dir { .. } => {}
             }
         }
+        // Now that every link is known, decide containment against the set —
+        // the per-entry lexical check above cannot see a chain.
+        crate::paths::assert_symlinks_confined(&links)?;
         let actual = self.compute_root()?;
         if actual != self.root_hash {
             return Err(BlobError::RootMismatch {
@@ -496,6 +521,45 @@ fn hardlink_target(
     _inodes: &mut HashMap<(u64, u64), String>,
 ) -> Option<String> {
     None
+}
+
+/// What a snapshot is allowed to do to the destination directory.
+///
+/// Materialization is in place (the rsync/casync model), so a snapshot writes
+/// into a directory that may already hold data the caller cares about. Two of
+/// the things an index can ask for are destructive enough that they are off
+/// unless the caller says otherwise — an index is remote input, and the
+/// default has to be the one that cannot surprise.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct MaterializePolicy {
+    replace_directories: bool,
+    restore_setid: bool,
+}
+
+impl MaterializePolicy {
+    /// Allow an entry to replace an existing **directory** — which deletes it
+    /// and everything under it.
+    ///
+    /// Off by default. A snapshot in which `foo/` became the file `foo` is a
+    /// real and ordinary change, so this exists; but with it off, an index
+    /// entry named `Documents` cannot recursively delete `<dest>/Documents`
+    /// on its way to writing a file there. Off, such an entry is an error.
+    pub fn replace_directories(mut self, allow: bool) -> Self {
+        self.replace_directories = allow;
+        self
+    }
+
+    /// Restore setuid/setgid/sticky bits from the index instead of masking
+    /// them off.
+    ///
+    /// Off by default: the mode is remote input, so a privileged extraction of
+    /// an index with attacker-chosen file content and `mode = 0o104755` would
+    /// otherwise produce a setuid-root binary. tar and rsync gate this the
+    /// same way. With it off, modes are masked to `0o0777`.
+    pub fn restore_setid(mut self, allow: bool) -> Self {
+        self.restore_setid = allow;
+        self
+    }
 }
 
 /// Serves a tree snapshot: an index queryable + a content-addressed chunk
@@ -755,7 +819,10 @@ struct TreeClientConfig {
     query_timeout: Duration,
     fetch_concurrency: usize,
     max_index_bytes: usize,
+    max_tree_bytes: u64,
+    max_tree_chunks: u32,
     priority: Priority,
+    policy: MaterializePolicy,
 }
 
 impl Default for TreeClientConfig {
@@ -764,8 +831,15 @@ impl Default for TreeClientConfig {
             query_timeout: Duration::from_secs(30),
             fetch_concurrency: 16,
             max_index_bytes: 64 * 1024 * 1024,
+            // Tier 1 has bounded the blob a remote peer can make us fetch since
+            // v2 (`BlobClientBuilder::max_blob_size`); tier 2 bounded only the
+            // index, so an index within its cap could still reference tens of
+            // TiB. These are the missing halves of that defence.
+            max_tree_bytes: 1 << 40,
+            max_tree_chunks: 4_000_000,
             // Bulk transfer yields — see `BlobClientBuilder::priority`.
             priority: Priority::DataLow,
+            policy: MaterializePolicy::default(),
         }
     }
 }
@@ -796,6 +870,39 @@ impl TreeClientBuilder {
     /// allocation bound against a hostile index reply.
     pub fn max_index_bytes(mut self, n: usize) -> Self {
         self.cfg.max_index_bytes = n;
+        self
+    }
+
+    /// Largest snapshot this client will fetch, in total bytes
+    /// (default 1 TiB).
+    ///
+    /// Bounding the *index* is not enough: an index comfortably inside
+    /// [`max_index_bytes`](Self::max_index_bytes) can reference millions of
+    /// chunks of up to `CdcParams::max` each, and `download_tree` would fetch
+    /// and store every one. This is tier 2's counterpart to
+    /// [`BlobClientBuilder::max_blob_size`](crate::BlobClientBuilder::max_blob_size):
+    /// a remote peer must not choose how much disk or memory we commit. The
+    /// check runs against the validated index before the first chunk is
+    /// requested.
+    pub fn max_tree_bytes(mut self, n: u64) -> Self {
+        self.cfg.max_tree_bytes = n;
+        self
+    }
+
+    /// Largest number of distinct chunks a snapshot may reference
+    /// (default 4,000,000) — the companion bound to
+    /// [`max_tree_bytes`](Self::max_tree_bytes), since a great many *small*
+    /// chunks cost queries and bookkeeping rather than bytes.
+    pub fn max_tree_chunks(mut self, n: u32) -> Self {
+        self.cfg.max_tree_chunks = n;
+        self
+    }
+
+    /// What a snapshot may do to the destination directory
+    /// (see [`MaterializePolicy`]; the default refuses both destructive
+    /// operations).
+    pub fn materialize_policy(mut self, policy: MaterializePolicy) -> Self {
+        self.cfg.policy = policy;
         self
     }
 
@@ -946,10 +1053,27 @@ impl TreeClient {
             .fetch_index_matching(&req.id, req.expected_root)
             .await?;
 
+        // Bound the work a remote index can commit us to, *before* the first
+        // chunk GET. `validate()` has already established the index is
+        // self-consistent; that says nothing about whether it is affordable.
+        let total_size = index.total_size();
+        if total_size > self.cfg.max_tree_bytes {
+            return Err(BlobError::InvalidManifest(format!(
+                "snapshot totals {total_size} bytes, over the configured limit of {}",
+                self.cfg.max_tree_bytes
+            )));
+        }
         let needed = index.needed_chunks();
+        if needed.len() as u64 > self.cfg.max_tree_chunks as u64 {
+            return Err(BlobError::InvalidManifest(format!(
+                "snapshot references {} chunks, over the configured limit of {}",
+                needed.len(),
+                self.cfg.max_tree_chunks
+            )));
+        }
         let total = needed.len() as u32;
         sink.emit(Progress::Started {
-            total_len: index.total_size(),
+            total_len: total_size,
             chunk_count: total,
         });
 
@@ -963,7 +1087,8 @@ impl TreeClient {
         let entries = index.entries.clone();
         let dest = dest_root.to_path_buf();
         let store2 = store.clone();
-        tokio::task::spawn_blocking(move || reconstruct_tree(&dest, &entries, &*store2))
+        let policy = self.cfg.policy;
+        tokio::task::spawn_blocking(move || reconstruct_tree(&dest, &entries, &*store2, policy))
             .await
             .map_err(|e| BlobError::Protocol(format!("reconstruct task: {e}")))??;
 
@@ -1113,7 +1238,12 @@ async fn fetch_one_chunk(
 /// Materialize `entries` under `dest_root`, defensively:
 /// dirs → files/hardlinks → symlinks (last), then dir mtimes. Every path is
 /// sanitized and every write's parent is canonicalized back under the root.
-fn reconstruct_tree(dest_root: &Path, entries: &[Entry], store: &dyn ContentStore) -> Result<()> {
+fn reconstruct_tree(
+    dest_root: &Path,
+    entries: &[Entry],
+    store: &dyn ContentStore,
+    policy: MaterializePolicy,
+) -> Result<()> {
     std::fs::create_dir_all(dest_root)?;
     let root = dest_root.canonicalize()?;
 
@@ -1144,7 +1274,7 @@ fn reconstruct_tree(dest_root: &Path, entries: &[Entry], store: &dyn ContentStor
                 }
                 let p = root.join(&rel);
                 assert_parent_within(&root, &p)?;
-                remove_existing(&p);
+                remove_existing(&p, policy)?;
                 let mut f = std::fs::File::create(&p)?;
                 let mut written: u64 = 0;
                 for c in chunks {
@@ -1162,7 +1292,7 @@ fn reconstruct_tree(dest_root: &Path, entries: &[Entry], store: &dyn ContentStor
                         "file {path:?}: wrote {written} of declared {size} bytes"
                     )));
                 }
-                set_mode(&p, *mode);
+                set_mode(&p, *mode, policy);
                 set_mtime(&f, *mtime);
             }
             Entry::Hardlink { path, target } => {
@@ -1187,7 +1317,7 @@ fn reconstruct_tree(dest_root: &Path, entries: &[Entry], store: &dyn ContentStor
                         "hardlink target {target:?} resolves outside the destination root"
                     )));
                 }
-                remove_existing(&p);
+                remove_existing(&p, policy)?;
                 std::fs::hard_link(&canon_t, &p)?;
             }
             _ => {}
@@ -1204,7 +1334,7 @@ fn reconstruct_tree(dest_root: &Path, entries: &[Entry], store: &dyn ContentStor
             }
             let p = root.join(&rel);
             assert_parent_within(&root, &p)?;
-            remove_existing(&p);
+            remove_existing(&p, policy)?;
             symlink(target, &p)?;
         }
     }
@@ -1222,33 +1352,59 @@ fn reconstruct_tree(dest_root: &Path, entries: &[Entry], store: &dyn ContentStor
             {
                 set_mtime(&f, *mtime);
             }
-            set_mode(&p, *mode);
+            set_mode(&p, *mode, policy);
         }
     }
     Ok(())
 }
 
 /// Remove whatever currently sits at `p` (file, symlink, or directory) so a
-/// fresh entry can take its place. Best-effort.
-fn remove_existing(p: &Path) {
-    if let Ok(meta) = std::fs::symlink_metadata(p) {
-        if meta.is_dir() {
-            let _ = std::fs::remove_dir_all(p);
-        } else {
-            let _ = std::fs::remove_file(p);
+/// fresh entry can take its place.
+///
+/// Removing a *file or symlink* is the ordinary in-place update and is
+/// best-effort. Removing a **directory** is not: it takes everything
+/// underneath with it, on a path chosen by a remote index, so it happens only
+/// when [`MaterializePolicy::replace_directories`] allows it and is otherwise
+/// a loud error. See that method for why the default is off.
+fn remove_existing(p: &Path, policy: MaterializePolicy) -> Result<()> {
+    let Ok(meta) = std::fs::symlink_metadata(p) else {
+        return Ok(());
+    };
+    if meta.is_dir() {
+        if !policy.replace_directories {
+            return Err(BlobError::Protocol(format!(
+                "refusing to replace the existing directory {p:?} (and everything under it) \
+                 with a non-directory entry; enable MaterializePolicy::replace_directories \
+                 if that is intended"
+            )));
         }
+        let _ = std::fs::remove_dir_all(p);
+    } else {
+        let _ = std::fs::remove_file(p);
     }
+    Ok(())
 }
 
+/// Mode bits an index may set without an explicit opt-in: permissions only.
 #[cfg(unix)]
-fn set_mode(path: &Path, mode: u32) {
+const MODE_MASK: u32 = 0o0777;
+
+/// Apply an index-supplied mode, masking setuid/setgid/sticky unless the
+/// caller opted in (see [`MaterializePolicy::restore_setid`]).
+#[cfg(unix)]
+fn set_mode(path: &Path, mode: u32, policy: MaterializePolicy) {
+    use std::os::unix::fs::PermissionsExt;
+    let mode = if policy.restore_setid {
+        mode & 0o7777
+    } else {
+        mode & MODE_MASK
+    };
     if mode != 0 {
-        use std::os::unix::fs::PermissionsExt;
         let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode));
     }
 }
 #[cfg(not(unix))]
-fn set_mode(_path: &Path, _mode: u32) {}
+fn set_mode(_path: &Path, _mode: u32, _policy: MaterializePolicy) {}
 
 /// Restore a recorded mtime (best-effort; 0 means "unknown").
 fn set_mtime(f: &std::fs::File, mtime: i64) {

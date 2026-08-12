@@ -197,6 +197,144 @@ async fn escaping_symlink_target_rejected() {
     session.close().await.unwrap();
 }
 
+/// A *chain* of symlinks declared by one index escapes the root even though
+/// every link passes the per-link lexical depth check. This is what
+/// `assert_symlinks_confined` exists for.
+///
+/// Asserted against `validate()` directly: that is the attacker-input boundary
+/// the whole tier depends on, so testing it there is testing the defence
+/// rather than one path that happens to reach it.
+#[test]
+fn symlink_chain_escape_rejected() {
+    // `sub/link` -> ".." resolves to the tree root, so `sub/link/..` is the
+    // root's parent. The lexical walk for `e` never goes negative:
+    //   sub(1) link(2) ..(1) ..(0) etc(1) passwd(2)
+    let hostile = index_for(
+        "chain",
+        vec![
+            Entry::Dir {
+                path: "sub".into(),
+                mode: 0o755,
+                mtime: 0,
+            },
+            Entry::Symlink {
+                path: "sub/link".into(),
+                target: "..".into(),
+            },
+            Entry::Symlink {
+                path: "e".into(),
+                target: "sub/link/../../etc/passwd".into(),
+            },
+        ],
+    );
+    let err = hostile
+        .validate()
+        .expect_err("a symlink chain out of the root must be rejected");
+    assert!(
+        format!("{err}").contains("outside the tree root"),
+        "wrong diagnosis: {err}"
+    );
+
+    // Discriminating power: the same *shape* — a link through a link, with
+    // parent traversal — is legitimate as long as it lands inside. If this
+    // fails, the check above is just banning symlinks and proves nothing.
+    let honest = index_for(
+        "chain-ok",
+        vec![
+            Entry::Dir {
+                path: "sub".into(),
+                mode: 0o755,
+                mtime: 0,
+            },
+            Entry::Dir {
+                path: "data".into(),
+                mode: 0o755,
+                mtime: 0,
+            },
+            Entry::Symlink {
+                path: "sub/link".into(),
+                target: "..".into(),
+            },
+            Entry::Symlink {
+                path: "e".into(),
+                target: "sub/link/data".into(),
+            },
+        ],
+    );
+    honest
+        .validate()
+        .expect("a chain that stays inside the root must still be accepted");
+}
+
+/// Mutually-referential symlinks terminate with an error instead of looping
+/// forever — resolution is bounded, like the kernel's own `ELOOP`.
+#[test]
+fn symlink_cycle_terminates() {
+    let cyclic = index_for(
+        "cycle",
+        vec![
+            Entry::Symlink {
+                path: "a".into(),
+                target: "b".into(),
+            },
+            Entry::Symlink {
+                path: "b".into(),
+                target: "a".into(),
+            },
+        ],
+    );
+    let err = cyclic.validate().expect_err("a symlink cycle must error");
+    assert!(
+        format!("{err}").contains("hops"),
+        "should report the hop budget: {err}"
+    );
+}
+
+/// Two entries claiming one path let a snapshot destroy its own output — and,
+/// with a `Dir` first, turn a directory into a file.
+#[test]
+fn duplicate_entry_paths_rejected() {
+    let dup = index_for(
+        "dup",
+        vec![
+            Entry::Dir {
+                path: "x".into(),
+                mode: 0o755,
+                mtime: 0,
+            },
+            Entry::Symlink {
+                path: "x".into(), // the same path, claimed twice
+                target: "y".into(),
+            },
+        ],
+    );
+    let err = dup
+        .validate()
+        .expect_err("duplicate entry paths must be rejected");
+    assert!(
+        format!("{err}").contains("duplicate entry path"),
+        "wrong diagnosis: {err}"
+    );
+
+    // Discriminating power: distinct paths that merely share a prefix are fine.
+    index_for(
+        "nodup",
+        vec![
+            Entry::Dir {
+                path: "x".into(),
+                mode: 0o755,
+                mtime: 0,
+            },
+            Entry::Symlink {
+                path: "x/y".into(),
+                target: "z".into(),
+            },
+        ],
+    )
+    .validate()
+    .expect("distinct paths sharing a prefix must be accepted");
+}
+
 /// An index whose root_hash doesn't match its entries is rejected at fetch.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn forged_root_hash_rejected() {
@@ -338,6 +476,185 @@ async fn wrong_content_chunk_ignored() {
     assert!(matches!(err, BlobError::NotFound(_)), "{err}");
     assert!(!dest.path().join("f.bin").exists());
     assert!(store.hashes().unwrap().is_empty(), "nothing stored");
+
+    srv.abort();
+    session.close().await.unwrap();
+}
+
+/// An index entry that lands on an existing *directory* must not silently
+/// `rm -rf` it. Materialization is in place, so the destination legitimately
+/// holds data the caller cares about; deleting a subtree is a decision the
+/// caller makes, not one an index makes for them.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn existing_directory_is_not_silently_destroyed() {
+    let session = open_session().await;
+    let p = unique_prefix();
+    let store_prefix = format!("{p}/store");
+    let tree_prefix = format!("{p}/tree");
+
+    let payload = b"replacement".to_vec();
+    let payload_hash = Hash::of(&payload);
+    let chunk_key = zblob::store_key(&store_prefix, Hash::ALGO, &payload_hash);
+    // A file entry named exactly like a directory the caller already has.
+    let index = index_for(
+        "clobber",
+        vec![Entry::File {
+            path: "Documents".into(),
+            mode: 0o644,
+            mtime: 0,
+            size: payload.len() as u64,
+            chunks: vec![zblob::ChunkRef {
+                hash: payload_hash,
+                len: payload.len() as u32,
+            }],
+        }],
+    );
+    let srv = fake_tree_server(
+        session.clone(),
+        tree_prefix.clone(),
+        "clobber",
+        wire::encode(&index).unwrap(),
+        vec![(chunk_key, payload.clone())],
+    )
+    .await;
+
+    // A destination that already holds something valuable.
+    let dest = tempfile::tempdir().unwrap();
+    std::fs::create_dir(dest.path().join("Documents")).unwrap();
+    std::fs::write(dest.path().join("Documents/thesis.txt"), b"years of work").unwrap();
+
+    let store: Arc<dyn ContentStore> = Arc::new(MemoryStore::new());
+    let err = test_client(session.clone(), &store_prefix, &tree_prefix)
+        .download_tree(
+            &DownloadRequest::new("clobber"),
+            dest.path(),
+            &store,
+            &(),
+            &CancelToken::new(),
+        )
+        .await
+        .expect_err("replacing a directory must be refused by default");
+    assert!(matches!(err, BlobError::Protocol(_)), "{err}");
+    assert_eq!(
+        std::fs::read(dest.path().join("Documents/thesis.txt")).unwrap(),
+        b"years of work",
+        "the pre-existing subtree must survive"
+    );
+
+    // Discriminating power: the same index succeeds once the caller opts in.
+    // Without this, the assertion above would also pass if download_tree were
+    // simply broken.
+    let dest2 = tempfile::tempdir().unwrap();
+    std::fs::create_dir(dest2.path().join("Documents")).unwrap();
+    std::fs::write(dest2.path().join("Documents/thesis.txt"), b"years of work").unwrap();
+    let permissive = TreeClient::builder(session.clone(), &store_prefix, &tree_prefix)
+        .query_timeout(Duration::from_secs(3))
+        .materialize_policy(zblob::MaterializePolicy::default().replace_directories(true))
+        .build();
+    let store2: Arc<dyn ContentStore> = Arc::new(MemoryStore::new());
+    permissive
+        .download_tree(
+            &DownloadRequest::new("clobber"),
+            dest2.path(),
+            &store2,
+            &(),
+            &CancelToken::new(),
+        )
+        .await
+        .expect("an opted-in caller may replace the directory");
+    assert_eq!(
+        std::fs::read(dest2.path().join("Documents")).unwrap(),
+        payload
+    );
+
+    srv.abort();
+    session.close().await.unwrap();
+}
+
+/// Mode bits come off the wire, so setuid/setgid/sticky are masked unless the
+/// caller explicitly asks to restore them (tar and rsync gate this the same
+/// way). Without the mask, a privileged extraction of an index with
+/// attacker-chosen content yields a setuid-root binary.
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn setid_bits_are_masked_unless_requested() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let session = open_session().await;
+    let p = unique_prefix();
+    let store_prefix = format!("{p}/store");
+    let tree_prefix = format!("{p}/tree");
+
+    let payload = b"#!/bin/sh\nid\n".to_vec();
+    let payload_hash = Hash::of(&payload);
+    let chunk_key = zblob::store_key(&store_prefix, Hash::ALGO, &payload_hash);
+    let index = index_for(
+        "setuid",
+        vec![Entry::File {
+            path: "rooted".into(),
+            mode: 0o104755, // regular file, setuid, rwxr-xr-x
+            mtime: 0,
+            size: payload.len() as u64,
+            chunks: vec![zblob::ChunkRef {
+                hash: payload_hash,
+                len: payload.len() as u32,
+            }],
+        }],
+    );
+    let srv = fake_tree_server(
+        session.clone(),
+        tree_prefix.clone(),
+        "setuid",
+        wire::encode(&index).unwrap(),
+        vec![(chunk_key, payload.clone())],
+    )
+    .await;
+
+    let dest = tempfile::tempdir().unwrap();
+    let store: Arc<dyn ContentStore> = Arc::new(MemoryStore::new());
+    test_client(session.clone(), &store_prefix, &tree_prefix)
+        .download_tree(
+            &DownloadRequest::new("setuid"),
+            dest.path(),
+            &store,
+            &(),
+            &CancelToken::new(),
+        )
+        .await
+        .expect("the snapshot itself is legitimate; only the bit is refused");
+    let mode = std::fs::metadata(dest.path().join("rooted"))
+        .unwrap()
+        .permissions()
+        .mode();
+    assert_eq!(mode & 0o7000, 0, "setuid/setgid/sticky must be masked");
+    assert_eq!(mode & 0o777, 0o755, "ordinary permissions must survive");
+
+    // Discriminating power: with the opt-in, the bit is restored — so the
+    // assertion above is about the mask, not about set_mode being a no-op.
+    let dest2 = tempfile::tempdir().unwrap();
+    let store2: Arc<dyn ContentStore> = Arc::new(MemoryStore::new());
+    TreeClient::builder(session.clone(), &store_prefix, &tree_prefix)
+        .query_timeout(Duration::from_secs(3))
+        .materialize_policy(zblob::MaterializePolicy::default().restore_setid(true))
+        .build()
+        .download_tree(
+            &DownloadRequest::new("setuid"),
+            dest2.path(),
+            &store2,
+            &(),
+            &CancelToken::new(),
+        )
+        .await
+        .expect("opted-in restore");
+    let mode2 = std::fs::metadata(dest2.path().join("rooted"))
+        .unwrap()
+        .permissions()
+        .mode();
+    assert_eq!(
+        mode2 & 0o4000,
+        0o4000,
+        "opt-in must actually restore setuid"
+    );
 
     srv.abort();
     session.close().await.unwrap();
