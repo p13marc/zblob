@@ -298,6 +298,37 @@ pub fn store_key(prefix: &str, algo: &str, hash: &Hash) -> String {
     format!("{prefix}/{algo}/{hash}")
 }
 
+/// Split a query key expression into the segments that follow `prefix`,
+/// matching the prefix **positionally** rather than by literal string
+/// stripping — the tier-2 counterpart of [`parse_id`].
+///
+/// A client may legitimately query a wildcard-origin prefix (the sanctioned
+/// probe form), and a server declared on a *concrete* prefix still has to
+/// recognise its own keys inside such a query. Literal `strip_prefix` cannot:
+/// it matches only when the client spelled the prefix exactly as the server
+/// did, so a wildcard-origin tier-2 query validated on the client and was then
+/// answerable by nothing at all — a silent total failure, which is the bug
+/// class `parse_id` was rewritten to fix for tier 1.
+///
+/// As there, a `**` inside the prefix region is refused: it spans an unknown
+/// number of segments, so what follows is genuinely ambiguous.
+pub fn parse_tier2_tail<'k>(prefix: &str, key_expr: &'k str) -> Option<Vec<&'k str>> {
+    let p: Vec<&str> = prefix.split('/').collect();
+    let k: Vec<&str> = key_expr.split('/').collect();
+    if k.len() <= p.len() {
+        return None;
+    }
+    for (want, got) in p.iter().zip(k.iter()) {
+        if got == &"**" {
+            return None; // ambiguous span
+        }
+        if want != got && !got.contains('*') {
+            return None;
+        }
+    }
+    Some(k[p.len()..].to_vec())
+}
+
 /// Key of a tree snapshot index (Tier 2): `<prefix>/<id>`.
 pub fn tree_key(prefix: &str, id: &str) -> String {
     format!("{prefix}/{id}")
@@ -421,6 +452,40 @@ mod key_tests {
         );
         // The id itself may never be a wildcard.
         assert_eq!(parse_id("p", "p/*/manifest"), None);
+    }
+
+    #[test]
+    fn tier2_tail_matches_positionally() {
+        // The ordinary case.
+        assert_eq!(
+            parse_tier2_tail("v1/host-a/@blob/store", "v1/host-a/@blob/store/blake3/abc")
+                .as_deref(),
+            Some(&["blake3", "abc"][..])
+        );
+        // A wildcard origin stands in for the literal segment — the whole
+        // point: the client cannot name the origin, the server still must
+        // recognise its own key.
+        assert_eq!(
+            parse_tier2_tail("v1/host-a/@blob/store", "v1/*/@blob/store/blake3/abc").as_deref(),
+            Some(&["blake3", "abc"][..])
+        );
+        // Tree keys have a one-segment tail.
+        assert_eq!(
+            parse_tier2_tail("v1/host-a/@blob/tree", "v1/*/@blob/tree/deadbeef").as_deref(),
+            Some(&["deadbeef"][..])
+        );
+        // `**` spans an unknown number of segments, so the tail is ambiguous.
+        assert_eq!(
+            parse_tier2_tail("v1/host-a/@blob/store", "v1/**/blake3/abc"),
+            None
+        );
+        // A non-matching literal segment is still a miss.
+        assert_eq!(
+            parse_tier2_tail("v1/host-a/@blob/store", "v1/host-b/@blob/store/blake3/abc"),
+            None
+        );
+        // Nothing after the prefix.
+        assert_eq!(parse_tier2_tail("p/q", "p/q"), None);
     }
 
     #[test]

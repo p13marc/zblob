@@ -824,9 +824,10 @@ async fn serve_chunk_query(inner: &TreeInner, query: zenoh::query::Query) -> Res
 
 async fn serve_index_query(inner: &TreeInner, query: zenoh::query::Query) -> Result<()> {
     let key = query.key_expr().as_str().to_string();
-    let Some(id) = key.strip_prefix(&format!("{}/", inner.tree_prefix)) else {
+    let Some(tail) = crate::parse_tier2_tail(&inner.tree_prefix, &key) else {
         return Ok(());
     };
+    let [id] = tail[..] else { return Ok(()) };
     let Some(index) = inner.index.read().await.get(id).cloned() else {
         return Ok(()); // unknown id → client times out → NotFound.
     };
@@ -842,8 +843,8 @@ async fn serve_index_query(inner: &TreeInner, query: zenoh::query::Query) -> Res
 /// Parse the chunk hash from a `<store_prefix>/<algo>/<hex>` key; only the
 /// crate's algorithm is served.
 fn parse_store_key(store_prefix: &str, key: &str) -> Option<Hash> {
-    let rest = key.strip_prefix(store_prefix)?.strip_prefix('/')?;
-    let (algo, hex) = rest.split_once('/')?;
+    let tail = crate::parse_tier2_tail(store_prefix, key)?;
+    let [algo, hex] = tail[..] else { return None };
     if algo != Hash::ALGO {
         return None;
     }

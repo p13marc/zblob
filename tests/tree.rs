@@ -850,3 +850,58 @@ async fn a_sweep_cannot_collect_an_in_flight_download() {
     handle.shutdown().await.unwrap();
     session.close().await.unwrap();
 }
+
+/// A wildcard-origin tier-2 prefix must be *answerable*, not merely
+/// acceptable.
+///
+/// `TreeClient` validated its prefixes with the rule that permits a
+/// single-segment origin wildcard, while the server resolved both index and
+/// chunk keys by literal `strip_prefix`. So such a client passed validation
+/// and then every query went unanswered by every server — a silent total
+/// failure, and exactly the bug class `parse_id` was rewritten to fix for
+/// tier 1. Either the shape works or it is refused; it must not validate and
+/// then be unserviceable.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_wildcard_origin_tier2_prefix_is_answerable() {
+    let session = open_session().await;
+    let base = unique_prefix();
+    // The server owns a concrete origin segment…
+    let store_prefix = format!("{base}/host-a/store");
+    let tree_prefix = format!("{base}/host-a/tree");
+    // …and the client does not know which origin holds the snapshot.
+    let store_query = format!("{base}/*/store");
+    let tree_query = format!("{base}/*/tree");
+
+    let src = tempfile::tempdir().unwrap();
+    let body = common::pseudo_random(50_000, 71);
+    std::fs::write(src.path().join("wide.bin"), &body).unwrap();
+    let server_store: Arc<dyn ContentStore> = Arc::new(MemoryStore::new());
+    let index = build_tree(src.path(), "anyorigin", &small_cdc(), &*server_store).unwrap();
+    let server = TreeServer::new(
+        session.clone(),
+        store_prefix.clone(),
+        tree_prefix.clone(),
+        server_store,
+    );
+    server.register(index.clone()).await;
+    let handle = server.spawn().await.unwrap();
+
+    let dest = tempfile::tempdir().unwrap();
+    let client_store: Arc<dyn ContentStore> = Arc::new(MemoryStore::new());
+    TreeClient::builder(session.clone(), &store_query, &tree_query)
+        .query_timeout(Duration::from_secs(5))
+        .build()
+        .download_tree(
+            &DownloadRequest::pinned("anyorigin", index.root_hash),
+            dest.path(),
+            &client_store,
+            &(),
+            &CancelToken::new(),
+        )
+        .await
+        .expect("a wildcard-origin prefix must reach the server that owns the id");
+    assert_eq!(std::fs::read(dest.path().join("wide.bin")).unwrap(), body);
+
+    handle.shutdown().await.unwrap();
+    session.close().await.unwrap();
+}
