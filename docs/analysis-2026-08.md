@@ -462,6 +462,24 @@ costs a 30 s timeout. v3 adds a tiny tagged reply
 Fan-out probes ignore it (absence of a manifest already means "not here");
 single-origin fetches convert it to an immediate `NotFound`.
 
+> 🔴 **[rev] Rejected — the premise is false, and this was measured.** An
+> unknown id does *not* cost the timeout. A Zenoh query finalizes once every
+> matching queryable has completed, and completing without replying is
+> immediate. Against a 30 s `query_timeout`: ~1.0 ms with a server present that
+> does not own the id, ~0.4 ms with no server at all, ~1.4 ms across a
+> wildcard fan-out over two servers.
+>
+> The belief came from a code comment (`// unknown id → client times out →
+> NotFound.`) that was never checked. Both instances of it are now corrected
+> and the measurement is a test.
+>
+> The cost of having shipped it would not have been only the wire message: this
+> section itself notes the reply would need "authoritative only when no
+> positive reply arrives", a subtlety introduced entirely to serve a
+> non-problem. Silence is the correct way to say "not mine", and it is what
+> lets several servers share one prefix — which zensight's netring already
+> relies on.
+
 ### 4.9 Chunk-size default
 
 Zenoh fragments >64 KiB messages hop-by-hop and one lost fragment drops the

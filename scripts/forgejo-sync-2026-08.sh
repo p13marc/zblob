@@ -219,6 +219,40 @@ Finally, one deliberate divergence worth recording: iroh's equivalent
 rule for a bus with many partial holders. Keep it, and say why.
 EOF
 
+comment 53 <<'EOF'
+**Closing: the premise is false. Measured.**
+
+This issue rests on `serve_one`'s comment — `// unknown id → client times out
+→ NotFound.` — and on the same comment in `serve_index_query`. Both are wrong,
+and the negative reply designed to work around them is not needed.
+
+A Zenoh query finalizes once **every matching queryable has completed**, and a
+queryable that drops the `Query` without replying completes *immediately*. So
+silence does not cost the timeout. Measured against a 30-second
+`query_timeout`:
+
+| shape | elapsed |
+|---|---|
+| a server is listening on the prefix, but does not own the id | ~1.0 ms |
+| nothing is listening on the prefix at all | ~0.4 ms |
+| a wildcard-origin fan-out across two servers, neither holding it | ~1.4 ms |
+| the same fan-out through `probe()` | ~1.3 ms |
+
+That is the whole justification for `ENC_NACK` gone. And the feature was not
+free: the issue itself notes it would need the rule "a nack is authoritative
+only when no positive reply arrives", precisely because several servers may
+share a prefix — a subtlety introduced to solve a problem that does not exist.
+
+What was actually wrong here is the two comments, which are now corrected, and
+the absence of a test pinning the behaviour. Both are fixed: the measurement
+above is `an_unknown_id_fails_fast_not_on_the_timeout` in `tests/coverage.rs`,
+so anyone who believes the old story again has something to run. `BlobServer`'s
+docs now state it too, since silence-means-not-mine is what makes sharing a
+prefix work at all.
+
+No RFC amendment is needed for tier 1's endpoints as a result.
+EOF
+
 # ----------------------------------------------------------- new issues ----
 
 create 'Materialization is destructive and mode-unsafe: a hostile index can delete subtrees and set setuid' \
