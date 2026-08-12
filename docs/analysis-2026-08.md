@@ -6,8 +6,10 @@
 
 ## Context
 
-zblob 0.2 (wire v2) shipped 2026-07-31 and is consumed by zensight, tcgui, and
-zenkey (`zenkey-fleet`/`zenctl`/`zengui`), all on default features. The trigger
+zblob 0.2 (wire v2) shipped 2026-07-29 and is consumed by zensight, tcgui, and
+zenkey (`zenkey-fleet`/`zenctl`/`zengui`), all on default features — which for
+this crate is the *empty* set, so `zstd`, `tracing`, `fanout` and `encryption`
+are not compiled anywhere in the fleet. The trigger
 for this report is **zblob#39** — a public, verifying single-chunk fetch for
 `store/<algo>/<hash>` — filed from zenkey's Explorer Suite work (**zenkey#111**),
 where tier-2 keys are today *listable* and *addressable* but neither probeable
@@ -39,6 +41,15 @@ Recommendation in one line: ship an **0.3 that is API-additive** (closes #39
 and everything the explorers need, no wire change), then a **wire v3 + RFC
 v1.9** release that unifies the two tiers around batched, verified range
 fetches and makes probe-then-fetch total across all three tiers.
+
+> **Superseded, 2026-08-12.** An independent review of this report and of the
+> issues filed from it (#39–#55) revised three of its conclusions and found
+> twenty defects it had missed. The corrections are inline below, marked
+> **[rev]**; the revised plan collapses 0.3 and 0.4 into a single breaking
+> **0.3.0 = wire v3**. Two of the corrections matter enough to state here:
+> §4.1's batched-fetch key shape **does not work as written** (see §4.1), and
+> the RFC amendments are **v1.17**, not v1.9 — the zenkey RFC set was already
+> at v1.16 when this was written.
 
 ---
 
@@ -100,8 +111,19 @@ Full survey notes are in the appendix; the conclusions that matter:
   concatenation of 32-byte hashes — collections as plain blobs, one request
   streams the seq then every referenced blob) and the **ticket** (one compact
   string = root + format + provider hint). Both transfer well to a bus.
-- **FastCDC** stays the right CDC (the `fastcdc` crate is mature; SuperCDC /
-  UltraCDC / VectorCDC have no maintained Rust crates and single-digit-% gains).
+- **FastCDC** stays the right CDC — but **[rev]** the stated reason was wrong.
+  SuperCDC / UltraCDC / VectorCDC are *not* single-digit-% improvements:
+  [VectorCDC](https://arxiv.org/pdf/2508.05797) (arXiv 2508.05797, 2025-08)
+  measures 8.35×–26.2× over existing vector-accelerated CDC and up to 207× over
+  unaccelerated, using hashless SIMD boundary detection. The correct reason to
+  stay is that **no maintained Rust implementation exists** (`seq_chunking`,
+  `chunkrs`, `clast`, `mincatcdc` are all single-author preview crates;
+  `cdchunking` and `gearhash` are stale since 2020) **and chunking is not the
+  bottleneck — the bus is**. **[rev]** One live hazard: `fastcdc = "4"` admits
+  **4.0.0**, whose floored-vs-rounded `log2` change silently moves cut points
+  for any non-power-of-two `avg_size`, and which downgraded size-bound
+  `assert!`s to `debug_assert!`. A consumer resolving 4.0.0 would compute a
+  *different tree root for identical bytes*. Pin `4.0.1`.
   CDC on the one-shot artifact path remains wrong — that's a rolling-hash pass
   on an embedded sensor for a blob sent once. 0.2's split (fixed grid for tier
   1, seeded FastCDC for tier 2) is correct; keep it.
@@ -120,9 +142,22 @@ Full survey notes are in the appendix; the conclusions that matter:
   for *if* sealed-on-bus is ever wanted; the RFC's current ban stays right
   until then.
 - **Zenoh 1.8/1.9**: replies inherit the query's QoS since 1.8 (0.2 already
-  exploits this — client-side `Priority::DataLow` default); 1.9 adds declared
-  **`Querier`s** (publisher-like optimization for repeated GETs to one
-  keyexpr — exactly the shape of a chunk-fetch loop); wire batches are 64 KiB
+  exploits this — client-side `Priority::DataLow` default; note the 1.8
+  corollary that `Reply::priority`/`congestion_control` setters are deprecated
+  and have no effect, so the *query's* congestion control is now the only
+  backpressure lever on the reply path). **[rev]** Declared **`Querier`s** are
+  *not* a 1.9 feature — they landed in 1.1.0 (2024-12) and were stabilized in
+  1.5.0 (2025-07), and `declare_querier` is not `unstable`-gated. What 1.9
+  actually contributes to bulk transfer is **per-priority QUIC streams**, which
+  removes head-of-line blocking between priorities and so strengthens the case
+  for `DataLow` on bulk traffic. **[rev]** A caution before adopting a
+  `Querier` here: the *drop-with-pending-query* deadlock fix
+  ([PR #2635](https://github.com/eclipse-zenoh/zenoh/pull/2635)) is on `main`
+  and **not in 1.9.0**. **[rev]** Also newly relevant and already available to
+  this crate (it enables `zenoh/unstable`): query
+  `CancellationToken` (since 1.7.0), which can abort a want-list GET the moment
+  another holder empties the set, and `Querier::matching_status()`. Wire
+  batches are 64 KiB
   and larger messages fragment hop-by-hop, so one lost fragment costs the whole
   message — an argument for **keeping transfer chunks in the 64–512 KiB band**,
   not multi-MB. `zenoh-plugin-storage-manager` backends (RocksDB/S3) remain the
@@ -278,13 +313,40 @@ batch GET  <store_prefix>/<algo>/batch?v=3      payload: postcard WantList { ver
 replies    <store_prefix>/<algo>/<hex>          one container frame per hash the holder has, existing framing
 ```
 
+> **[rev] As written above, this does not work.** `…/<algo>/batch` and
+> `…/<algo>/<hex>` are **disjoint** key expressions, and Zenoh enforces
+> intersection on the *server*: under the default `ReplyKeyExpr::MatchingQuery`,
+> `Query::reply()` fails with "does not intersect with query"
+> (`zenoh-1.9.0/zenoh/src/api/queryable.rs:553`) — once per reply, loudly.
+>
+> The fix is `.accept_replies(ReplyKeyExpr::Any)` on the GET, **stable since
+> Zenoh 1.8.0**, carried as the `_anyke` selector parameter and readable
+> server-side via `Query::accepts_replies()`. The client must then check each
+> reply key itself, which is nearly free since it verifies content anyway.
+>
+> The alternative floated below — "make the request key a wildcard" — must be
+> **rejected outright, not decided later**: a GET on `<store_prefix>/<algo>/**`
+> would make every router-hosted Zenoh storage **dump its entire content
+> store** in one query, and `docs/router-storage.md` makes storages a
+> first-class tier. Replying under `…/batch/<hex>` is also wrong: it breaks the
+> single-chunk cacheability that is the whole point of the reply key.
+>
+> **[rev] A router storage never answers `batch` at all** — it serves by key,
+> and no key `…/<algo>/batch` exists in it — so it stays silent. The client
+> must therefore fall back to per-chunk GETs for every hash the batch round
+> left unanswered. That fallback is not a nicety: it is what keeps the
+> publish-then-exit tier working.
+
 - The reply key is the ordinary store key, so replies remain individually
   verifiable, cacheable, and identical to single-chunk replies — a router
   storage that materialized them can still serve singles.
 - A holder answers only the hashes it has; the client's want-set shrinks as
   verified chunks land (the same "resume = re-derive the query from the holes"
   shape as tier 1's `ranges`).
-- Issue batches through a declared **`Querier`** (Zenoh 1.9) per store prefix.
+- **[rev]** Issue batches through a plain `session.get()` with
+  `accept_replies(Any)`, **not** a declared `Querier` — see §2: the Querier
+  drop-with-pending-query deadlock fix is not in 1.9.0. Revisit when it ships;
+  the chunk-fetch loop is exactly the shape a Querier is for.
 - `MAX_RANGE_SPANS`-style cap on `hashes.len()`, validated before I/O, exactly
   like `server.rs:560-570`.
 
@@ -331,6 +393,16 @@ content-addressed data in the store** —
 
 `root_hash` stays the mtime-free canonical digest — identity is unchanged;
 only the *container* of the index moves.
+
+**[rev] Cap and shard it, don't just move it.** restic caps each index *file*
+at 8 MiB and keeps "an arbitrary number of index files containing information
+on non-disjoint sets of packs" — a discipline designed around exactly the
+failure this section is fixing. Replacing one unbounded monolithic reply with
+one unbounded blob on a fragment-fragile transport keeps the ceiling;
+`index_chunks` should carry several bounded shards. **[rev]** Use **fixed**
+chunking for index bytes, not CDC: the CDC parameters live *inside* the index,
+so CDC-chunking the index is circular, and the index is written once — CDC buys
+nothing on a blob nobody edits in place.
 
 ### 4.4 One version marker, one extension point
 
@@ -417,15 +489,25 @@ So the next reader doesn't re-litigate:
 
 ---
 
-## 5. RFC v1.9 amendments (zenkey side)
+## 5. RFC amendments (zenkey side) — **v1.17**, not v1.9 **[rev]**
+
+*The zenkey RFC set was already at **v1.16** (2026-08-12) when this was written;
+v1.9 shipped 2026-08-08. The amendments below are **v1.17**. They are already
+decomposed as zenkey #142–#147 under epic #141 (whose title carries the same
+stale number and needs retitling).*
 
 The v3 wire changes touch RFC 07 §§2.2, 2.4, 2.5 and RFC 08's `[[blob]]` kind:
 
 1. **Reconcile §2.2 with the actual query shape.** The table frames
    `<id>/slice/<i>` as a queryable you GET; wire v2 *requires* GETting
    `<prefix>/<id>/**?ranges=…` with `slice/<i>` as the **reply** key
-   (`zblob/src/lib.rs:13-16,46-49` — a bare-`<id>` GET silently rejects every
-   slice under `ReplyKeyExpr::MatchingQuery`). The table should describe
+   (`zblob/src/lib.rs:13-16,46-49` — a bare-`<id>` GET rejects every slice
+   under `ReplyKeyExpr::MatchingQuery`). **[rev]** Not *silently*, and the rule
+   is **intersection**, not equality: the failure surfaces as a server-side
+   `reply()` error naming the non-intersecting key
+   (`zenoh-1.9.0/zenoh/src/api/queryable.rs:553`), so a consumer that gets this
+   wrong sees error logs on the *serving* origin, not a client timeout. The
+   table should describe
    request keys and reply keys as separate columns. Latent today; mandatory
    the moment §2.2 is reopened for v3.
 2. **Add the tier-2 probe (§4.2) to §2.5**, making probe-then-fetch total
@@ -459,6 +541,71 @@ The 0.3/0.4 split matters: everything the explorers need is wire-compatible,
 and shipping it first means the v3 design gets field feedback from *three*
 working tier-2 consumers instead of zero.
 
+> **[rev] The split was dropped.** All three consumers belong to the same
+> author, so "field feedback from three working consumers" is really "the same
+> person, twice" — what the split actually buys is two migrations instead of
+> one. §3 and §4 ship together as a single breaking **0.3.0 = wire v3**, and
+> §7 below joins them.
+
+---
+
+## 7. What this report missed **[rev]**
+
+Twenty defects found by re-reading 0.2 against this report, each verified in
+the source. They are not refinements of §3.5 — several are security defects in
+a *published* crate, and the tier-2 materialization path (S1–S3) is the one
+zensight uses in production today.
+
+### Materialization is not safe against a hostile index
+
+| | Defect | Where |
+|---|---|---|
+| **S1** | `remove_existing` calls `remove_dir_all` and runs for every `File`/`Hardlink`/`Symlink` entry, so an index entry named `Documents` **recursively deletes** `<dest>/Documents`. Materialization being in-place is documented (`tree.rs:928-935`); being *destructive* is not. | `tree.rs:1233-1241`, called at `:1148,1190,1207` |
+| **S2** | `set_mode` applies index-supplied mode bits raw, **including setuid/setgid/sticky**. A privileged extraction of an attacker-chosen index yields a setuid-root binary. tar and rsync both gate this behind an explicit flag. | `tree.rs:1244-1249`, `:1165`, `:1225` |
+| **S3** | Symlink confinement is purely lexical, and a symlink **chain** defeats it: `sanitize_symlink_target` counts every `Normal` component as +1 depth even when that component is a symlink created by the same index. `[Symlink{"sub/link" → ".."}, Symlink{"e" → "sub/link/../../etc/passwd"}]` passes the depth check and resolves above the root. | `paths.rs:40-69`; `tests/tree_security.rs` covers only the single-level case |
+| **S10** | Tier 2 has **no end-to-end content verification** and `verify_on_read` defaults off: `reconstruct_tree` checks only `bytes.len() != c.len`, and `root_hash` covers the entry list, not chunk bytes. Tier 1's premise — every byte verified before it lands — has no tier-2 analogue. | `store.rs:107`, `tree.rs:1151-1158` |
+
+### The publish tier does not keep its promise
+
+| | Defect | Where |
+|---|---|---|
+| **S5** | `publish_chunk`/`publish_index` never set `CongestionControl::Block`, and **publications default to `Drop`** — which is precisely why `fanout.rs:152` sets it. Bulk chunk PUTs into a router storage are silently sheddable, and the read-back settle samples only ~7 keys, so a snapshot missing chunks in between still returns `Ok`. The whole point of this tier is "PUT, confirm, exit". | `publish.rs:48-55,86-91,113-126` |
+| **S6** | `publish_store` iterates `store.hashes()`, so `publish_snapshot` pushes **every unrelated chunk in the local store** — including other snapshots' — into a shared router storage. It should iterate `index.needed_chunks()`. | `publish.rs:60-74` |
+
+### Unbounded remote-driven resource use
+
+| | Defect | Where |
+|---|---|---|
+| **S7** | No size bound before decode: `try_unpack`'s `TAG_RAW` arm does `rest.to_vec()` at any length (`MAX_UNPACKED` guards only the zstd branch), and `fetch_one_chunk` never compares a reply against the index's declared `ChunkRef::len` — which `validate()` already bounded. ×16 concurrent fetches. | `compress.rs:89,96-98`; `tree.rs:1100` |
+| **S8** | Tier 2 has no `max_blob_size` analogue: a 64 MiB index can reference ~1.6 M `ChunkRef`s × 16 MiB `cdc.max`, all fetched and `put` with no ceiling. Into a `MemoryStore` that is straight RAM exhaustion. Tier 1 bounds this at `client.rs:96`. | `tree.rs:754-759,936-975` |
+| **S14** | Both serve loops `tokio::spawn` per inbound query and acquire the in-flight permit *inside* the task, so queued tasks accumulate unbounded, each holding its `Query` — and a `push/slice` query holds a full chunk. The permit is also taken before `PushPolicy` is consulted. | `server.rs:466-472,497-500,648`; `tree.rs:660-679,687,714` |
+| **S15** | `Availability::count()` sums the whole `Vec<u8>` without masking padding bits, and nothing validates `bits.len()` against `chunk_count` on decode. `ResumeState::received()` masks precisely because a corrupt bitfield must not over-report. | `wire.rs:73-75`, `client.rs:363-369` |
+| **S18** | The fanout publisher retains every slice sample for the handle's lifetime (O(blob) resident), and the receiver buffers up to **256 MiB of unverified frames** from an unauthenticated publisher before any manifest arrives — which need never arrive. | `fanout.rs:88,157,316-322` |
+
+### Correctness
+
+| | Defect | Where |
+|---|---|---|
+| **S4** | **AEAD nonce reuse.** The nonce derives from `(key, chunk hash)` only, and `DirStore::put` unconditionally re-packs, re-seals and replaces. Re-`put` one chunk under a different `ChunkCompression` — or a different zstd *level* — and two distinct plaintexts are sealed under one (key, nonce): XChaCha20 keystream reuse plus Poly1305 one-time-key reuse. Fix by binding the nonce to a digest of the container, which keeps idempotent re-puts idempotent. | `crypt.rs:53-57`, `store.rs:256-285` |
+| **S9** | The push client treats **any** `reply_err` from **any** responder as fatal, violating the crate's own fact 3. With two servers on one prefix — the arrangement zensight's netring relies on — one answering "push not enabled" aborts an upload the other already accepted. | `client.rs:449-453,539-544` |
+| **S11** | `build_tree` never validates its own output and records symlink targets verbatim from `read_link`, so a source tree containing an escaping symlink yields a snapshot that builds, registers and publishes fine and that **every** client rejects. Same failure shape as the leading-`@` id lesson `manifest.rs:95-102` documents at length. | `tree.rs:336-356,418-424` |
+| **S12** | `TransferChunks::count()` truncates (`div_ceil(...) as u32`) instead of erroring, so a large enough configured `max_blob_size` yields count 0 — and an all-zero file of the claimed length gets renamed into place as "verified". | `chunk.rs:85-87` |
+| **S13** | `download_tree` never takes a `TempTag`, so a concurrent `gc::sweep` deletes chunks a running download already fetched. The protection mechanism exists, is documented, and has no caller. | `gc.rs:126-153`, `tree.rs:936-975` |
+| **S16** | `Overwrite::Refuse` is checked *after* the transfer, and the `.part` is preallocated to the remote's `total_len` before any refusal. The fanout tier has the same bug **and then deletes the `.part`**, contradicting `Overwrite::Refuse`'s own documentation. | `client.rs:652-653,690`; `fanout.rs:418-428` |
+| **S17** | `register_file` writes `<source>.obao4` into the caller's directory, unasked, and nothing ever removes it; push spool files are likewise never reclaimed. | `server.rs:342-348,425-427,966-972` |
+| **S19** | `fastcdc = "4"` admits 4.0.0, which silently moved cut points for non-power-of-two `avg_size`. A consumer resolving it computes a **different tree root for identical bytes**. Pin `4.0.1`. | `Cargo.toml:29` |
+| **S20** | No incremental snapshot path: `build_tree` re-walks and re-chunks every file every time. `seed.rs` solves this for the *consumer*; the producer — an embedded sensor snapshotting repeatedly — has nothing. restic's parent-snapshot trick is the biggest producer-side win available. | `tree.rs:336-356,394-471` |
+
+Doc-truth items: `BlobError::HashMismatch`'s only producer is a *length* check
+(`tree.rs:1155`) and its doc advertises two behaviours that do not exist;
+`RootMismatch`'s doc claims nothing was written, contradicted by
+`finalize_push`; `validate_id` permits `.` and control characters.
+
+**The methodological point** is the same one 0.2 already paid for once
+(`CLAUDE.md`'s Tests section): none of these came from the test suite. They came
+from reading the code against its own documented invariants. S1, S2 and S3 sit
+directly under `tests/tree_security.rs`, which passes.
+
 ---
 
 ## Appendix — external references
@@ -468,5 +615,7 @@ working tier-2 consumers instead of zero.
 - casync: <https://0pointer.net/blog/casync-a-tool-for-distributing-file-system-images.html>, LWN: <https://lwn.net/Articles/726625/>; desync: <https://github.com/folbricht/desync>; OSTree repo anatomy: <https://ostreedev.github.io/ostree/repo/>; restic repo format: <https://restic.readthedocs.io/en/latest/100_references.html>; borg internals/security: <https://borgbackup.readthedocs.io/en/stable/internals/security.html>
 - IPFS UnixFS profiles (IPIP-499): <https://github.com/ipfs/specs/pull/499>
 - Convergent encryption pitfalls: <https://en.wikipedia.org/wiki/Convergent_encryption>; age STREAM spec: <https://github.com/codesoap/age-spec>
+- **[rev]** CDC-parameter extraction attacks (Alexeev, Percival, Zhang, 2025-04): <https://arxiv.org/abs/2504.02095> — extracts per-user chunking parameters from backup services and shows the resulting loss, *"including when these parameters are not set up at all"*. This is the evidence behind `CdcParams::with_seed`: an unseeded CDC over shared or sealed content is a demonstrated leak, not a theoretical one. It also strengthens §5's borg-style keyed-chunk-ID escape hatch.
+- **[rev]** VectorCDC (SIMD boundary detection, 2025-08): <https://arxiv.org/pdf/2508.05797>; DedupBench harness: <https://github.com/UWASL/dedup-bench>
 - Zenoh: 1.8 "Kiyohime" (reply QoS inheritance): <https://zenoh.io/blog/2026-03-18-zenoh-kiyohime/>; 1.9 "Longwang" (Querier everywhere): <https://zenoh.io/blog/2026-04-16-zenoh-longwang/>; storage manager: <https://zenoh.io/docs/manual/plugin-storage-manager/>; prior art zenoh-fs: <https://github.com/atolab/zenoh-fs>
 - BitTorrent v2 (per-file merkle, 16 KiB blocks): <https://www.bittorrent.org/beps/bep_0052.html>
