@@ -222,6 +222,26 @@ pub(crate) fn validate_query_prefix(prefix: &str) -> Result<()> {
     Ok(())
 }
 
+/// Validate a key prefix used to *upload* to (the push path).
+///
+/// Everything [`validate_query_prefix`] requires, plus **no wildcards**. A
+/// download may legitimately fan out — content is verified against a root, so
+/// whoever answers is fine. An upload cannot: it has exactly one destination,
+/// the receiving server spools state keyed by the id, and the push replies
+/// echo `query.key_expr()` verbatim — which for a wildcard query is a key
+/// *expression*, not a key. Fanning an upload out means several servers each
+/// spooling a partial copy while one of them drives the range set.
+pub(crate) fn validate_upload_prefix(prefix: &str) -> Result<()> {
+    validate_query_prefix(prefix)?;
+    if prefix.split('/').any(|seg| seg.contains('*')) {
+        return Err(BlobError::Protocol(format!(
+            "key prefix {prefix:?} must not contain wildcards when uploading — \
+             an upload has exactly one destination"
+        )));
+    }
+    Ok(())
+}
+
 /// Validate a key prefix used to *serve* or *publish* under (server side).
 ///
 /// Everything [`validate_query_prefix`] requires, plus **no wildcards**: a

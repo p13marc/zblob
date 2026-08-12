@@ -429,3 +429,116 @@ fn bulk_transfers_default_to_a_yielding_priority() {
         "Priority ordering changed; revisit the bulk default"
     );
 }
+
+/// A registered file that changes on disk must be diagnosed, not served.
+///
+/// The bao outboard is computed once at registration and every slice is proved
+/// against it. If the backing bytes move, each slice fails the *client's*
+/// verification — forever — and neither end can say why: the client sees only
+/// a rising rejected count and eventually `Incomplete`, the server sees
+/// nothing at all. One `stat` per query turns that into a single error on the
+/// side that can act on it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_mutated_source_is_diagnosed_not_served_forever() {
+    let session = open_session().await;
+    let prefix = unique_prefix();
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("mutable.bin");
+    let original = pseudo_random(MIN_CHUNK_SIZE as usize * 2, 31);
+    std::fs::write(&path, &original).unwrap();
+
+    let server = BlobServer::new(session.clone(), prefix.clone());
+    let manifest = server
+        .register_file(BlobSpec::new("mut").chunk_size(MIN_CHUNK_SIZE), &path)
+        .await
+        .unwrap();
+    let handle = server.spawn().await.unwrap();
+    let client = test_client(session.clone(), &prefix);
+
+    // Discriminating power first: while the file is untouched, it downloads.
+    let out = dir.path().join("before.bin");
+    client
+        .download_to(
+            &DownloadRequest::pinned("mut", manifest.root),
+            &out,
+            &(),
+            &CancelToken::new(),
+        )
+        .await
+        .expect("an unmodified source must serve normally");
+    assert_eq!(std::fs::read(&out).unwrap(), original);
+
+    // Now rewrite the backing file behind the server's back.
+    std::fs::write(&path, pseudo_random(MIN_CHUNK_SIZE as usize * 3, 32)).unwrap();
+
+    let out2 = dir.path().join("after.bin");
+    let err = client
+        .download_to(
+            &DownloadRequest::pinned("mut", manifest.root),
+            &out2,
+            &(),
+            &CancelToken::new(),
+        )
+        .await
+        .expect_err("a mutated source must not silently fail forever");
+    // The manifest itself is refused now, so this fails fast rather than
+    // grinding through the retry budget.
+    assert!(
+        matches!(err, zblob::BlobError::NotFound(_)),
+        "unexpected error: {err}"
+    );
+
+    handle.shutdown().await.unwrap();
+    session.close().await.unwrap();
+}
+
+/// Re-registering an id with different content is refused, matching the push
+/// path's hijack defence. Re-registering *identical* content stays a no-op, so
+/// idempotent registration keeps working.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn re_registration_cannot_silently_swap_content() {
+    let session = open_session().await;
+    let prefix = unique_prefix();
+    let server = BlobServer::new(session.clone(), prefix.clone());
+
+    let first = pseudo_random(4096, 41);
+    let spec = || BlobSpec::new("stable").chunk_size(MIN_CHUNK_SIZE);
+    let m1 = server
+        .register_source(spec(), Arc::new(MemoryBlobSource::new(first.clone())))
+        .await
+        .unwrap();
+
+    // Identical content: idempotent.
+    let m2 = server
+        .register_source(spec(), Arc::new(MemoryBlobSource::new(first.clone())))
+        .await
+        .expect("re-registering identical content must stay a no-op");
+    assert_eq!(m1.root, m2.root);
+
+    // Different content: refused, and the original keeps serving.
+    let err = server
+        .register_source(
+            spec(),
+            Arc::new(MemoryBlobSource::new(pseudo_random(4096, 42))),
+        )
+        .await
+        .expect_err("replacing an id's content must be refused");
+    assert!(matches!(err, zblob::BlobError::Protocol(_)), "{err}");
+
+    let handle = server.spawn().await.unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    let out = dir.path().join("still.bin");
+    test_client(session.clone(), &prefix)
+        .download_to(
+            &DownloadRequest::pinned("stable", m1.root),
+            &out,
+            &(),
+            &CancelToken::new(),
+        )
+        .await
+        .expect("the original registration must still serve");
+    assert_eq!(std::fs::read(&out).unwrap(), first);
+
+    handle.shutdown().await.unwrap();
+    session.close().await.unwrap();
+}

@@ -95,7 +95,7 @@ pub use publish::{
 };
 pub use server::{
     BlobServer, BlobServerBuilder, BlobSource, ErrorCallback, FileBlobSource, MemoryBlobSource,
-    PushPolicy, ReadAtSize, ServerHandle,
+    PushPolicy, ReadAtSize, ServerHandle, SourceFingerprint,
 };
 pub use store::{ContentStore, DirStore, MemoryStore};
 pub use tree::{

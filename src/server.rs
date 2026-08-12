@@ -39,6 +39,33 @@ impl<T: ReadAt + Size + Send + Sync> ReadAtSize for T {}
 pub trait BlobSource: Send + Sync {
     /// Open a new positional reader over the blob.
     fn open(&self) -> std::io::Result<Box<dyn ReadAtSize>>;
+
+    /// A cheap snapshot of the source's current identity, if it has one.
+    ///
+    /// Registration streams the source once to build its bao outboard, and
+    /// everything served afterwards is proved against that. If the underlying
+    /// bytes then change, every slice fails the *client's* verification —
+    /// forever, with the client seeing only a rising rejected count and
+    /// eventually [`BlobError::Incomplete`], and the server seeing nothing at
+    /// all. Comparing this value at serve time turns that into one clear error
+    /// on the side that can actually fix it.
+    ///
+    /// Returning `None` means "this source cannot change", which is why the
+    /// default is `None`: a source that *can* change should say so.
+    fn fingerprint(&self) -> Option<SourceFingerprint> {
+        None
+    }
+}
+
+/// A cheap identity snapshot of a [`BlobSource`] (see
+/// [`BlobSource::fingerprint`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SourceFingerprint {
+    /// Length in bytes.
+    pub len: u64,
+    /// Modification time in nanoseconds since the Unix epoch, where the source
+    /// has one.
+    pub mtime_ns: Option<i128>,
 }
 
 /// A [`BlobSource`] backed by a file on disk (e.g. a TTL'd report bundle).
@@ -56,6 +83,18 @@ impl FileBlobSource {
 impl BlobSource for FileBlobSource {
     fn open(&self) -> std::io::Result<Box<dyn ReadAtSize>> {
         Ok(Box::new(std::fs::File::open(&self.path)?))
+    }
+
+    fn fingerprint(&self) -> Option<SourceFingerprint> {
+        let meta = std::fs::metadata(&self.path).ok()?;
+        Some(SourceFingerprint {
+            len: meta.len(),
+            mtime_ns: meta.modified().ok().and_then(|t| {
+                t.duration_since(std::time::UNIX_EPOCH)
+                    .ok()
+                    .map(|d| d.as_nanos() as i128)
+            }),
+        })
     }
 }
 
@@ -107,6 +146,9 @@ struct Registered {
     chunks: TransferChunks,
     source: Arc<dyn BlobSource>,
     outboard: Arc<OutboardStore>,
+    /// The source's identity when its outboard was computed. Compared at
+    /// serve time; see `BlobSource::fingerprint`.
+    fingerprint: Option<SourceFingerprint>,
 }
 
 /// Callback invoked with every error raised while serving a query.
@@ -409,14 +451,37 @@ impl BlobServer {
             root: outboard.root().into(),
             created_ms: spec.created_ms,
         };
+        // Replacing an id's content is refused, matching the push path — which
+        // goes to considerable lengths to prevent exactly this hijack
+        // (`push_offer_inner`: identical content is an idempotent no-op,
+        // different content is an error). A local caller is more trusted than
+        // a remote one, but "the bytes behind this id changed and nobody was
+        // told" is the same hazard either way: downloaders resume against a
+        // root that no longer exists, and a pinned fetch starts failing with
+        // no explanation. Re-registering *identical* content stays a no-op;
+        // genuinely replacing content is `unregister` then register, which
+        // says what it means.
+        let mut registry = self.inner.registry.write().await;
+        if let Some(existing) = registry.get(&spec.id) {
+            if existing.manifest.root == manifest.root {
+                return Ok(manifest);
+            }
+            return Err(BlobError::Protocol(format!(
+                "id {:?} is already registered with different content (root {}, offered {}); \
+                 unregister it first",
+                spec.id, existing.manifest.root, manifest.root
+            )));
+        }
         zdebug!(id = %manifest.id, total_len, root = %manifest.root, "blob registered");
-        self.inner.registry.write().await.insert(
+        let fingerprint = source.fingerprint();
+        registry.insert(
             spec.id,
             Registered {
                 manifest: manifest.clone(),
                 chunks,
                 source,
                 outboard: Arc::new(outboard),
+                fingerprint,
             },
         );
         Ok(manifest)
@@ -521,7 +586,7 @@ async fn serve_one(inner: &Inner, query: zenoh::query::Query) -> Result<()> {
 
     // Snapshot the registration (clone the cheap manifest + Arc the rest) so we
     // don't hold the registry lock across the stream.
-    let (manifest, chunks, source, outboard) = {
+    let (manifest, chunks, source, outboard, registered_fingerprint) = {
         let reg = inner.registry.read().await;
         match reg.get(&id) {
             Some(r) => (
@@ -529,10 +594,31 @@ async fn serve_one(inner: &Inner, query: zenoh::query::Query) -> Result<()> {
                 r.chunks,
                 r.source.clone(),
                 r.outboard.clone(),
+                r.fingerprint,
             ),
             None => return Ok(()), // unknown id → client times out → NotFound.
         }
     };
+
+    // Has the source changed since its outboard was computed?
+    //
+    // Everything served is proved against that outboard, so if the backing
+    // bytes moved, every slice fails verification on the *client* — forever,
+    // with the client seeing only a rising rejected count and eventually
+    // `Incomplete`, and this server seeing nothing at all. Neither end can
+    // diagnose it. One `stat` per query converts that into a single error on
+    // the side that can fix it. Sources that cannot change report `None` and
+    // pay nothing.
+    if let (Some(then), Some(now)) = (registered_fingerprint, source.fingerprint())
+        && then != now
+    {
+        let e = BlobError::Protocol(format!(
+            "the source behind blob {id:?} changed after registration              (was {} bytes, now {}); re-register it — every slice served from              the stale outboard would fail the client's verification",
+            then.len, now.len
+        ));
+        let _ = query.reply_err(e.to_string()).await;
+        return Err(e);
+    }
 
     // Availability request: which chunks can this server serve? A registered
     // blob is always complete here, but the protocol supports partial holders.
@@ -619,7 +705,26 @@ fn push_part_path(push: &PushConfig, id: &str) -> std::path::PathBuf {
 /// stale pushes, create/resume spool state, and reply with the chunk ranges
 /// the server still wants. Spool I/O runs with the pushes lock **released** —
 /// one slow uploader must not stall the others.
+/// Handle a push offer, guaranteeing the uploader hears *something*.
+///
+/// Every early return inside already replies. What this wrapper covers is the
+/// `?` paths — encoding, geometry, spool I/O — which would otherwise propagate
+/// with no reply at all, leaving the uploader to wait out the full query
+/// timeout and then report "no push endpoint answered the offer": a
+/// server-side validation failure diagnosed as a missing server. An extra
+/// `reply_err` after a successful reply is harmless; the client takes the
+/// first acknowledgement it decodes.
 async fn handle_push_offer(inner: &Inner, query: zenoh::query::Query, key_id: &str) -> Result<()> {
+    match push_offer_inner(inner, &query, key_id).await {
+        Ok(()) => Ok(()),
+        Err(e) => {
+            let _ = query.reply_err(format!("push offer failed: {e}")).await;
+            Err(e)
+        }
+    }
+}
+
+async fn push_offer_inner(inner: &Inner, query: &zenoh::query::Query, key_id: &str) -> Result<()> {
     let Some(push) = inner.cfg.push.clone() else {
         let _ = query.reply_err("push not enabled on this server").await;
         return Ok(());
@@ -818,6 +923,23 @@ async fn handle_push_slice(
     id: &str,
     index: u32,
 ) -> Result<()> {
+    // Same guarantee as the offer path: no `?` may escape without the
+    // uploader hearing why (see `handle_push_offer`).
+    match push_slice_inner(inner, &query, id, index).await {
+        Ok(()) => Ok(()),
+        Err(e) => {
+            let _ = query.reply_err(format!("push slice failed: {e}")).await;
+            Err(e)
+        }
+    }
+}
+
+async fn push_slice_inner(
+    inner: &Inner,
+    query: &zenoh::query::Query,
+    id: &str,
+    index: u32,
+) -> Result<()> {
     let Some(push) = inner.cfg.push.clone() else {
         let _ = query.reply_err("push not enabled on this server").await;
         return Ok(());
@@ -1011,6 +1133,10 @@ async fn finalize_push(inner: &Inner, push: &PushConfig, id: &str) -> Result<()>
         Registered {
             manifest: entry.manifest,
             chunks: entry.chunks,
+            fingerprint: {
+                let src = FileBlobSource::new(&blob_path);
+                src.fingerprint()
+            },
             source: Arc::new(FileBlobSource::new(blob_path)),
             outboard: Arc::new(outboard),
         },

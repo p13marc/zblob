@@ -478,3 +478,124 @@ async fn concurrent_push_cap_enforced() {
     handle.shutdown().await.unwrap();
     session.close().await.unwrap();
 }
+
+/// Allows everything (the willing receiver).
+struct OpenPolicy;
+impl PushPolicy for OpenPolicy {
+    fn allow(&self, _manifest: &Manifest, _token: Option<&[u8]>) -> bool {
+        true
+    }
+}
+
+/// Two servers on one prefix, one of them with push disabled: the upload must
+/// still complete.
+///
+/// This is not hypothetical. zensight's netring sensor deliberately runs a
+/// second `BlobServer` on its artifact prefix, relying on servers ignoring ids
+/// they do not own — so a server answering "push not enabled on this server"
+/// shares the prefix with one that accepts. Treating any responder's error as
+/// the answer violates the crate's own rule that one bad reply must not be
+/// fatal, and it is the arm that would bite a real consumer.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_refusing_co_server_cannot_deny_an_accepting_one() {
+    let session = open_session().await;
+    let prefix = unique_prefix();
+    let spool = tempfile::tempdir().unwrap();
+
+    // One server accepts pushes…
+    let accepting = BlobServer::builder(session.clone(), prefix.clone())
+        .accept_push(Arc::new(OpenPolicy), spool.path())
+        .build()
+        .spawn()
+        .await
+        .unwrap();
+    // …and one on the same prefix has push switched off entirely.
+    let refusing = BlobServer::new(session.clone(), prefix.clone())
+        .spawn()
+        .await
+        .unwrap();
+
+    let data = pseudo_random(MIN_CHUNK_SIZE as usize * 2 + 13, 23);
+    let src = tempfile::tempdir().unwrap();
+    let src_path = src.path().join("shared.bin");
+    std::fs::write(&src_path, &data).unwrap();
+
+    let client = test_client(session.clone(), &prefix);
+    let manifest = tokio::time::timeout(
+        Duration::from_secs(20),
+        client.upload_file(
+            BlobSpec::new("coexist").chunk_size(MIN_CHUNK_SIZE),
+            &src_path,
+            None,
+            &(),
+            &CancelToken::new(),
+        ),
+    )
+    .await
+    .expect("upload must not hang")
+    .expect("a refusing co-server must not deny an accepting one");
+    assert_eq!(manifest.root, content_hash(&data));
+
+    // …and the accepting server really did land it: it serves the blob now.
+    let dest = tempfile::tempdir().unwrap().keep();
+    let out = dest.join("back.bin");
+    client
+        .download_to(
+            &DownloadRequest::pinned("coexist", manifest.root),
+            &out,
+            &(),
+            &CancelToken::new(),
+        )
+        .await
+        .expect("the pushed blob must be downloadable");
+    assert_eq!(std::fs::read(&out).unwrap(), data);
+
+    accepting.shutdown().await.unwrap();
+    refusing.shutdown().await.unwrap();
+    session.close().await.unwrap();
+}
+
+/// An upload has exactly one destination, so a wildcard prefix is refused
+/// rather than fanning the upload out across every matching origin.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn upload_refuses_a_wildcard_prefix() {
+    let session = open_session().await;
+    let src = tempfile::tempdir().unwrap();
+    let src_path = src.path().join("x.bin");
+    std::fs::write(&src_path, b"payload").unwrap();
+
+    let base = unique_prefix();
+    let wildcard = format!("{base}/*/blob");
+    let err = test_client(session.clone(), &wildcard)
+        .upload_file(
+            BlobSpec::new("nope").chunk_size(MIN_CHUNK_SIZE),
+            &src_path,
+            None,
+            &(),
+            &CancelToken::new(),
+        )
+        .await
+        .expect_err("a wildcard upload prefix must be refused");
+    assert!(matches!(err, BlobError::Protocol(_)), "{err}");
+
+    // Discriminating power: the same call against a concrete prefix gets past
+    // prefix validation (it then fails because nothing is serving, which is a
+    // different error).
+    let concrete = format!("{base}/one/blob");
+    let err2 = test_client(session.clone(), &concrete)
+        .upload_file(
+            BlobSpec::new("nope").chunk_size(MIN_CHUNK_SIZE),
+            &src_path,
+            None,
+            &(),
+            &CancelToken::new(),
+        )
+        .await
+        .expect_err("nothing is serving that prefix");
+    assert!(
+        matches!(err2, BlobError::PushDenied(_)),
+        "a concrete prefix must get past validation: {err2}"
+    );
+
+    session.close().await.unwrap();
+}

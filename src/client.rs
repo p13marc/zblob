@@ -410,7 +410,7 @@ impl BlobClient {
         cancel: &CancelToken,
     ) -> Result<Manifest> {
         use crate::verify::{MemOutboard, chunk_range};
-        crate::paths::validate_query_prefix(&self.prefix)?;
+        crate::paths::validate_upload_prefix(&self.prefix)?;
         let path = path.into();
 
         // Hash the source once: outboard + manifest, exactly like server-side
@@ -451,22 +451,40 @@ impl BlobClient {
         }
         let replies = builder.await.map_err(BlobError::zenoh)?;
         let mut wanted: Option<Vec<(u32, u32)>> = None;
+        // A refusal from *a* responder is not a refusal by *the* responder.
+        // More than one server can serve one prefix — zensight's netring runs
+        // a second `BlobServer` on its artifact prefix deliberately — so a
+        // server with push disabled answering "not enabled here" must not
+        // abort an upload another server is accepting. Same rule as every
+        // `fetch_*` loop (see the crate docs, fact 3): skip, keep the first
+        // rejection for diagnostics, fail only if nobody accepts.
+        let mut refusal: Option<String> = None;
         while let Ok(reply) = replies.recv_async().await {
             match reply.result() {
                 Ok(sample) if sample.encoding().to_string() == ENC_PUSH => {
-                    wanted = Some(decode(&sample.payload().to_bytes())?);
-                    break;
+                    match decode::<Vec<(u32, u32)>>(&sample.payload().to_bytes()) {
+                        Ok(ranges) => {
+                            wanted = Some(ranges);
+                            break;
+                        }
+                        Err(e) => {
+                            refusal.get_or_insert_with(|| format!("undecodable offer reply: {e}"));
+                        }
+                    }
                 }
                 Ok(_) => continue,
                 Err(e) => {
-                    return Err(BlobError::PushDenied(
-                        String::from_utf8_lossy(&e.payload().to_bytes()).into_owned(),
-                    ));
+                    refusal.get_or_insert_with(|| {
+                        String::from_utf8_lossy(&e.payload().to_bytes()).into_owned()
+                    });
                 }
             }
         }
-        let wanted = wanted
-            .ok_or_else(|| BlobError::PushDenied("no push endpoint answered the offer".into()))?;
+        let wanted = wanted.ok_or_else(|| {
+            BlobError::PushDenied(
+                refusal.unwrap_or_else(|| "no push endpoint answered the offer".into()),
+            )
+        })?;
 
         // The offer reply is attacker input like everything else off the wire:
         // enforce sorted, disjoint, in-bounds, non-empty spans *before* any
@@ -542,26 +560,41 @@ impl BlobClient {
                 }
                 let replies = b.await.map_err(BlobError::zenoh)?;
                 let mut acked = false;
+                // As in the offer loop: one responder's error is not the
+                // answer. The server that declined the offer holds no spool
+                // state for this id and will reject every slice; the one that
+                // accepted acknowledges them.
+                let mut slice_refusal: Option<String> = None;
                 while let Ok(reply) = replies.recv_async().await {
                     match reply.result() {
                         Ok(sample) if sample.encoding().to_string() == ENC_PUSH => {
-                            let _remaining: u32 = decode(&sample.payload().to_bytes())?;
-                            acked = true;
-                            break;
+                            match decode::<u32>(&sample.payload().to_bytes()) {
+                                Ok(_remaining) => {
+                                    acked = true;
+                                    break;
+                                }
+                                Err(e) => {
+                                    slice_refusal
+                                        .get_or_insert_with(|| format!("undecodable ack: {e}"));
+                                }
+                            }
                         }
                         Ok(_) => continue,
                         Err(e) => {
-                            return Err(BlobError::PushDenied(
-                                String::from_utf8_lossy(&e.payload().to_bytes()).into_owned(),
-                            ));
+                            slice_refusal.get_or_insert_with(|| {
+                                String::from_utf8_lossy(&e.payload().to_bytes()).into_owned()
+                            });
                         }
                     }
                 }
                 if !acked {
-                    return Err(BlobError::Incomplete {
-                        received: sent,
-                        total: count,
-                    });
+                    return match slice_refusal {
+                        Some(reason) => Err(BlobError::PushDenied(reason)),
+                        None => Err(BlobError::Incomplete {
+                            received: sent,
+                            total: count,
+                        }),
+                    };
                 }
                 sent += 1;
                 bytes_sent += chunks.len_of(index) as u64;
