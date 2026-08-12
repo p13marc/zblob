@@ -26,7 +26,9 @@ use crate::error::{BlobError, Result};
 use crate::hash::Hash;
 use crate::prefix::QueryPrefix;
 use crate::store_key;
+use crate::tree::ChunkRef;
 use crate::wire::ENC_CHUNK;
+use crate::wire::{HaveBits, WantList};
 
 #[derive(Debug, Clone)]
 pub(crate) struct StoreClientConfig {
@@ -44,6 +46,15 @@ impl Default for StoreClientConfig {
             max_chunk_bytes: MAX_UNPACKED,
         }
     }
+}
+
+/// What one origin holds, from [`StoreClient::probe`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ChunkProbe {
+    /// The store prefix that answered — fetch from it to get these chunks.
+    pub origin: QueryPrefix,
+    /// The subset of the asked-about addresses this origin holds.
+    pub held: Vec<Hash>,
 }
 
 /// Reads single chunks from a content-addressed store by their hash.
@@ -136,6 +147,101 @@ impl StoreClient {
         Ok(bytes)
     }
 
+    /// Fetch many chunks in one query round.
+    ///
+    /// Returns the chunks that came back verified; a holder answers only what
+    /// it has, so a short result is normal and not an error. Anything absent
+    /// is the caller's to ask for elsewhere — [`fetch_chunk`](Self::fetch_chunk)
+    /// against a router storage, typically, which serves by key and so never
+    /// answers a batch at all.
+    ///
+    /// The list is capped at [`MAX_WANT_LIST`](crate::wire::MAX_WANT_LIST);
+    /// longer input is split across rounds.
+    ///
+    /// **Holds every returned chunk in memory.** For a whole snapshot use
+    /// [`TreeClient::download_tree`](crate::TreeClient::download_tree), which
+    /// streams each round into a store instead.
+    pub async fn fetch_many(&self, wanted: &[ChunkRef]) -> Result<Vec<(Hash, Vec<u8>)>> {
+        let mut out = Vec::new();
+        for group in wanted.chunks(crate::wire::MAX_WANT_LIST) {
+            let (replies, expected) = batch_query(
+                &self.session,
+                self.prefix.as_str(),
+                group,
+                self.cfg.query_timeout,
+                self.cfg.priority,
+            )
+            .await?;
+            let mut seen = std::collections::HashSet::new();
+            while let Ok(reply) = replies.recv_async().await {
+                let Ok(sample) = reply.result() else { continue };
+                if let Some((hash, bytes)) =
+                    accept_batch_reply(self.prefix.as_str(), sample, &expected)
+                    && seen.insert(hash)
+                {
+                    out.push((hash, bytes));
+                }
+            }
+        }
+        Ok(out)
+    }
+
+    /// Ask which of `hashes` each answering holder has.
+    ///
+    /// This is tier 2's probe, and the reason it can exist: the reply is one
+    /// bit per address asked about, so its size is a function of the
+    /// *question*, never of the objects. A tier-2 *fetch* fanned across
+    /// origins would be one full copy per responder, which RFC 07 §3 forbids;
+    /// a bitfield over a caller-supplied list cannot be bulk, so probing tier 2
+    /// across origins is as legitimate as probing tier 1 — and
+    /// probe-then-fetch becomes total across all three key families instead of
+    /// being available on one of them.
+    ///
+    /// Each result names the origin that answered, so the follow-up fetch can
+    /// go to a holder that actually has the chunks.
+    pub async fn probe(&self, hashes: &[Hash]) -> Result<Vec<ChunkProbe>> {
+        let mut out = Vec::new();
+        for group in hashes.chunks(crate::wire::MAX_WANT_LIST) {
+            for (key, bits) in probe_chunks(
+                &self.session,
+                self.prefix.as_str(),
+                group,
+                self.cfg.query_timeout,
+                self.cfg.priority,
+            )
+            .await?
+            {
+                // The reply key is `<origin>/<algo>/have`; the origin is what
+                // a caller needs in order to fetch from this holder.
+                let Some(origin) = key
+                    .strip_suffix(crate::STORE_HAVE)
+                    .and_then(|k| k.strip_suffix('/'))
+                    .and_then(|k| k.strip_suffix(Hash::ALGO))
+                    .and_then(|k| k.strip_suffix('/'))
+                else {
+                    continue;
+                };
+                let Ok(origin) = QueryPrefix::new(origin) else {
+                    continue;
+                };
+                let held = group
+                    .iter()
+                    .enumerate()
+                    .filter(|(i, _)| bits.is_set(*i as u32))
+                    .map(|(_, h)| *h)
+                    .collect::<Vec<_>>();
+                match out
+                    .iter_mut()
+                    .find(|p: &&mut ChunkProbe| p.origin == origin)
+                {
+                    Some(existing) => existing.held.extend(held),
+                    None => out.push(ChunkProbe { origin, held }),
+                }
+            }
+        }
+        Ok(out)
+    }
+
     /// [`fetch_chunk`](Self::fetch_chunk) for a caller that already knows the
     /// chunk's length — from a [`ChunkRef`](crate::ChunkRef), typically.
     ///
@@ -155,6 +261,111 @@ impl StoreClient {
         .await?;
         Ok(bytes)
     }
+}
+
+/// Issue one batched want-list query and hand back the reply stream, together
+/// with the map of what was asked for.
+///
+/// Kept separate from the draining so both callers share the *security*
+/// half — which reply counts as an answer — while each drains at the pace it
+/// can afford. The tree path must stream: a round of 256 chunks at the CDC
+/// maximum would be gigabytes if collected first.
+pub(crate) async fn batch_query(
+    session: &zenoh::Session,
+    store_prefix: &str,
+    wanted: &[ChunkRef],
+    timeout: Duration,
+    priority: Priority,
+) -> Result<(
+    zenoh::handlers::FifoChannelHandler<zenoh::query::Reply>,
+    std::collections::HashMap<Hash, u32>,
+)> {
+    let expected: std::collections::HashMap<Hash, u32> =
+        wanted.iter().map(|c| (c.hash, c.len)).collect();
+    let want = WantList::new(wanted.iter().map(|c| c.hash).collect());
+    let replies = session
+        .get(crate::store_batch_key(store_prefix, Hash::ALGO))
+        .payload(crate::wire::encode(&want)?)
+        // The replies land on each chunk's own key, which does not intersect
+        // this one. Without this the *server* refuses them, once per chunk.
+        .accept_replies(zenoh::query::ReplyKeyExpr::Any)
+        .consolidation(ConsolidationMode::None)
+        .priority(priority)
+        .timeout(timeout)
+        .await
+        .map_err(BlobError::zenoh)?;
+    Ok((replies, expected))
+}
+
+/// Decide whether one batch reply is an answer, and to which address.
+///
+/// `ReplyKeyExpr::Any` means the reply key is no longer constrained for us, so
+/// everything is checked here: that it is a chunk reply, that its key is under
+/// our own store prefix, that we asked for that address, that it is not
+/// over-long, and finally that the bytes hash to the address. One bad chunk in
+/// a batch costs only itself.
+pub(crate) fn accept_batch_reply(
+    store_prefix: &str,
+    sample: &zenoh::sample::Sample,
+    expected: &std::collections::HashMap<Hash, u32>,
+) -> Option<(Hash, Vec<u8>)> {
+    if sample.encoding().to_string() != ENC_CHUNK {
+        return None;
+    }
+    let tail = crate::parse_tier2_tail(store_prefix, sample.key_expr().as_str())?;
+    let [algo, hex] = tail[..] else { return None };
+    if algo != Hash::ALGO {
+        return None;
+    }
+    let hash: Hash = hex.parse().ok()?;
+    let len = *expected.get(&hash)?;
+    let payload = sample.payload().to_bytes();
+    if payload.len() > len as usize + 1 + 4 {
+        return None; // over-long for the declared chunk; do not unframe it
+    }
+    let bytes = unpack(&payload).ok()?;
+    if bytes.len() as u32 != len || Hash::of(&bytes) != hash {
+        return None;
+    }
+    Some((hash, bytes))
+}
+
+/// Ask a holder which of `hashes` it has. The reply is one bit each, so its
+/// size is a function of the question rather than of the chunks.
+pub(crate) async fn probe_chunks(
+    session: &zenoh::Session,
+    store_prefix: &str,
+    hashes: &[Hash],
+    timeout: Duration,
+    priority: Priority,
+) -> Result<Vec<(String, HaveBits)>> {
+    if hashes.is_empty() {
+        return Ok(Vec::new());
+    }
+    let want = WantList::new(hashes.to_vec());
+    let replies = session
+        .get(crate::store_have_key(store_prefix, Hash::ALGO))
+        .payload(crate::wire::encode(&want)?)
+        .consolidation(ConsolidationMode::None)
+        .priority(priority)
+        .timeout(timeout)
+        .await
+        .map_err(BlobError::zenoh)?;
+    let mut out = Vec::new();
+    while let Ok(reply) = replies.recv_async().await {
+        let Ok(sample) = reply.result() else { continue };
+        if sample.encoding().to_string() != crate::wire::ENC_HAVEBITS {
+            continue;
+        }
+        let Ok(bits) = crate::wire::decode::<HaveBits>(&sample.payload().to_bytes()) else {
+            continue;
+        };
+        if bits.validate(hashes.len()).is_err() {
+            continue;
+        }
+        out.push((sample.key_expr().as_str().to_string(), bits));
+    }
+    Ok(out)
 }
 
 /// GET one content-addressed chunk and verify it by re-hashing — the one

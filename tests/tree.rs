@@ -338,14 +338,21 @@ async fn cancellable_reports_progress_and_resumes() {
     server.register(index).await;
     let handle = server.spawn().await.unwrap();
 
-    // Serial fetch so the cancel lands mid-stream deterministically.
+    // Serial, unbatched fetch so the cancel lands mid-stream deterministically.
+    //
+    // Batching changes cancellation granularity, and honestly so: chunks that
+    // arrive together in one query round are stored together, so a cancel
+    // observed during a round cannot un-fetch them. `batch_size(0)` selects
+    // the per-chunk path, where a partial cancel is well-defined; the batched
+    // path's cancellation is covered separately below.
     let client = TreeClient::builder(
         session.clone(),
-        common::query(store_prefix),
-        common::query(tree_prefix),
+        common::query(store_prefix.clone()),
+        common::query(tree_prefix.clone()),
     )
     .query_timeout(Duration::from_secs(5))
     .fetch_concurrency(1)
+    .batch_size(0)
     .build();
 
     // 1) Cancel after the first chunk: the call returns Cancelled and the store
@@ -425,6 +432,66 @@ async fn cancellable_reports_progress_and_resumes() {
     }
     assert_eq!(last as usize, total, "progress reaches total");
     assert!(saw_complete, "emits Completed");
+
+    // 3) The batched path: cancellation is round-granular rather than
+    //    chunk-granular, but the property that matters is unchanged — the call
+    //    reports Cancelled, whatever it fetched is in the store, and calling
+    //    again finishes the job.
+    {
+        let batched = TreeClient::builder(
+            session.clone(),
+            common::query(store_prefix),
+            common::query(tree_prefix),
+        )
+        .query_timeout(Duration::from_secs(5))
+        .build();
+        let store_dir = tempfile::tempdir().unwrap();
+        let fresh: Arc<dyn ContentStore> = Arc::new(DirStore::open(store_dir.path()).unwrap());
+        let cancel = CancelToken::new();
+        struct CancelAfterOne {
+            cancel: CancelToken,
+        }
+        impl ProgressSink for CancelAfterOne {
+            fn emit(&self, p: Progress) {
+                if let Progress::Chunk { received, .. } = p
+                    && received >= 1
+                {
+                    self.cancel.cancel();
+                }
+            }
+        }
+        let dest = tempfile::tempdir().unwrap();
+        let err = batched
+            .download_tree(
+                &DownloadRequest::new("snap1"),
+                dest.path(),
+                &fresh,
+                &CancelAfterOne {
+                    cancel: cancel.clone(),
+                },
+                &cancel,
+            )
+            .await
+            .expect_err("a cancel must surface even when a round resolved it all");
+        assert!(matches!(err, BlobError::Cancelled { .. }), "{err}");
+        assert!(
+            !fresh.hashes().unwrap().is_empty(),
+            "a cancelled batch must leave what it fetched behind to resume from"
+        );
+
+        let dest2 = tempfile::tempdir().unwrap();
+        batched
+            .download_tree(
+                &DownloadRequest::new("snap1"),
+                dest2.path(),
+                &fresh,
+                &(),
+                &CancelToken::new(),
+            )
+            .await
+            .expect("resume after a batched cancel must complete");
+        assert_dirs_equal(src.path(), dest2.path());
+    }
 
     handle.shutdown().await.unwrap();
     session.close().await.unwrap();

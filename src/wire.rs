@@ -13,6 +13,7 @@
 use serde::{Serialize, de::DeserializeOwned};
 
 use crate::error::{BlobError, Result};
+use crate::hash::Hash;
 
 /// The wire schema version this crate speaks. Carried as the first field of
 /// every control struct; any shape change bumps it.
@@ -35,6 +36,10 @@ pub const ENC_CHUNK: &str = "zblob/chunk;v=3";
 pub const ENC_PUSH: &str = "zblob/push;v=3";
 /// Encoding tag of availability (`…/have`) replies.
 pub const ENC_AVAIL: &str = "zblob/have;v=3";
+/// Encoding tag of tier-2 probe replies ([`HaveBits`]).
+pub const ENC_HAVEBITS: &str = "zblob/havebits;v=3";
+/// Encoding tag of tier-2 snapshot probe replies ([`TreeProbe`]).
+pub const ENC_TREEPROBE: &str = "zblob/treeprobe;v=3";
 
 /// A trailing, length-prefixed extension list carried by the *metadata*
 /// messages ([`crate::Manifest`]).
@@ -63,6 +68,177 @@ pub fn ext_u32(ext: &Ext, id: u16) -> Option<u32> {
 pub fn ext_u64(ext: &Ext, id: u16) -> Option<u64> {
     let (_, v) = ext.iter().find(|(k, _)| *k == id)?;
     Some(u64::from_le_bytes(v.as_slice().try_into().ok()?))
+}
+
+/// A set of content addresses a client is asking about: the request body of
+/// the tier-2 batch fetch and the tier-2 chunk probe.
+///
+/// One question, two answers of very different size — the batch endpoint
+/// replies with the chunks themselves, the probe with one bit each. Sharing
+/// the request type is deliberate: probe to choose a holder, then batch-fetch
+/// from the one you chose.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct WantList {
+    /// Wire schema version (first field; postcard is positional).
+    pub version: u16,
+    /// The addresses being asked about, in the order the answer must use.
+    pub hashes: Vec<Hash>,
+}
+
+/// Largest want-list a server will accept in one query.
+///
+/// Bounds the work a single request can commit a server to, the same way
+/// `MAX_RANGE_SPANS` does for tier 1. Advertised, so a client clamps rather
+/// than guessing.
+pub const MAX_WANT_LIST: usize = 512;
+
+impl WantList {
+    /// A want-list for `hashes`.
+    pub fn new(hashes: Vec<Hash>) -> Self {
+        WantList {
+            version: WIRE_VERSION,
+            hashes,
+        }
+    }
+
+    /// Check a want-list received from the network *before* doing any I/O for
+    /// it: schema version, non-empty, within `max`, and free of duplicates.
+    ///
+    /// Duplicates are refused rather than deduplicated because they can only
+    /// be a mistake or an attempt to multiply the reply volume for a given
+    /// request size, and silently accepting either makes the cap a lie.
+    pub fn validate(&self, max: usize) -> Result<()> {
+        if self.version != WIRE_VERSION {
+            return Err(BlobError::UnsupportedVersion(self.version));
+        }
+        if self.hashes.is_empty() {
+            return Err(BlobError::Protocol("empty want list".into()));
+        }
+        if self.hashes.len() > max {
+            return Err(BlobError::Protocol(format!(
+                "want list of {} exceeds the limit of {max}",
+                self.hashes.len()
+            )));
+        }
+        let mut seen = std::collections::HashSet::with_capacity(self.hashes.len());
+        if let Some(dup) = self.hashes.iter().find(|h| !seen.insert(**h)) {
+            return Err(BlobError::Protocol(format!("want list repeats {dup}")));
+        }
+        Ok(())
+    }
+}
+
+/// One bit per entry of a [`WantList`], in the same order: the tier-2 probe's
+/// reply.
+///
+/// The reply is a function of the *question*, never of the objects asked
+/// about — `hashes.len() / 8` bytes — which is what makes a wildcard-origin
+/// tier-2 probe as legitimate as tier 1's, and a wildcard-origin tier-2
+/// *fetch* still forbidden.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct HaveBits {
+    /// Wire schema version (first field; postcard is positional).
+    pub version: u16,
+    /// How many entries the answered want-list had.
+    pub count: u32,
+    /// LSB-first presence bitfield (`ceil(count / 8)` bytes).
+    pub bits: Vec<u8>,
+}
+
+impl HaveBits {
+    /// Build a reply from a presence predicate over the want-list.
+    pub fn from_presence(present: impl IntoIterator<Item = bool>) -> Self {
+        let mut count = 0u32;
+        let mut bits: Vec<u8> = Vec::new();
+        for (i, yes) in present.into_iter().enumerate() {
+            if i % 8 == 0 {
+                bits.push(0);
+            }
+            if yes {
+                let last = bits.len() - 1;
+                bits[last] |= 1 << (i % 8);
+            }
+            count += 1;
+        }
+        HaveBits {
+            version: WIRE_VERSION,
+            count,
+            bits,
+        }
+    }
+
+    /// Whether entry `i` of the answered want-list is held.
+    pub fn is_set(&self, i: u32) -> bool {
+        i < self.count
+            && (i / 8) < self.bits.len() as u32
+            && self.bits[(i / 8) as usize] & (1 << (i % 8)) != 0
+    }
+
+    /// How many entries are held.
+    pub fn count_set(&self) -> u32 {
+        (0..self.count).filter(|i| self.is_set(*i)).count() as u32
+    }
+
+    /// Check a probe reply against the question it answers: right version,
+    /// right length, and a bitfield sized to its own count.
+    pub fn validate(&self, asked: usize) -> Result<()> {
+        if self.version != WIRE_VERSION {
+            return Err(BlobError::UnsupportedVersion(self.version));
+        }
+        if self.count as usize != asked {
+            return Err(BlobError::Protocol(format!(
+                "probe answered {} entries for a want-list of {asked}",
+                self.count
+            )));
+        }
+        let want = self.count.div_ceil(8) as usize;
+        if self.bits.len() != want {
+            return Err(BlobError::Protocol(format!(
+                "probe bitfield is {} bytes, expected {want}",
+                self.bits.len()
+            )));
+        }
+        Ok(())
+    }
+}
+
+/// What one holder has of a snapshot: the tier-2 tree probe's reply.
+///
+/// Four small numbers, whatever the size of the snapshot — so an explorer can
+/// ask "who has this, and how much of it" across origins without any of them
+/// shipping a tree. Before this, the honest answer available to a consumer was
+/// `not_probed`.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct TreeProbe {
+    /// Wire schema version (first field; postcard is positional).
+    pub version: u16,
+    /// Whether this holder serves the snapshot index itself.
+    pub have_index: bool,
+    /// Distinct chunks of the snapshot this holder has.
+    pub chunks_present: u32,
+    /// Distinct chunks the snapshot references in total.
+    pub chunks_total: u32,
+}
+
+impl TreeProbe {
+    /// Check a probe reply for internal consistency.
+    pub fn validate(&self) -> Result<()> {
+        if self.version != WIRE_VERSION {
+            return Err(BlobError::UnsupportedVersion(self.version));
+        }
+        if self.chunks_present > self.chunks_total {
+            return Err(BlobError::Protocol(format!(
+                "probe claims {} of {} chunks",
+                self.chunks_present, self.chunks_total
+            )));
+        }
+        Ok(())
+    }
+
+    /// Whether this holder can serve the whole snapshot on its own.
+    pub fn is_complete(&self) -> bool {
+        self.have_index && self.chunks_present == self.chunks_total
+    }
 }
 
 /// A responder's chunk availability for one blob: which transfer chunks it

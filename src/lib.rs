@@ -112,7 +112,7 @@ pub use server::{
     PushPolicy, ReadAtSize, ServerHandle, SourceFingerprint,
 };
 pub use store::{ContentStore, DirStore, MemoryStore};
-pub use store_client::{StoreClient, StoreClientBuilder};
+pub use store_client::{ChunkProbe, StoreClient, StoreClientBuilder};
 pub use tree::{
     ChunkRef, Entry, MaterializePolicy, TreeClient, TreeClientBuilder, TreeIndex, TreeServer,
     TreeServerBuilder, build_tree,
@@ -365,6 +365,49 @@ pub fn parse_tier2_tail<'k>(prefix: &str, key_expr: &'k str) -> Option<Vec<&'k s
         }
     }
     Some(k[p.len()..].to_vec())
+}
+
+/// Reserved tier-2 endpoint token: the batched want-list fetch.
+///
+/// Unambiguous against a chunk key because `<hex>` is hex and this is not.
+pub const STORE_BATCH: &str = "batch";
+
+/// Reserved tier-2 endpoint token: the chunk probe (and, under a tree key,
+/// the snapshot probe).
+pub const STORE_HAVE: &str = "have";
+
+/// Key a client GETs — with a [`WantList`](crate::wire::WantList) payload — to
+/// fetch many chunks in one round: `<prefix>/<algo>/batch`.
+///
+/// Replies come back on the ordinary [`store_key`] of each chunk the holder
+/// has, which keeps them individually verifiable, individually cacheable and
+/// byte-identical to a single-chunk reply. Those keys do **not** intersect
+/// this one, so the query must be issued with
+/// `accept_replies(ReplyKeyExpr::Any)` — Zenoh otherwise refuses the reply on
+/// the *server*, once per chunk.
+///
+/// Note what this endpoint is not: a wildcard. A GET on
+/// `<prefix>/<algo>/**` would also carry those replies, and would make every
+/// router-hosted storage in range dump its entire content store in answer to
+/// one query.
+pub fn store_batch_key(prefix: &str, algo: &str) -> String {
+    format!("{prefix}/{algo}/{STORE_BATCH}")
+}
+
+/// Key a client GETs — with a [`WantList`](crate::wire::WantList) payload — to
+/// ask which of those chunks a holder has: `<prefix>/<algo>/have`.
+///
+/// The reply is one bit per entry, so its size is a function of the question
+/// rather than of the objects asked about. That is what makes this safe to
+/// fan out across origins where a tier-2 *fetch* is not.
+pub fn store_have_key(prefix: &str, algo: &str) -> String {
+    format!("{prefix}/{algo}/{STORE_HAVE}")
+}
+
+/// Key a client GETs to ask a holder how much of snapshot `id` it has:
+/// `<prefix>/<id>/have`.
+pub fn tree_have_key(prefix: &str, id: &str) -> String {
+    format!("{prefix}/{id}/{STORE_HAVE}")
 }
 
 /// Key of a tree snapshot index (Tier 2): `<prefix>/<id>`.

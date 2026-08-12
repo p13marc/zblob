@@ -43,6 +43,13 @@ pub struct TransferStats {
     pub rejected: u32,
     /// No-progress query attempts that were retried with backoff.
     pub retries: u32,
+    /// Zenoh queries this call issued.
+    ///
+    /// The number that matters for scale: a tier-2 snapshot used to cost one
+    /// query per chunk, so this is how you tell whether batching is actually
+    /// working against a given fleet rather than silently falling back to
+    /// single fetches.
+    pub queries: u64,
     /// Wall-clock duration of this call.
     pub elapsed: Duration,
 }

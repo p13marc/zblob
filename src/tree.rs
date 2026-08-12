@@ -627,6 +627,7 @@ struct TreeInner {
     index: tokio::sync::RwLock<std::collections::HashMap<String, TreeIndex>>,
     inflight: Arc<Semaphore>,
     compression: ChunkCompression,
+    max_want_list: usize,
     on_error: Option<ErrorCallback>,
 }
 
@@ -638,6 +639,7 @@ pub struct TreeServerBuilder {
     store: Arc<dyn ContentStore>,
     max_inflight: usize,
     compression: ChunkCompression,
+    max_want_list: usize,
     on_error: Option<ErrorCallback>,
 }
 
@@ -652,6 +654,17 @@ impl TreeServerBuilder {
     /// feature for [`ChunkCompression::Zstd`]).
     pub fn compression(mut self, c: ChunkCompression) -> Self {
         self.compression = c;
+        self
+    }
+
+    /// Largest want-list this server will answer in one batch fetch or probe
+    /// (default [`MAX_WANT_LIST`](crate::wire::MAX_WANT_LIST)).
+    ///
+    /// The bound on how much work one request can commit this server to —
+    /// tier 2's counterpart of `max_chunks_per_query`. Checked before any
+    /// store access.
+    pub fn max_want_list(mut self, n: usize) -> Self {
+        self.max_want_list = n.max(1);
         self
     }
 
@@ -673,6 +686,7 @@ impl TreeServerBuilder {
                 index: tokio::sync::RwLock::new(std::collections::HashMap::new()),
                 inflight: Arc::new(Semaphore::new(self.max_inflight)),
                 compression: self.compression,
+                max_want_list: self.max_want_list,
                 on_error: self.on_error,
             }),
         }
@@ -695,6 +709,7 @@ impl TreeServer {
             store,
             max_inflight: 8,
             compression: ChunkCompression::default(),
+            max_want_list: crate::wire::MAX_WANT_LIST,
             on_error: None,
         }
     }
@@ -800,24 +815,156 @@ impl TreeServer {
 }
 
 async fn serve_chunk_query(inner: &TreeInner, query: zenoh::query::Query) -> Result<()> {
-    let key = query.key_expr().as_str();
-    let Some(hash) = parse_store_key(inner.store_prefix.as_str(), key) else {
-        return Ok(()); // not a chunk key (or foreign algo); ignore.
+    let key = query.key_expr().as_str().to_string();
+    let Some(tail) = crate::parse_tier2_tail(inner.store_prefix.as_str(), &key) else {
+        return Ok(()); // not one of our keys; ignore.
     };
+    let [algo, last] = tail[..] else {
+        return Ok(());
+    };
+    if algo != Hash::ALGO {
+        return Ok(()); // foreign algorithm; not ours to answer.
+    }
+    match last {
+        crate::STORE_BATCH => serve_chunk_batch(inner, query).await,
+        crate::STORE_HAVE => serve_chunk_probe(inner, query).await,
+        hex => {
+            let Ok(hash) = hex.parse::<Hash>() else {
+                return Ok(()); // not a chunk address; ignore.
+            };
+            let store = inner.store.clone();
+            let compression = inner.compression;
+            let packed = tokio::task::spawn_blocking(move || {
+                store.get(&hash).map(|bytes| pack(&bytes, compression))
+            })
+            .await
+            .map_err(|e| BlobError::Protocol(format!("store get task: {e}")))?;
+            if let Some(packed) = packed {
+                query
+                    // This server's own key, not `query.key_expr()`. For a
+                    // concrete GET they are the same; for a wildcard-origin
+                    // one the query's expression names *every* origin, so
+                    // replying with it makes the answer unattributable and
+                    // uncacheable. A reply must say who is answering.
+                    .reply(
+                        store_key(inner.store_prefix.as_str(), Hash::ALGO, &hash),
+                        packed?,
+                    )
+                    .encoding(ENC_CHUNK)
+                    .await
+                    .map_err(BlobError::zenoh)?;
+            }
+            Ok(())
+        }
+    }
+}
+
+/// Read and validate a [`WantList`] out of a query payload, replying with the
+/// reason if it is unusable.
+async fn want_list_of(
+    inner: &TreeInner,
+    query: &zenoh::query::Query,
+) -> Result<Option<crate::wire::WantList>> {
+    let Some(payload) = query.payload() else {
+        let _ = query
+            .reply_err("want-list endpoint requires a payload")
+            .await;
+        return Ok(None);
+    };
+    let want: crate::wire::WantList = match decode(&payload.to_bytes()) {
+        Ok(w) => w,
+        Err(e) => {
+            let _ = query.reply_err(format!("undecodable want list: {e}")).await;
+            return Ok(None);
+        }
+    };
+    // Validate before any I/O, exactly as `parse_ranges` does for tier 1: a
+    // malformed request must not be able to drive unbounded work.
+    if let Err(e) = want.validate(inner.max_want_list) {
+        let _ = query.reply_err(e.to_string()).await;
+        return Ok(None);
+    }
+    Ok(Some(want))
+}
+
+/// Serve a batched want-list: one reply per held chunk, each on its ordinary
+/// store key.
+///
+/// Those keys are **disjoint** from the `…/batch` key this query arrived on,
+/// so Zenoh refuses them unless the client asked for
+/// `ReplyKeyExpr::Any` — and it refuses them *here*, on the serving side, once
+/// per chunk. Checking first turns that into one clear error for the client
+/// that got it wrong.
+async fn serve_chunk_batch(inner: &TreeInner, query: zenoh::query::Query) -> Result<()> {
+    if query.accepts_replies() != zenoh::query::ReplyKeyExpr::Any {
+        let _ = query
+            .reply_err(
+                "a batch fetch replies on each chunk's own key, which does not \
+                 intersect the batch key: issue the query with \
+                 accept_replies(ReplyKeyExpr::Any)",
+            )
+            .await;
+        return Ok(());
+    }
+    let Some(want) = want_list_of(inner, &query).await? else {
+        return Ok(());
+    };
+
     let store = inner.store.clone();
     let compression = inner.compression;
-    let packed = tokio::task::spawn_blocking(move || {
-        store.get(&hash).map(|bytes| pack(&bytes, compression))
+    let prefix = inner.store_prefix.as_str().to_string();
+    // One blocking pass for the whole batch: a store `get` is a syscall (or a
+    // transaction), and hundreds of them do not belong on an async worker
+    // one at a time.
+    let packed: Vec<(String, Vec<u8>)> = tokio::task::spawn_blocking(move || {
+        want.hashes
+            .iter()
+            .filter_map(|h| {
+                let bytes = store.get(h)?;
+                let framed = pack(&bytes, compression).ok()?;
+                Some((store_key(&prefix, Hash::ALGO, h), framed))
+            })
+            .collect()
     })
     .await
-    .map_err(|e| BlobError::Protocol(format!("store get task: {e}")))?;
-    if let Some(packed) = packed {
-        query
-            .reply(query.key_expr().clone(), packed?)
+    .map_err(|e| BlobError::Protocol(format!("batch get task: {e}")))?;
+
+    // Silence for what we do not hold: the client re-asks elsewhere, and a
+    // per-chunk "no" would defeat the point of batching.
+    for (key, bytes) in packed {
+        if query
+            .reply(key, bytes)
             .encoding(ENC_CHUNK)
             .await
-            .map_err(BlobError::zenoh)?;
+            .map_err(BlobError::zenoh)
+            .is_err()
+        {
+            break; // the client went away; stop streaming into the void.
+        }
     }
+    Ok(())
+}
+
+/// Serve a chunk probe: one bit per want-list entry, in order.
+async fn serve_chunk_probe(inner: &TreeInner, query: zenoh::query::Query) -> Result<()> {
+    let Some(want) = want_list_of(inner, &query).await? else {
+        return Ok(());
+    };
+    let store = inner.store.clone();
+    let bits = tokio::task::spawn_blocking(move || {
+        crate::wire::HaveBits::from_presence(want.hashes.iter().map(|h| store.has(h)))
+    })
+    .await
+    .map_err(|e| BlobError::Protocol(format!("probe task: {e}")))?;
+    query
+        // Our own key: a probe exists to be attributed (see the chunk reply).
+        .reply(
+            crate::store_have_key(inner.store_prefix.as_str(), Hash::ALGO),
+            encode(&bits)?,
+        )
+        .encoding(crate::wire::ENC_HAVEBITS)
+        .await
+        .map_err(BlobError::zenoh)?;
     Ok(())
 }
 
@@ -826,7 +973,12 @@ async fn serve_index_query(inner: &TreeInner, query: zenoh::query::Query) -> Res
     let Some(tail) = crate::parse_tier2_tail(inner.tree_prefix.as_str(), &key) else {
         return Ok(());
     };
-    let [id] = tail[..] else { return Ok(()) };
+    let id = match tail[..] {
+        [id] => id,
+        // `<tree_prefix>/<id>/have`: how much of this snapshot do you have?
+        [id, crate::STORE_HAVE] => return serve_tree_probe(inner, &query, id).await,
+        _ => return Ok(()),
+    };
     let Some(index) = inner.index.read().await.get(id).cloned() else {
         // Unknown id: silence, not an error reply. A query finalizes when
         // its matching queryables complete, so this resolves on the client
@@ -836,22 +988,47 @@ async fn serve_index_query(inner: &TreeInner, query: zenoh::query::Query) -> Res
     };
     let payload = encode(&index)?;
     query
-        .reply(query.key_expr().clone(), payload)
+        // Our own key, so a wildcard-origin index query can tell holders apart.
+        .reply(tree_key(inner.tree_prefix.as_str(), id), payload)
         .encoding(ENC_INDEX)
         .await
         .map_err(BlobError::zenoh)?;
     Ok(())
 }
 
-/// Parse the chunk hash from a `<store_prefix>/<algo>/<hex>` key; only the
-/// crate's algorithm is served.
-fn parse_store_key(store_prefix: &str, key: &str) -> Option<Hash> {
-    let tail = crate::parse_tier2_tail(store_prefix, key)?;
-    let [algo, hex] = tail[..] else { return None };
-    if algo != Hash::ALGO {
-        return None;
-    }
-    hex.parse().ok()
+/// Answer "how much of snapshot `id` do you have": four numbers, whatever the
+/// size of the snapshot.
+///
+/// A holder that does not know the snapshot says nothing, exactly as it does
+/// for an unknown chunk — silence means "not mine" and costs the asker
+/// nothing.
+async fn serve_tree_probe(inner: &TreeInner, query: &zenoh::query::Query, id: &str) -> Result<()> {
+    let Some(index) = inner.index.read().await.get(id).cloned() else {
+        return Ok(());
+    };
+    let store = inner.store.clone();
+    let needed = index.needed_chunks();
+    let total = needed.len() as u32;
+    let present =
+        tokio::task::spawn_blocking(move || needed.iter().filter(|h| store.has(h)).count() as u32)
+            .await
+            .map_err(|e| BlobError::Protocol(format!("tree probe task: {e}")))?;
+    let probe = crate::wire::TreeProbe {
+        version: WIRE_VERSION,
+        have_index: true,
+        chunks_present: present,
+        chunks_total: total,
+    };
+    query
+        // Our own key, so a wildcard-origin probe can attribute the answer.
+        .reply(
+            crate::tree_have_key(inner.tree_prefix.as_str(), id),
+            encode(&probe)?,
+        )
+        .encoding(crate::wire::ENC_TREEPROBE)
+        .await
+        .map_err(BlobError::zenoh)?;
+    Ok(())
 }
 
 /// Downloads a tree snapshot. Stateless server; persistent client (the store).
@@ -869,6 +1046,7 @@ struct TreeClientConfig {
     max_index_bytes: usize,
     max_tree_bytes: u64,
     max_tree_chunks: u32,
+    batch_size: usize,
     priority: Priority,
     policy: MaterializePolicy,
     temps: Option<Arc<crate::gc::TempTags>>,
@@ -886,6 +1064,10 @@ impl Default for TreeClientConfig {
             // TiB. These are the missing halves of that defence.
             max_tree_bytes: 1 << 40,
             max_tree_chunks: 4_000_000,
+            // Chunks asked for per batched round. 256 keeps a round's reply
+            // volume sane on a shared bus while cutting queries by two orders
+            // of magnitude against the old one-query-per-chunk shape.
+            batch_size: 256,
             // Bulk transfer yields — see `BlobClientBuilder::priority`.
             priority: Priority::DataLow,
             policy: MaterializePolicy::default(),
@@ -945,6 +1127,21 @@ impl TreeClientBuilder {
     /// chunks cost queries and bookkeeping rather than bytes.
     pub fn max_tree_chunks(mut self, n: u32) -> Self {
         self.cfg.max_tree_chunks = n;
+        self
+    }
+
+    /// Chunks requested per batched round (default 256; `0` disables
+    /// batching and falls back to one query per chunk).
+    ///
+    /// Clamped to the server's [`MAX_WANT_LIST`](crate::wire::MAX_WANT_LIST),
+    /// since a server validates the list before doing any work for it.
+    /// Batching is what makes a large snapshot affordable — but it is only
+    /// answered by holders that implement the endpoint, so a fleet served
+    /// entirely by router storages will silently fall back. Watch
+    /// [`TransferStats::queries`](crate::TransferStats::queries) to tell the
+    /// difference.
+    pub fn batch_size(mut self, n: usize) -> Self {
+        self.cfg.batch_size = n.min(crate::wire::MAX_WANT_LIST);
         self
     }
 
@@ -1024,6 +1221,64 @@ impl TreeClient {
     /// [`fetch_index_by_root`](Self::fetch_index_by_root).
     pub async fn fetch_index(&self, id: &str) -> Result<TreeIndex> {
         self.fetch_index_matching(id, None).await
+    }
+
+    /// Ask every origin that answers how much of snapshot `id` it has.
+    ///
+    /// Completes RFC 07 §2.5's probe-then-fetch across all three key families.
+    /// Tier 1 always had purpose-built tiny endpoints; tier 2 had none, and the
+    /// reasoning for that — a `tree` or `store` key *carries the object*, so a
+    /// wildcard GET on one is the bulk fan-out §3 forbids — is correct as far
+    /// as it goes. What follows from it is "give tier 2 something small to
+    /// ask for", which is this: the reply is four numbers regardless of the
+    /// snapshot's size.
+    ///
+    /// Each result names the origin that answered, so the fetch that follows
+    /// can go to a holder that actually has the chunks.
+    pub async fn probe_snapshot(
+        &self,
+        id: &str,
+    ) -> Result<Vec<(QueryPrefix, crate::wire::TreeProbe)>> {
+        validate_id(id)?;
+        let replies = self
+            .session
+            .get(crate::tree_have_key(self.tree_prefix.as_str(), id))
+            .consolidation(ConsolidationMode::None)
+            .priority(self.cfg.priority)
+            .timeout(self.cfg.query_timeout)
+            .await
+            .map_err(BlobError::zenoh)?;
+        let mut out = Vec::new();
+        while let Ok(reply) = replies.recv_async().await {
+            let Ok(sample) = reply.result() else { continue };
+            if sample.encoding().to_string() != crate::wire::ENC_TREEPROBE {
+                continue;
+            }
+            let Ok(probe) = decode::<crate::wire::TreeProbe>(&sample.payload().to_bytes()) else {
+                continue;
+            };
+            if probe.validate().is_err() {
+                continue;
+            }
+            // The reply key is `<origin>/<id>/have`.
+            let Some(origin) = sample
+                .key_expr()
+                .as_str()
+                .strip_suffix(crate::STORE_HAVE)
+                .and_then(|k| k.strip_suffix('/'))
+                .and_then(|k| k.strip_suffix(id))
+                .and_then(|k| k.strip_suffix('/'))
+            else {
+                continue;
+            };
+            let Ok(origin) = QueryPrefix::new(origin) else {
+                continue;
+            };
+            if !out.iter().any(|(o, _): &(QueryPrefix, _)| *o == origin) {
+                out.push((origin, probe));
+            }
+        }
+        Ok(out)
     }
 
     /// Fetch and fully validate the snapshot whose identity **is** `root`.
@@ -1222,31 +1477,152 @@ impl TreeClient {
             .await
             .map_err(|e| BlobError::Protocol(format!("presence task: {e}")))?
         };
-        let mut iter = needed
-            .iter()
-            .cloned()
-            .zip(presence)
-            .enumerate()
-            .map(|(i, (c, present))| (i, c, present));
+        // Split into what we already have and what we must fetch, reporting
+        // the former immediately so a resume shows its true position at once.
+        let mut missing: Vec<(usize, ChunkRef)> = Vec::new();
+        for (i, (chunk, present)) in needed.iter().cloned().zip(presence).enumerate() {
+            if present {
+                received += 1;
+                stats.chunks_resumed += 1;
+                sink.emit(Progress::Chunk {
+                    index: i as u32,
+                    received,
+                    total,
+                    bytes_received,
+                });
+            } else {
+                missing.push((i, chunk));
+            }
+        }
+
+        // Batched rounds first.
+        //
+        // This is the scalability fix: a snapshot used to cost one Zenoh query
+        // per chunk, so a 100k-chunk tree was 100k queries. A holder answers
+        // only the addresses it has and says nothing about the rest, so a
+        // partial holder shortens the round rather than failing it.
+        //
+        // What is left over then goes through the per-chunk path below, and
+        // that fallback is not a nicety: a router-hosted Zenoh storage serves
+        // by key and has nothing stored at `…/batch`, so it never answers a
+        // batch at all. Without the fallback, publish-then-exit would stop
+        // working entirely.
+        if self.cfg.batch_size > 0 && !missing.is_empty() {
+            let mut unanswered: Vec<(usize, ChunkRef)> = Vec::new();
+            for group in missing.chunks(self.cfg.batch_size) {
+                if cancel.is_cancelled() {
+                    sink.emit(Progress::Cancelled { received, total });
+                    return Err(BlobError::Cancelled { received, total });
+                }
+                let refs: Vec<ChunkRef> = group.iter().map(|(_, c)| c.clone()).collect();
+                stats.queries += 1;
+                let (replies, expected) = crate::store_client::batch_query(
+                    &self.session,
+                    self.store_prefix.as_str(),
+                    &refs,
+                    self.cfg.query_timeout,
+                    self.cfg.priority,
+                )
+                .await?;
+
+                // Drain the round *streaming*: a round of `batch_size` chunks
+                // at the CDC maximum would be gigabytes if collected first,
+                // and collecting would also make cancellation as coarse as a
+                // whole round. Chunks land in the store in small flushes, so
+                // memory stays bounded and a cancel keeps what it fetched.
+                const FLUSH: usize = 32;
+                let mut pending: Vec<(Hash, Vec<u8>)> = Vec::with_capacity(FLUSH);
+                let mut arrived: std::collections::HashSet<Hash> = Default::default();
+                let mut cancelled = false;
+                loop {
+                    if cancel.is_cancelled() {
+                        cancelled = true;
+                    }
+                    let next = if cancelled {
+                        None
+                    } else {
+                        replies.recv_async().await.ok()
+                    };
+                    if let Some(reply) = &next
+                        && let Ok(sample) = reply.result()
+                        && let Some((hash, bytes)) = crate::store_client::accept_batch_reply(
+                            self.store_prefix.as_str(),
+                            sample,
+                            &expected,
+                        )
+                        && arrived.insert(hash)
+                    {
+                        pending.push((hash, bytes));
+                    }
+                    if pending.len() >= FLUSH || (next.is_none() && !pending.is_empty()) {
+                        let batch = std::mem::take(&mut pending);
+                        let put_store = store.clone();
+                        let sizes: Vec<(Hash, u64)> =
+                            batch.iter().map(|(h, b)| (*h, b.len() as u64)).collect();
+                        tokio::task::spawn_blocking(move || -> std::io::Result<()> {
+                            for (h, b) in &batch {
+                                put_store.put(h, b)?;
+                            }
+                            Ok(())
+                        })
+                        .await
+                        .map_err(|e| BlobError::Protocol(format!("batch put task: {e}")))??;
+                        for (hash, len) in sizes {
+                            received += 1;
+                            bytes_received += len;
+                            stats.chunks_fetched += 1;
+                            stats.bytes_fetched += len;
+                            let index = group
+                                .iter()
+                                .find(|(_, c)| c.hash == hash)
+                                .map_or(0, |(i, _)| *i as u32);
+                            sink.emit(Progress::Chunk {
+                                index,
+                                received,
+                                total,
+                                bytes_received,
+                            });
+                        }
+                    }
+                    if next.is_none() {
+                        break;
+                    }
+                }
+                for (i, chunk) in group {
+                    if !arrived.contains(&chunk.hash) {
+                        unanswered.push((*i, chunk.clone()));
+                    }
+                }
+                if cancelled {
+                    sink.emit(Progress::Cancelled { received, total });
+                    return Err(BlobError::Cancelled { received, total });
+                }
+            }
+            zdebug!(
+                batched = missing.len() - unanswered.len(),
+                falling_back = unanswered.len(),
+                "tier-2 batch rounds complete"
+            );
+            missing = unanswered;
+            // A cancel observed during the rounds must surface even if the
+            // rounds happened to resolve everything — the chunks are in the
+            // store, so calling again resumes from them.
+            if cancel.is_cancelled() {
+                sink.emit(Progress::Cancelled { received, total });
+                return Err(BlobError::Cancelled { received, total });
+            }
+        }
+
+        let mut iter = missing.into_iter();
         let mut join: tokio::task::JoinSet<Result<(usize, u64, u32)>> = tokio::task::JoinSet::new();
 
         loop {
             // Keep the pipeline full.
             while join.len() < self.cfg.fetch_concurrency {
-                let Some((i, chunk, present)) = iter.next() else {
+                let Some((i, chunk)) = iter.next() else {
                     break;
                 };
-                if present {
-                    received += 1;
-                    stats.chunks_resumed += 1;
-                    sink.emit(Progress::Chunk {
-                        index: i as u32,
-                        received,
-                        total,
-                        bytes_received,
-                    });
-                    continue;
-                }
+                stats.queries += 1;
                 let session = self.session.clone();
                 let hash = chunk.hash;
                 let key = store_key(self.store_prefix.as_str(), Hash::ALGO, &hash);
