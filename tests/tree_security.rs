@@ -757,3 +757,70 @@ async fn preexisting_symlink_cannot_be_traversed() {
 
     session.close().await.unwrap();
 }
+
+/// A holder that answers a small chunk's key with a very large payload must
+/// not be able to choose our allocation, nor to deny a fetch an honest holder
+/// is answering. The index declares each chunk's length and `validate()` has
+/// already capped it, so an over-long reply is refusable before it is unframed.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_over_long_chunk_reply_is_skipped_not_fatal() {
+    let session = open_session().await;
+    let p = unique_prefix();
+    let store_prefix = format!("{p}/store");
+    let tree_prefix = format!("{p}/tree");
+
+    let payload = b"small".to_vec();
+    let payload_hash = Hash::of(&payload);
+    let chunk_key = zblob::store_key(&store_prefix, Hash::ALGO, &payload_hash);
+    let index = index_for(
+        "bloat",
+        vec![Entry::File {
+            path: "f.bin".into(),
+            mode: 0o644,
+            mtime: 0,
+            size: payload.len() as u64,
+            chunks: vec![zblob::ChunkRef {
+                hash: payload_hash,
+                len: payload.len() as u32,
+            }],
+        }],
+    );
+
+    // The hostile holder serves the index and a megabytes-long body under the
+    // five-byte chunk's key…
+    let hostile = fake_tree_server(
+        session.clone(),
+        tree_prefix.clone(),
+        "bloat",
+        wire::encode(&index).unwrap(),
+        vec![(chunk_key.clone(), vec![0xAAu8; 4 * 1024 * 1024])],
+    )
+    .await;
+    // …while an honest one serves the real bytes.
+    let honest = fake_tree_server(
+        session.clone(),
+        tree_prefix.clone(),
+        "bloat",
+        wire::encode(&index).unwrap(),
+        vec![(chunk_key, payload.clone())],
+    )
+    .await;
+
+    let dest = tempfile::tempdir().unwrap();
+    let store: Arc<dyn ContentStore> = Arc::new(MemoryStore::new());
+    test_client(session.clone(), &store_prefix, &tree_prefix)
+        .download_tree(
+            &DownloadRequest::new("bloat"),
+            dest.path(),
+            &store,
+            &(),
+            &CancelToken::new(),
+        )
+        .await
+        .expect("an honest holder is answering; the fetch must complete");
+    assert_eq!(std::fs::read(dest.path().join("f.bin")).unwrap(), payload);
+
+    hostile.abort();
+    honest.abort();
+    session.close().await.unwrap();
+}

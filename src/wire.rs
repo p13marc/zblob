@@ -70,8 +70,40 @@ impl Availability {
     }
 
     /// How many chunks are available.
+    ///
+    /// Counts only bits within `chunk_count`. Summing the whole byte vector
+    /// would let a responder over-report by setting the final byte's padding
+    /// bits, or by sending more bytes than the count needs — this is a value
+    /// off the network, so it is not permitted to exceed its own bound.
     pub fn count(&self) -> u32 {
-        self.bits.iter().map(|b| b.count_ones()).sum()
+        (0..self.chunk_count).filter(|i| self.is_set(*i)).count() as u32
+    }
+
+    /// Check an availability reply against its own claims: the schema version,
+    /// and a bitfield exactly as long as `chunk_count` requires.
+    ///
+    /// A decoded `Availability` is remote input. Without the length check a
+    /// responder can answer `chunk_count = 1` with megabytes of `bits`, and
+    /// callers accumulating one reply per responder pay for all of it.
+    pub fn validate(&self, max_chunks: u32) -> Result<()> {
+        if self.version != WIRE_VERSION {
+            return Err(BlobError::UnsupportedVersion(self.version));
+        }
+        if self.chunk_count > max_chunks {
+            return Err(BlobError::Protocol(format!(
+                "availability claims {} chunks, over the limit of {max_chunks}",
+                self.chunk_count
+            )));
+        }
+        let want = self.chunk_count.div_ceil(8) as usize;
+        if self.bits.len() != want {
+            return Err(BlobError::Protocol(format!(
+                "availability bitfield is {} bytes, expected {want} for {} chunks",
+                self.bits.len(),
+                self.chunk_count
+            )));
+        }
+        Ok(())
     }
 }
 
@@ -83,6 +115,61 @@ pub fn encode<T: Serialize>(value: &T) -> Result<Vec<u8>> {
 /// Decode a control message from postcard bytes.
 pub fn decode<T: DeserializeOwned>(data: &[u8]) -> Result<T> {
     postcard::from_bytes(data).map_err(BlobError::encode)
+}
+
+#[cfg(test)]
+mod properties {
+    use super::*;
+    use proptest::prelude::*;
+
+    proptest! {
+        /// An availability reply is a remote peer's claim about itself, so it
+        /// must never be able to claim more than it declared — whatever bytes
+        /// arrive, and whether or not they are well-formed. Summing the byte
+        /// vector, the obvious implementation, fails this the moment the final
+        /// byte has padding bits set.
+        #[test]
+        fn count_never_exceeds_the_declared_chunk_count(
+            chunk_count in 0u32..5000,
+            bits in prop::collection::vec(any::<u8>(), 0..800),
+        ) {
+            let avail = Availability { version: WIRE_VERSION, chunk_count, bits };
+            prop_assert!(avail.count() <= chunk_count);
+            // …and it must agree with the per-chunk accessor it is derived from.
+            let by_hand = (0..chunk_count).filter(|i| avail.is_set(*i)).count() as u32;
+            prop_assert_eq!(avail.count(), by_hand);
+        }
+
+        /// `validate` accepts exactly the bitfields whose length matches the
+        /// count they claim — the check that stops a responder answering
+        /// "1 chunk" with megabytes of bits.
+        #[test]
+        fn validate_accepts_only_well_sized_bitfields(
+            chunk_count in 0u32..5000,
+            len in 0usize..800,
+        ) {
+            let avail = Availability {
+                version: WIRE_VERSION,
+                chunk_count,
+                bits: vec![0u8; len],
+            };
+            prop_assert_eq!(
+                avail.validate(u32::MAX).is_ok(),
+                len == chunk_count.div_ceil(8) as usize
+            );
+        }
+    }
+
+    /// The honest constructor must satisfy its own validator — otherwise the
+    /// check above is just rejecting everything.
+    #[test]
+    fn full_availability_is_valid() {
+        for n in [0u32, 1, 7, 8, 9, 4095] {
+            let a = Availability::full(n);
+            a.validate(u32::MAX).expect("full() must validate");
+            assert_eq!(a.count(), n, "full() must report every chunk present");
+        }
+    }
 }
 
 #[cfg(test)]

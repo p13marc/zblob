@@ -21,7 +21,7 @@ use zenoh::qos::Priority;
 use zenoh::query::ConsolidationMode;
 
 use crate::cancel::CancelToken;
-use crate::chunk::TransferChunks;
+use crate::chunk::{MIN_CHUNK_SIZE, TransferChunks};
 use crate::error::{BlobError, Result};
 use crate::hash::Hash;
 use crate::manifest::{BlobSpec, Manifest, validate_id};
@@ -81,6 +81,7 @@ struct ClientConfig {
     retry: RetryPolicy,
     max_chunks_per_query: u32,
     max_blob_size: u64,
+    max_probe_replies: usize,
     overwrite: Overwrite,
     priority: Priority,
 }
@@ -92,6 +93,9 @@ impl Default for ClientConfig {
             retry: RetryPolicy::default(),
             max_chunks_per_query: 512,
             max_blob_size: 1 << 40, // 1 TiB — a remote peer must not size our disk.
+            // How many responders a fan-out probe will collect. The number of
+            // peers that answer is not ours to choose, so it is bounded.
+            max_probe_replies: 256,
             overwrite: Overwrite::default(),
             // Bulk transfer yields. Replies inherit the *query's* QoS (a
             // server cannot set it), so the only place this can be decided is
@@ -357,13 +361,21 @@ impl BlobClient {
             .map_err(BlobError::zenoh)?;
         let mut out = Vec::new();
         while let Ok(reply) = replies.recv_async().await {
+            // One responder per entry, and the responder count is not ours to
+            // choose — cap it so a flood of repliers cannot grow this vector
+            // without bound.
+            if out.len() >= self.cfg.max_probe_replies {
+                break;
+            }
             let Ok(sample) = reply.result() else { continue };
             if sample.encoding().to_string() != ENC_AVAIL {
                 continue;
             }
             // A malformed reply from one responder must not hide the others.
             if let Ok(avail) = decode::<Availability>(&sample.payload().to_bytes())
-                && avail.version == crate::wire::WIRE_VERSION
+                && avail
+                    .validate(self.cfg.max_blob_size.div_ceil(MIN_CHUNK_SIZE as u64) as u32)
+                    .is_ok()
             {
                 out.push(avail);
             }

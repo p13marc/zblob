@@ -167,7 +167,7 @@ struct Inner {
     session: Arc<zenoh::Session>,
     prefix: String,
     registry: RwLock<HashMap<String, Registered>>,
-    inflight: Semaphore,
+    inflight: Arc<Semaphore>,
     cfg: ServerConfig,
     pushes: tokio::sync::Mutex<HashMap<String, PushEntry>>,
 }
@@ -277,7 +277,7 @@ impl BlobServerBuilder {
                 session: self.session,
                 prefix: self.prefix,
                 registry: RwLock::new(HashMap::new()),
-                inflight: Semaphore::new(self.cfg.max_inflight),
+                inflight: Arc::new(Semaphore::new(self.cfg.max_inflight)),
                 cfg: self.cfg,
                 pushes: tokio::sync::Mutex::new(HashMap::new()),
             }),
@@ -464,7 +464,15 @@ impl BlobServer {
                 q = queryable.recv_async() => {
                     let Ok(query) = q else { break };
                     let inner = self.inner.clone();
+                    // Take the in-flight permit *here*, before spawning. Taken
+                    // inside the task it would bound concurrent work but not
+                    // the number of queued tasks, each of which holds its
+                    // `Query` — and a push slice holds a whole chunk payload.
+                    // Awaiting here also stops draining the queryable, which is
+                    // the backpressure the semaphore was meant to be.
+                    let Ok(permit) = inner.inflight.clone().acquire_owned().await else { break };
                     tokio::spawn(async move {
+                        let _permit = permit;
                         if let Err(e) = serve_one(&inner, query).await {
                             report_error(&inner.cfg.on_error, &e);
                         }
@@ -494,12 +502,6 @@ pub(crate) type FifoQueryable =
     zenoh::query::Queryable<zenoh::handlers::FifoChannelHandler<zenoh::query::Query>>;
 
 async fn serve_one(inner: &Inner, query: zenoh::query::Query) -> Result<()> {
-    let _permit = inner
-        .inflight
-        .acquire()
-        .await
-        .map_err(|e| BlobError::Protocol(e.to_string()))?;
-
     let key_str = query.key_expr().as_str().to_string();
     let Some(id) = parse_id(&inner.prefix, &key_str) else {
         return Ok(()); // not a per-blob query; ignore.

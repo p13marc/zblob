@@ -51,8 +51,14 @@ pub(crate) const TAG_ZSTD: u8 = 0x01;
 /// XChaCha20-Poly1305 sealed container (at rest only; see `crate::crypt`).
 pub(crate) const TAG_SEALED: u8 = 0x02;
 
-/// Largest uncompressed chunk a frame may declare (matches the CDC `max` cap).
-const MAX_UNPACKED: usize = 16 * 1024 * 1024;
+/// Largest uncompressed chunk a frame may yield (matches the CDC `max` cap).
+///
+/// This bounds **both** arms. Guarding only the compressed one looks
+/// sufficient — a raw frame's size is its own size, so there is nothing to
+/// "declare" — but the frame arrives over the network before anything about it
+/// is trusted, so an unbounded raw arm is an unbounded allocation a remote peer
+/// chooses, multiplied by the fetch concurrency.
+pub(crate) const MAX_UNPACKED: usize = 16 * 1024 * 1024;
 
 /// Frame `bytes` according to `compression`.
 pub(crate) fn pack(bytes: &[u8], compression: ChunkCompression) -> Result<Vec<u8>> {
@@ -86,7 +92,12 @@ pub(crate) fn pack(bytes: &[u8], compression: ChunkCompression) -> Result<Vec<u8
 /// Unframe a chunk container back to its raw bytes.
 pub(crate) fn try_unpack(packed: &[u8]) -> std::result::Result<Vec<u8>, ContainerError> {
     match packed.split_first() {
-        Some((&TAG_RAW, rest)) => Ok(rest.to_vec()),
+        Some((&TAG_RAW, rest)) => {
+            if rest.len() > MAX_UNPACKED {
+                return Err(ContainerError::Corrupt);
+            }
+            Ok(rest.to_vec())
+        }
         Some((&TAG_ZSTD, rest)) => {
             if rest.len() < 4 {
                 return Err(ContainerError::Corrupt);
@@ -125,6 +136,51 @@ pub(crate) fn unpack(packed: &[u8]) -> Result<Vec<u8>> {
         ),
         ContainerError::Corrupt => BlobError::Protocol("malformed chunk container".into()),
     })
+}
+
+#[cfg(test)]
+mod properties {
+    use super::*;
+    use proptest::prelude::*;
+
+    proptest! {
+        /// Whatever a peer sends, unframing it must never yield more than the
+        /// container format's own ceiling. This is the bound that makes the
+        /// allocation ours rather than the sender's, and it has to hold on
+        /// *both* arms: the raw arm has no declared length to check, which is
+        /// exactly why it was the one left unguarded.
+        #[test]
+        fn unpacking_never_exceeds_the_ceiling(
+            tag in any::<u8>(),
+            body in prop::collection::vec(any::<u8>(), 0..4096),
+        ) {
+            let mut framed = vec![tag];
+            framed.extend_from_slice(&body);
+            if let Ok(out) = try_unpack(&framed) {
+                prop_assert!(out.len() <= MAX_UNPACKED);
+            }
+        }
+    }
+
+    /// A raw frame one byte over the ceiling is refused; one byte under it is
+    /// accepted. Without the second half this would pass for a `try_unpack`
+    /// that rejected everything.
+    #[test]
+    fn the_raw_ceiling_is_exact() {
+        let ok = vec![0u8; MAX_UNPACKED];
+        let mut framed = vec![TAG_RAW];
+        framed.extend_from_slice(&ok);
+        assert!(
+            try_unpack(&framed).is_ok(),
+            "a frame at the ceiling is fine"
+        );
+
+        framed.push(0);
+        assert!(
+            try_unpack(&framed).is_err(),
+            "a frame over the ceiling must be refused"
+        );
+    }
 }
 
 #[cfg(test)]

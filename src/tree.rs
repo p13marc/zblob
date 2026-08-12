@@ -211,6 +211,41 @@ impl TreeIndex {
         out
     }
 
+    /// All distinct chunk references, carrying each chunk's declared length.
+    ///
+    /// The length matters on the fetch path: it is the bound a reply must
+    /// respect, and `validate()` has already capped it at `cdc.max`. Where two
+    /// entries disagree about one hash's length — which only a malformed index
+    /// does, since content determines length — the larger is kept, so an
+    /// honest reply is never rejected for being too long.
+    pub fn needed_chunk_refs(&self) -> Vec<ChunkRef> {
+        let mut index: std::collections::HashMap<Hash, u32> = std::collections::HashMap::new();
+        let mut order = Vec::new();
+        for e in &self.entries {
+            if let Entry::File { chunks, .. } = e {
+                for c in chunks {
+                    match index.entry(c.hash) {
+                        std::collections::hash_map::Entry::Occupied(mut slot) => {
+                            let len = slot.get_mut();
+                            *len = (*len).max(c.len);
+                        }
+                        std::collections::hash_map::Entry::Vacant(slot) => {
+                            slot.insert(c.len);
+                            order.push(c.hash);
+                        }
+                    }
+                }
+            }
+        }
+        order
+            .into_iter()
+            .map(|hash| ChunkRef {
+                hash,
+                len: index[&hash],
+            })
+            .collect()
+    }
+
     /// Total size in bytes of all file entries (the reconstructed tree's payload).
     pub fn total_size(&self) -> u64 {
         self.entries
@@ -577,7 +612,7 @@ struct TreeInner {
     tree_prefix: String,
     store: Arc<dyn ContentStore>,
     index: tokio::sync::RwLock<std::collections::HashMap<String, TreeIndex>>,
-    inflight: Semaphore,
+    inflight: Arc<Semaphore>,
     compression: ChunkCompression,
     on_error: Option<ErrorCallback>,
 }
@@ -623,7 +658,7 @@ impl TreeServerBuilder {
                 tree_prefix: self.tree_prefix,
                 store: self.store,
                 index: tokio::sync::RwLock::new(std::collections::HashMap::new()),
-                inflight: Semaphore::new(self.max_inflight),
+                inflight: Arc::new(Semaphore::new(self.max_inflight)),
                 compression: self.compression,
                 on_error: self.on_error,
             }),
@@ -725,7 +760,12 @@ impl TreeServer {
                 q = store_q.recv_async() => {
                     let Ok(query) = q else { break };
                     let inner = self.inner.clone();
+                    // Permit before spawn — see BlobServer::serve_loop: taken
+                    // inside the task it bounds work but not the queue of
+                    // tasks holding queries.
+                    let Ok(permit) = inner.inflight.clone().acquire_owned().await else { break };
                     tokio::spawn(async move {
+                        let _permit = permit;
                         if let Err(e) = serve_chunk_query(&inner, query).await {
                             report_error(&inner.on_error, &e);
                         }
@@ -734,7 +774,9 @@ impl TreeServer {
                 q = tree_q.recv_async() => {
                     let Ok(query) = q else { break };
                     let inner = self.inner.clone();
+                    let Ok(permit) = inner.inflight.clone().acquire_owned().await else { break };
                     tokio::spawn(async move {
+                        let _permit = permit;
                         if let Err(e) = serve_index_query(&inner, query).await {
                             report_error(&inner.on_error, &e);
                         }
@@ -747,11 +789,6 @@ impl TreeServer {
 }
 
 async fn serve_chunk_query(inner: &TreeInner, query: zenoh::query::Query) -> Result<()> {
-    let _permit = inner
-        .inflight
-        .acquire()
-        .await
-        .map_err(|e| BlobError::Protocol(e.to_string()))?;
     let key = query.key_expr().as_str();
     let Some(hash) = parse_store_key(&inner.store_prefix, key) else {
         return Ok(()); // not a chunk key (or foreign algo); ignore.
@@ -774,11 +811,6 @@ async fn serve_chunk_query(inner: &TreeInner, query: zenoh::query::Query) -> Res
 }
 
 async fn serve_index_query(inner: &TreeInner, query: zenoh::query::Query) -> Result<()> {
-    let _permit = inner
-        .inflight
-        .acquire()
-        .await
-        .map_err(|e| BlobError::Protocol(e.to_string()))?;
     let key = query.key_expr().as_str().to_string();
     let Some(id) = key.strip_prefix(&format!("{}/", inner.tree_prefix)) else {
         return Ok(());
@@ -1079,7 +1111,7 @@ impl TreeClient {
 
         zdebug!(id = %index.id, chunks = total, "tree download start");
         let mut stats = self
-            .fetch_missing(&needed, store, sink, cancel, total)
+            .fetch_missing(&index.needed_chunk_refs(), store, sink, cancel, total)
             .await?;
 
         // Materialize (all blocking fs work on the blocking pool).
@@ -1105,7 +1137,7 @@ impl TreeClient {
     /// (present or fetched), so a resume reports its true position at once.
     async fn fetch_missing(
         &self,
-        needed: &[Hash],
+        needed: &[ChunkRef],
         store: &Arc<dyn ContentStore>,
         sink: &dyn ProgressSink,
         cancel: &CancelToken,
@@ -1121,23 +1153,26 @@ impl TreeClient {
             let store = store.clone();
             let needed = needed.to_vec();
             tokio::task::spawn_blocking(move || {
-                needed.iter().map(|h| store.has(h)).collect::<Vec<_>>()
+                needed
+                    .iter()
+                    .map(|c| store.has(&c.hash))
+                    .collect::<Vec<_>>()
             })
             .await
             .map_err(|e| BlobError::Protocol(format!("presence task: {e}")))?
         };
         let mut iter = needed
             .iter()
-            .copied()
+            .cloned()
             .zip(presence)
             .enumerate()
-            .map(|(i, (h, present))| (i, h, present));
+            .map(|(i, (c, present))| (i, c, present));
         let mut join: tokio::task::JoinSet<Result<(usize, u64, u32)>> = tokio::task::JoinSet::new();
 
         loop {
             // Keep the pipeline full.
             while join.len() < self.cfg.fetch_concurrency {
-                let Some((i, hash, present)) = iter.next() else {
+                let Some((i, chunk, present)) = iter.next() else {
                     break;
                 };
                 if present {
@@ -1152,13 +1187,15 @@ impl TreeClient {
                     continue;
                 }
                 let session = self.session.clone();
+                let hash = chunk.hash;
                 let key = store_key(&self.store_prefix, Hash::ALGO, &hash);
                 let timeout = self.cfg.query_timeout;
                 let priority = self.cfg.priority;
                 let store = store.clone();
                 join.spawn(async move {
                     let (bytes, rejected) =
-                        fetch_one_chunk(&session, &key, &hash, timeout, priority).await?;
+                        fetch_one_chunk(&session, &key, &hash, chunk.len, timeout, priority)
+                            .await?;
                     let len = bytes.len() as u64;
                     let put_store = store.clone();
                     tokio::task::spawn_blocking(move || put_store.put(&hash, &bytes))
@@ -1206,9 +1243,16 @@ async fn fetch_one_chunk(
     session: &zenoh::Session,
     key: &str,
     hash: &Hash,
+    expected_len: u32,
     timeout: Duration,
     priority: Priority,
 ) -> Result<(Vec<u8>, u32)> {
+    // A container is one tag byte plus the chunk (a compressed frame is
+    // smaller still), so anything longer than that cannot be the chunk we
+    // asked for. Checking the length *before* unframing means a hostile
+    // holder cannot pick our allocation size, which it otherwise could —
+    // multiplied by `fetch_concurrency`.
+    let max_frame = expected_len as usize + 1 + 4;
     let mut rejected = 0u32;
     let replies = session
         .get(key)
@@ -1222,11 +1266,16 @@ async fn fetch_one_chunk(
         if sample.encoding().to_string() != ENC_CHUNK {
             continue;
         }
-        let Ok(bytes) = unpack(&sample.payload().to_bytes()) else {
+        let payload = sample.payload().to_bytes();
+        if payload.len() > max_frame {
+            rejected += 1;
+            continue; // over-long for the declared chunk; do not unframe it.
+        }
+        let Ok(bytes) = unpack(&payload) else {
             rejected += 1;
             continue; // malformed frame; wait for a good replier.
         };
-        if Hash::of(&bytes) != *hash {
+        if bytes.len() as u32 != expected_len || Hash::of(&bytes) != *hash {
             rejected += 1;
             continue; // hostile or corrupt replier; wait for a good one.
         }
