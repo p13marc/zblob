@@ -37,8 +37,12 @@ use crate::{
 /// What to do when the destination path already exists at completion time.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum Overwrite {
-    /// Fail with [`BlobError::DestinationExists`], keeping the finished
-    /// `.part` next to the destination (nothing is lost). The default.
+    /// Fail with [`BlobError::DestinationExists`]. The default.
+    ///
+    /// Checked *before* the transfer, so an occupied destination costs
+    /// nothing. It is checked again at the end — the destination can appear
+    /// while a download is in flight — and in that case the finished `.part`
+    /// is kept next to it, so the transfer is not thrown away either.
     #[default]
     Refuse,
     /// Atomically replace the existing file.
@@ -670,6 +674,19 @@ impl BlobClient {
         cancel: &CancelToken,
     ) -> Result<TransferStats> {
         let started_at = tokio::time::Instant::now();
+
+        // Refuse *before* transferring, not after.
+        //
+        // This used to be checked once the download had completed and been
+        // fsynced, so a full transfer crossed the wire — and the `.part` was
+        // preallocated to the remote-supplied total_len — for a request that
+        // was then refused. It is re-checked after the transfer as well, since
+        // the destination can appear while we are fetching; that late check is
+        // the TOCTOU backstop, not the policy.
+        if self.cfg.overwrite == Overwrite::Refuse && tokio::fs::try_exists(dest).await? {
+            return Err(BlobError::DestinationExists(dest.to_path_buf()));
+        }
+
         let (manifest, chunks) = self.start(req).await?;
         let count = chunks.count();
         zdebug!(id = %manifest.id, total_len = manifest.total_len, chunks = count, "download start");

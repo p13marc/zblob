@@ -228,6 +228,15 @@ pub async fn receive_fanout(
     cfg: FanoutConfig,
 ) -> Result<TransferStats> {
     let started_at = tokio::time::Instant::now();
+
+    // Refuse before receiving anything, as `download_to` does. Checking after
+    // the stream had been consumed spent the whole transfer on a request that
+    // was then refused — and, worse, the error path below deletes the `.part`,
+    // which contradicts what `Overwrite::Refuse` promises ("nothing is lost").
+    if cfg.overwrite == Overwrite::Refuse && tokio::fs::try_exists(dest).await? {
+        return Err(BlobError::DestinationExists(dest.to_path_buf()));
+    }
+
     let subscriber = session
         .declare_subscriber(fanout_key(prefix, id))
         // The declare-time history query replays the publisher's whole cache
@@ -415,16 +424,22 @@ pub async fn receive_fanout(
             }
         }
         file.sync_data().await?;
-        if cfg.overwrite == Overwrite::Refuse && tokio::fs::try_exists(dest).await? {
-            return Err(BlobError::DestinationExists(dest.to_path_buf()));
-        }
         Ok(())
     }
     .await;
     drop(file);
     if let Err(e) = result {
+        // A destination that appeared while we were receiving is the TOCTOU
+        // backstop for the check at the top — and it must *keep* the finished
+        // `.part`, which is exactly what `Overwrite::Refuse` documents.
+        if matches!(e, BlobError::DestinationExists(_)) {
+            return Err(e);
+        }
         let _ = tokio::fs::remove_file(&part).await;
         return Err(e);
+    }
+    if cfg.overwrite == Overwrite::Refuse && tokio::fs::try_exists(dest).await? {
+        return Err(BlobError::DestinationExists(dest.to_path_buf()));
     }
     tokio::fs::rename(&part, dest).await?;
     sink.emit(Progress::Completed {

@@ -9,7 +9,7 @@ use std::sync::Arc;
 use std::sync::Mutex;
 use std::time::Duration;
 
-use common::unique_prefix;
+use common::{open_session, unique_prefix};
 use zblob::{
     BlobError, CancelToken, CdcParams, ContentStore, DirStore, DownloadRequest, Entry, MemoryStore,
     Progress, ProgressSink, TreeClient, TreeServer, build_tree,
@@ -756,6 +756,96 @@ async fn content_addressed_trees_pin_by_construction() {
         .await
         .expect_err("unknown root must not resolve");
     assert!(matches!(err, BlobError::NotFound(_)), "{err}");
+
+    handle.shutdown().await.unwrap();
+    session.close().await.unwrap();
+}
+
+/// A garbage collection running mid-download must not collect the chunks that
+/// download has already fetched.
+///
+/// Progress in tier 2 *is* "which hashes are in the store", so a sweep sees
+/// freshly-fetched chunks that no tagged snapshot references yet and takes
+/// them for garbage — and the download then fails with `NotFound` for a chunk
+/// it stored itself. `gc::TempTags` has always existed for this and had no
+/// caller; giving the client the same registry the sweep uses connects them.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_sweep_cannot_collect_an_in_flight_download() {
+    use std::sync::Arc as StdArc;
+    use zblob::gc;
+
+    let session = open_session().await;
+    let p = unique_prefix();
+    let store_prefix = format!("{p}/store");
+    let tree_prefix = format!("{p}/tree");
+
+    let src = tempfile::tempdir().unwrap();
+    std::fs::write(src.path().join("a.bin"), common::pseudo_random(60_000, 61)).unwrap();
+    std::fs::write(src.path().join("b.bin"), common::pseudo_random(60_000, 62)).unwrap();
+    let server_store: Arc<dyn ContentStore> = Arc::new(MemoryStore::new());
+    let index = build_tree(src.path(), "swept", &small_cdc(), &*server_store).unwrap();
+    let server = TreeServer::new(
+        session.clone(),
+        store_prefix.clone(),
+        tree_prefix.clone(),
+        server_store,
+    );
+    server.register(index.clone()).await;
+    let handle = server.spawn().await.unwrap();
+
+    // The client's store starts empty and holds nothing any tag references, so
+    // an unprotected sweep would collect every chunk it fetches.
+    let temps = StdArc::new(gc::TempTags::new());
+    let tag_dir = tempfile::tempdir().unwrap();
+    let tags = gc::SnapshotTags::open(tag_dir.path()).unwrap();
+    let client_store: Arc<dyn ContentStore> = Arc::new(MemoryStore::new());
+    let client = TreeClient::builder(session.clone(), &store_prefix, &tree_prefix)
+        .query_timeout(Duration::from_secs(5))
+        .temp_tags(temps.clone())
+        .build();
+
+    let dest = tempfile::tempdir().unwrap();
+    // Sweep repeatedly while the download runs.
+    let sweeper = {
+        let store = client_store.clone();
+        let temps = temps.clone();
+        let tag_dir = tag_dir.path().to_path_buf();
+        tokio::spawn(async move {
+            let tags = gc::SnapshotTags::open(&tag_dir).unwrap();
+            for _ in 0..40 {
+                let _ = gc::sweep(&*store, &tags, &temps, []);
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
+        })
+    };
+
+    client
+        .download_tree(
+            &DownloadRequest::pinned("swept", index.root_hash),
+            dest.path(),
+            &client_store,
+            &(),
+            &CancelToken::new(),
+        )
+        .await
+        .expect("a concurrent sweep must not break the download");
+    sweeper.await.unwrap();
+
+    assert_eq!(
+        std::fs::read(dest.path().join("a.bin")).unwrap(),
+        common::pseudo_random(60_000, 61)
+    );
+
+    // Discriminating power: the sweeps were real and effective. Once the
+    // download released its temp tag and nothing is tagged, its chunks *are*
+    // garbage and get collected — the protection is scoped to the transfer,
+    // not permanent. If sweeping had been a no-op the store would still be
+    // full here, and the assertion above would have proved nothing.
+    let _ = gc::sweep(&*client_store, &tags, &temps, []).unwrap();
+    assert!(
+        client_store.hashes().unwrap().is_empty(),
+        "an untagged store must be collectable once the download released its tag"
+    );
 
     handle.shutdown().await.unwrap();
     session.close().await.unwrap();

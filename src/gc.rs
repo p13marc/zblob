@@ -5,23 +5,37 @@
 //! model here is iroh's, cut down:
 //!
 //! - **Persistent tags** ([`SnapshotTags`]): named references to whole
-//!   snapshots, stored on disk (one postcard [`TreeIndex`] per tag), so
+//!   snapshots, stored on disk (one postcard [`TagRecord`] per tag), so
 //!   liveness survives restart. Tag what you want to keep.
 //! - **Temp tags** ([`TempTags`] / [`TempTag`]): in-memory guards for chunks a
 //!   running download is about to add. A sweep racing a download must not
-//!   collect chunks the index references but the store only half-has; take a
-//!   temp tag on `index.needed_chunks()` before fetching, drop it after.
+//!   collect chunks the index references but the store only half-has.
 //! - **Mark and sweep** ([`sweep`]): everything reachable from the persistent
 //!   tags, live temp tags, and any extra roots survives; the rest is removed.
 //!
+//! Give the client the same [`TempTags`] the sweep uses and the protection is
+//! automatic — `download_tree` takes a temp tag over the snapshot's chunks for
+//! the duration of the transfer:
+//!
 //! ```ignore
+//! let temps = Arc::new(gc::TempTags::new());
 //! let tags = SnapshotTags::open(state_dir.join("tags"))?;
-//! tags.set("current", &index)?;              // survives restart
-//! let temp = temps.protect(index.needed_chunks());
+//! let client = TreeClient::builder(session, store_prefix, tree_prefix)
+//!     .temp_tags(temps.clone())     // downloads now protect themselves
+//!     .build();
 //! client.download_tree(&req, &dest, &store, &(), &cancel).await?;
-//! drop(temp);
+//! tags.set("current", &index)?;      // survives restart
 //! let stats = gc::sweep(&*store, &tags, &temps, [])?;
 //! ```
+//!
+//! Without a shared registry a concurrent sweep is free to delete chunks a
+//! running download has already fetched, and the download then fails with a
+//! `NotFound` for a chunk it just stored.
+//!
+//! **A sweep is still not atomic against concurrent writers.** The live set is
+//! computed and then acted on, so a snapshot tagged, or registered on a
+//! [`TreeServer`](crate::TreeServer), *during* a sweep is not protected by it —
+//! pass such indices as `extra_roots`.
 
 use std::collections::HashSet;
 use std::path::PathBuf;
@@ -33,7 +47,23 @@ use crate::paths::fsync_dir;
 use crate::store::ContentStore;
 use crate::tree::TreeIndex;
 
-/// Persistent, named snapshot references: one postcard-encoded [`TreeIndex`]
+/// What a persistent tag records about a snapshot.
+///
+/// Only what liveness needs: the root that names the snapshot, and the chunks
+/// keeping it alive. Storing the whole [`TreeIndex`] meant every sweep decoded
+/// every tagged snapshot's full entry list — paths, modes, sizes, per-file
+/// chunk vectors — to reach a set of hashes it could have stored directly.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct TagRecord {
+    /// Wire schema version (first field; postcard is positional).
+    pub version: u16,
+    /// The tagged snapshot's identity.
+    pub root: Hash,
+    /// The distinct chunk hashes the snapshot references.
+    pub chunks: Vec<Hash>,
+}
+
+/// Persistent, named snapshot references: one postcard-encoded [`TagRecord`]
 /// per tag, in a directory. A tagged snapshot's chunks are live.
 pub struct SnapshotTags {
     dir: PathBuf,
@@ -55,10 +85,17 @@ impl SnapshotTags {
     }
 
     /// Create or replace tag `name` → `index` (atomic, fsynced).
+    ///
+    /// Only the snapshot's root and chunk set are written; see [`TagRecord`].
     pub fn set(&self, name: &str, index: &TreeIndex) -> Result<()> {
         use std::io::Write;
         let path = self.path(name)?;
-        let payload = crate::wire::encode(index)?;
+        let record = TagRecord {
+            version: crate::wire::WIRE_VERSION,
+            root: index.root_hash,
+            chunks: index.needed_chunks(),
+        };
+        let payload = crate::wire::encode(&record)?;
         let mut tmp = tempfile::NamedTempFile::new_in(&self.dir)?;
         tmp.write_all(&payload)?;
         tmp.as_file().sync_all()?;
@@ -68,7 +105,7 @@ impl SnapshotTags {
     }
 
     /// Read tag `name`, if present.
-    pub fn get(&self, name: &str) -> Result<Option<TreeIndex>> {
+    pub fn get(&self, name: &str) -> Result<Option<TagRecord>> {
         let path = self.path(name)?;
         match std::fs::read(&path) {
             Ok(bytes) => Ok(Some(crate::wire::decode(&bytes)?)),
@@ -104,8 +141,8 @@ impl SnapshotTags {
     pub fn live_set(&self) -> Result<HashSet<Hash>> {
         let mut live = HashSet::new();
         for name in self.list()? {
-            if let Some(index) = self.get(&name)? {
-                live.extend(index.needed_chunks());
+            if let Some(record) = self.get(&name)? {
+                live.extend(record.chunks);
             }
         }
         Ok(live)
@@ -113,13 +150,14 @@ impl SnapshotTags {
 }
 
 /// A registry of in-memory temp tags protecting in-flight chunk sets.
-#[derive(Default)]
+#[derive(Default, Debug)]
 pub struct TempTags {
     sets: Mutex<Vec<Weak<HashSet<Hash>>>>,
 }
 
 /// A live guard: while it exists, its chunks survive [`sweep`]. Dropping it
 /// releases the protection.
+#[derive(Debug)]
 pub struct TempTag {
     _set: Arc<HashSet<Hash>>,
 }
@@ -216,7 +254,9 @@ mod tests {
 
         // Reopen (as after a restart): the tag and its live set survive.
         let tags2 = SnapshotTags::open(tag_dir.path()).unwrap();
-        assert_eq!(tags2.get("current").unwrap().unwrap(), index);
+        let record = tags2.get("current").unwrap().unwrap();
+        assert_eq!(record.root, index.root_hash);
+        assert_eq!(record.chunks, index.needed_chunks());
         assert_eq!(
             tags2.live_set().unwrap(),
             index.needed_chunks().into_iter().collect()

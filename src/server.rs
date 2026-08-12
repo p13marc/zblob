@@ -215,6 +215,27 @@ struct Inner {
 }
 
 /// Serves registered blobs over a Zenoh queryable at `<prefix>/**`.
+///
+/// # Several servers may share one prefix
+///
+/// A server **ignores ids it has not registered**: an unknown id draws no
+/// reply at all, not an error. So two or more `BlobServer`s can serve the same
+/// prefix, each owning a disjoint set of ids, and a client's query is answered
+/// by whichever one owns the id. This is supported and depended on — a sensor
+/// that serves long-lived artifacts from one server and short-TTL captures
+/// from another is the motivating case — so it is promised here rather than
+/// left as an accident of the implementation.
+///
+/// Two consequences follow from it:
+///
+/// - **An unknown id costs a client its full query timeout**, since silence is
+///   how "not mine" is expressed. That is the price of the arrangement: a
+///   server cannot answer "I don't have it" without also answering for ids a
+///   co-server *does* have.
+/// - **A refusal from one server is not a refusal from all of them.** The push
+///   path treats an error reply as one responder's opinion and keeps waiting
+///   for an acceptance, exactly as every download loop treats an unusable
+///   reply (see the crate docs, fact 3).
 #[derive(Clone)]
 pub struct BlobServer {
     inner: Arc<Inner>,

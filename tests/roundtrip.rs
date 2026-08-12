@@ -210,7 +210,10 @@ async fn overwrite_policy_refuse_and_replace() {
     let dest = dest_dir.path().join("out.bin");
     std::fs::write(&dest, b"previous contents").unwrap();
 
-    // Default policy refuses to clobber; the finished .part is kept.
+    // Default policy refuses to clobber — *before* transferring anything, so
+    // no bytes cross the wire and no partial is left lying around. (This used
+    // to be checked after the download completed, which spent a full transfer
+    // on a request it then refused.)
     let refuse = test_client(session.clone(), &prefix);
     let err = refuse
         .download_to(
@@ -223,7 +226,10 @@ async fn overwrite_policy_refuse_and_replace() {
         .expect_err("must refuse");
     assert!(matches!(err, BlobError::DestinationExists(_)), "{err}");
     assert_eq!(std::fs::read(&dest).unwrap(), b"previous contents");
-    assert!(dest_dir.path().join("out.bin.part").exists());
+    assert!(
+        !dest_dir.path().join("out.bin.part").exists(),
+        "a refused download must not have transferred anything"
+    );
 
     // Replace policy overwrites atomically.
     let replace = BlobClient::builder(session.clone(), &prefix)

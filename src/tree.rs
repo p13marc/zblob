@@ -867,6 +867,7 @@ struct TreeClientConfig {
     max_tree_chunks: u32,
     priority: Priority,
     policy: MaterializePolicy,
+    temps: Option<Arc<crate::gc::TempTags>>,
 }
 
 impl Default for TreeClientConfig {
@@ -884,6 +885,7 @@ impl Default for TreeClientConfig {
             // Bulk transfer yields — see `BlobClientBuilder::priority`.
             priority: Priority::DataLow,
             policy: MaterializePolicy::default(),
+            temps: None,
         }
     }
 }
@@ -947,6 +949,21 @@ impl TreeClientBuilder {
     /// operations).
     pub fn materialize_policy(mut self, policy: MaterializePolicy) -> Self {
         self.cfg.policy = policy;
+        self
+    }
+
+    /// Protect in-flight downloads from a concurrent
+    /// [`gc::sweep`](crate::gc::sweep) by registering their chunks in `temps`.
+    ///
+    /// Pass the same registry the sweep is given. Progress in tier 2 *is*
+    /// "which hashes are in the store", so a sweep running mid-download sees
+    /// chunks that no tagged snapshot references yet and collects them — and
+    /// the download then fails on a chunk it had already fetched. The
+    /// mechanism for this has always existed in `gc`; this is what connects
+    /// it. Without a registry, downloads are unprotected (the previous, and
+    /// only, behaviour).
+    pub fn temp_tags(mut self, temps: Arc<crate::gc::TempTags>) -> Self {
+        self.cfg.temps = Some(temps);
         self
     }
 
@@ -1108,6 +1125,13 @@ impl TreeClient {
             )));
         }
         let needed = index.needed_chunks();
+        // Hold a temp tag over this snapshot's chunks for the whole transfer,
+        // so a sweep racing us cannot collect what we have already fetched.
+        let _protect = self
+            .cfg
+            .temps
+            .as_ref()
+            .map(|t| t.protect(needed.iter().copied()));
         if needed.len() as u64 > self.cfg.max_tree_chunks as u64 {
             return Err(BlobError::InvalidManifest(format!(
                 "snapshot references {} chunks, over the configured limit of {}",
