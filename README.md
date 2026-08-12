@@ -90,7 +90,8 @@ let handle = server.spawn().await?;
 
 // ...or publish into a router storage (with read-back settling) and exit:
 zblob::publish_snapshot(&session, "demo/store", "demo/tree", &index, &*store,
-                        zblob::ChunkCompression::default(), settle).await?;
+                        zblob::ChunkCompression::default(),
+                        zblob::SettleCoverage::All, settle).await?;
 
 // client
 let client = zblob::TreeClient::new(session, "demo/store", "demo/tree");

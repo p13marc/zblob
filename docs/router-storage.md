@@ -27,9 +27,16 @@ one byte string), the storage's last-writer-wins reconciliation is a no-op and
 re-publishing is idempotent.
 
 `publish_snapshot` ends with a **read-back settle phase** — it GETs the index
-and a sample of chunk keys until the storage answers (or the settle budget
-expires) — so a resolved publish means *a client can fetch this now*, not just
-"the samples left the producer".
+and, per `SettleCoverage`, either a bounded sample of chunk keys or all of them,
+until the storage answers (or the settle budget expires).
+
+Be precise about what that buys. `SettleCoverage::All` means *a client can fetch
+this now*. `SettleCoverage::Sample(n)` is a smoke test — it establishes that the
+storage received something, and says nothing about the chunks it did not probe.
+A producer that is about to exit should use `All`. And note that **any**
+responder satisfies a probe, so a `TreeServer` still running on the same prefix
+makes the phase report success without a storage having retained anything —
+easy to arrange accidentally while developing.
 
 ## How it fits together
 
@@ -37,7 +44,7 @@ expires) — so a resolved publish means *a client can fetch this now*, not just
 flowchart LR
     subgraph Producer["producer"]
         BT["build_tree(dir, id, cdc, store)"] --> PS["publish_snapshot(...)"]
-        PS --> PC["publish_store"]
+        PS --> PC["publish_snapshot_chunks"]
         PS --> PI["publish_index"]
         PS --> RB["read-back settle"]
         RB --> EX["(then exits)"]
@@ -63,9 +70,14 @@ flowchart LR
 
 `zblob` provides the producer side:
 
-- `publish_chunk` / `publish_store` — PUT content-addressed chunks.
+- `publish_chunk` — PUT one content-addressed chunk.
+- `publish_snapshot_chunks` — PUT the chunks one snapshot references.
+- `publish_store` — PUT *every* chunk in a store. This mirrors a whole content
+  store to a router, which is occasionally what you want and is usually not:
+  a producer's store holds other snapshots' chunks too.
 - `publish_index` — PUT an encoded `TreeIndex`.
-- `publish_snapshot` — chunks, index, then read-back settling.
+- `publish_snapshot` — the snapshot's chunks, its index, then read-back
+  settling.
 
 The consumer side is **unchanged**: `TreeClient::download_tree` issues ordinary
 GETs, which the storage answers exactly as a `TreeServer` would. Producer and
@@ -99,6 +111,7 @@ zblob::publish_snapshot(
     &index,
     &store,
     zblob::ChunkCompression::default(),
+    zblob::SettleCoverage::All,         // the producer is about to exit
     std::time::Duration::from_secs(10), // settle budget
 ).await?;
 // producer may now exit; the router serves the snapshot

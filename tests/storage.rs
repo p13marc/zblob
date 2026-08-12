@@ -95,6 +95,9 @@ async fn publish_to_storage_then_download_without_server() {
         &index,
         &producer_store,
         zblob::ChunkCompression::default(),
+        // Every chunk, not a sample: the point of this test is that the
+        // producer can exit and the snapshot is genuinely retrievable.
+        zblob::SettleCoverage::All,
         Duration::from_secs(10),
     )
     .await
@@ -129,4 +132,89 @@ async fn publish_to_storage_then_download_without_server() {
 
     storage.abort();
     session.close().await.unwrap();
+}
+
+/// `publish_snapshot` publishes the snapshot, not the store it was built in.
+///
+/// A producer's store routinely holds chunks from other snapshots — and on a
+/// shared machine, other tenants' — while the storage being published into is
+/// typically fleet-wide. Iterating `store.hashes()` therefore exported
+/// everything the producer happened to have.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn publish_snapshot_exports_only_the_snapshot() {
+    let session = Arc::new(zenoh::open(isolated_config()).await.unwrap());
+    let root = unique_prefix();
+    let store_prefix = format!("{root}/store");
+    let tree_prefix = format!("{root}/tree");
+    let storage = spawn_storage(session.clone(), root.clone()).await;
+
+    let cdc = CdcParams {
+        min: 2048,
+        avg: 8192,
+        max: 32768,
+        normalization: 2,
+        gear_seed: 0,
+    };
+
+    // One store, two snapshots — the ordinary shape for a producer that keeps
+    // a warm store to dedup against.
+    let producer_store = MemoryStore::new();
+    let published_src = tempfile::tempdir().unwrap();
+    std::fs::write(published_src.path().join("shipped.bin"), b"this one ships").unwrap();
+    let published = build_tree(published_src.path(), "shipped", &cdc, &producer_store).unwrap();
+
+    let private_src = tempfile::tempdir().unwrap();
+    let secret = b"this one must not leave the producer".to_vec();
+    std::fs::write(private_src.path().join("private.bin"), &secret).unwrap();
+    let private = build_tree(private_src.path(), "private", &cdc, &producer_store).unwrap();
+
+    publish_snapshot(
+        &session,
+        &store_prefix,
+        &tree_prefix,
+        &published,
+        &producer_store,
+        zblob::ChunkCompression::default(),
+        zblob::SettleCoverage::All,
+        Duration::from_secs(10),
+    )
+    .await
+    .expect("publish snapshot");
+
+    // The published snapshot's chunks are in the storage (discriminating
+    // power: without this, the assertion below would hold for an empty
+    // storage too).
+    for hash in published.needed_chunks() {
+        let key = zblob::store_key(&store_prefix, zblob::Hash::ALGO, &hash);
+        assert!(
+            probe(&session, &key).await,
+            "the published snapshot must be retrievable: {key}"
+        );
+    }
+    // The other snapshot's chunks are not.
+    for hash in private.needed_chunks() {
+        let key = zblob::store_key(&store_prefix, zblob::Hash::ALGO, &hash);
+        assert!(
+            !probe(&session, &key).await,
+            "an unpublished snapshot's chunk leaked into the storage: {key}"
+        );
+    }
+
+    storage.abort();
+    session.close().await.unwrap();
+}
+
+/// Does anything answer for `key`?
+async fn probe(session: &zenoh::Session, key: &str) -> bool {
+    let replies = session
+        .get(key)
+        .timeout(Duration::from_millis(700))
+        .await
+        .unwrap();
+    while let Ok(reply) = replies.recv_async().await {
+        if reply.result().is_ok() {
+            return true;
+        }
+    }
+    false
 }

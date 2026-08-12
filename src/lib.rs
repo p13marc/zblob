@@ -89,7 +89,10 @@ pub use hash::{Hash, HashParseError};
 pub use manifest::{BlobSpec, Manifest};
 pub use obs::TransferStats;
 pub use progress::{Progress, ProgressSink};
-pub use publish::{publish_chunk, publish_index, publish_snapshot, publish_store};
+pub use publish::{
+    SettleCoverage, publish_chunk, publish_index, publish_snapshot, publish_snapshot_chunks,
+    publish_store,
+};
 pub use server::{
     BlobServer, BlobServerBuilder, BlobSource, ErrorCallback, FileBlobSource, MemoryBlobSource,
     PushPolicy, ReadAtSize, ServerHandle,
