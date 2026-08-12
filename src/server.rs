@@ -19,6 +19,7 @@ use crate::chunk::TransferChunks;
 use crate::error::{BlobError, Result};
 use crate::manifest::{BlobSpec, Manifest, validate_id};
 use crate::obs::{zdebug, zwarn};
+use crate::prefix::ServePrefix;
 use crate::resume::ResumeState;
 use crate::verify::{self, OutboardStore, ReadAtCursor};
 use crate::wire::{Availability, ENC_AVAIL, ENC_MANIFEST, ENC_PUSH, ENC_SLICE, encode};
@@ -207,7 +208,7 @@ impl Default for ServerConfig {
 
 struct Inner {
     session: Arc<zenoh::Session>,
-    prefix: String,
+    prefix: ServePrefix,
     registry: RwLock<HashMap<String, Registered>>,
     inflight: Arc<Semaphore>,
     cfg: ServerConfig,
@@ -244,7 +245,7 @@ pub struct BlobServer {
 /// Builder for a [`BlobServer`] (see [`BlobServer::builder`]).
 pub struct BlobServerBuilder {
     session: Arc<zenoh::Session>,
-    prefix: String,
+    prefix: ServePrefix,
     cfg: ServerConfig,
 }
 
@@ -371,19 +372,16 @@ impl ServerHandle {
 
 impl BlobServer {
     /// Start building a server for blobs under `key_prefix`.
-    pub fn builder(
-        session: Arc<zenoh::Session>,
-        key_prefix: impl Into<String>,
-    ) -> BlobServerBuilder {
+    pub fn builder(session: Arc<zenoh::Session>, key_prefix: ServePrefix) -> BlobServerBuilder {
         BlobServerBuilder {
             session,
-            prefix: key_prefix.into(),
+            prefix: key_prefix,
             cfg: ServerConfig::default(),
         }
     }
 
     /// Build a server with default configuration (see [`BlobServer::builder`]).
-    pub fn new(session: Arc<zenoh::Session>, key_prefix: impl Into<String>) -> Self {
+    pub fn new(session: Arc<zenoh::Session>, key_prefix: ServePrefix) -> Self {
         Self::builder(session, key_prefix).build()
     }
 
@@ -534,7 +532,6 @@ impl BlobServer {
     }
 
     async fn declare(&self) -> Result<FifoQueryable> {
-        crate::paths::validate_serve_prefix(&self.inner.prefix)?;
         let key = format!("{}/**", self.inner.prefix);
         self.inner
             .session
@@ -589,7 +586,7 @@ pub(crate) type FifoQueryable =
 
 async fn serve_one(inner: &Inner, query: zenoh::query::Query) -> Result<()> {
     let key_str = query.key_expr().as_str().to_string();
-    let Some(id) = parse_id(&inner.prefix, &key_str) else {
+    let Some(id) = parse_id(inner.prefix.as_str(), &key_str) else {
         return Ok(()); // not a per-blob query; ignore.
     };
 
@@ -646,7 +643,10 @@ async fn serve_one(inner: &Inner, query: zenoh::query::Query) -> Result<()> {
     if key_str.ends_with("/have") {
         let avail = Availability::full(chunks.count());
         query
-            .reply(crate::availability_key(&inner.prefix, &id), encode(&avail)?)
+            .reply(
+                crate::availability_key(inner.prefix.as_str(), &id),
+                encode(&avail)?,
+            )
             .encoding(ENC_AVAIL)
             .await
             .map_err(BlobError::zenoh)?;
@@ -657,7 +657,7 @@ async fn serve_one(inner: &Inner, query: zenoh::query::Query) -> Result<()> {
     if key_str.ends_with("/manifest") {
         let payload = encode(&manifest)?;
         query
-            .reply(manifest_key(&inner.prefix, &id), payload)
+            .reply(manifest_key(inner.prefix.as_str(), &id), payload)
             .encoding(ENC_MANIFEST)
             .await
             .map_err(BlobError::zenoh)?;
@@ -704,7 +704,7 @@ async fn serve_one(inner: &Inner, query: zenoh::query::Query) -> Result<()> {
             // A reply error means the client dropped the GET (query finalized):
             // stop promptly instead of streaming the rest into the void.
             if query
-                .reply(slice_key(&inner.prefix, &id, index), slice)
+                .reply(slice_key(inner.prefix.as_str(), &id, index), slice)
                 .encoding(ENC_SLICE)
                 .await
                 .is_err()

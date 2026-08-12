@@ -32,7 +32,7 @@ async fn fanout_reaches_live_and_late_subscribers() {
         tokio::spawn(async move {
             receive_fanout(
                 session,
-                &prefix,
+                &common::query(prefix),
                 "rollout",
                 Some(expected),
                 &dest,
@@ -54,7 +54,7 @@ async fn fanout_reaches_live_and_late_subscribers() {
 
     let (manifest, handle) = fanout_file(
         session.clone(),
-        &prefix,
+        &common::serve(prefix.clone()),
         BlobSpec::new("rollout").chunk_size(MIN_CHUNK_SIZE),
         &src_path,
         FanoutConfig::default(),
@@ -79,7 +79,7 @@ async fn fanout_reaches_live_and_late_subscribers() {
         Duration::from_secs(20),
         receive_fanout(
             session.clone(),
-            &prefix,
+            &common::query(prefix.clone()),
             "rollout",
             Some(manifest.root),
             &late_dest,

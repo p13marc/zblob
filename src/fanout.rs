@@ -33,6 +33,7 @@ use crate::error::{BlobError, Result};
 use crate::hash::Hash;
 use crate::manifest::{BlobSpec, Manifest};
 use crate::obs::{TransferStats, zdebug};
+use crate::prefix::{QueryPrefix, ServePrefix};
 use crate::progress::{Progress, ProgressSink};
 use crate::verify;
 
@@ -109,7 +110,7 @@ impl FanoutHandle {
 /// `(id, root)` so receivers can pin.
 pub async fn fanout_file(
     session: Arc<zenoh::Session>,
-    prefix: &str,
+    prefix: &ServePrefix,
     spec: BlobSpec,
     path: impl Into<PathBuf>,
     cfg: FanoutConfig,
@@ -140,7 +141,7 @@ pub async fn fanout_file(
 
     let stop = Arc::new(tokio::sync::Notify::new());
     let stop2 = stop.clone();
-    let key = fanout_key(prefix, &manifest.id);
+    let key = fanout_key(prefix.as_str(), &manifest.id);
     let task_manifest = manifest.clone();
     let join = tokio::spawn(async move {
         let publisher = session
@@ -219,7 +220,7 @@ pub async fn fanout_file(
 #[allow(clippy::too_many_arguments)] // transfer surface mirrors download_to
 pub async fn receive_fanout(
     session: Arc<zenoh::Session>,
-    prefix: &str,
+    prefix: &QueryPrefix,
     id: &str,
     expected_root: Option<Hash>,
     dest: &Path,
@@ -238,7 +239,7 @@ pub async fn receive_fanout(
     }
 
     let subscriber = session
-        .declare_subscriber(fanout_key(prefix, id))
+        .declare_subscriber(fanout_key(prefix.as_str(), id))
         // The declare-time history query replays the publisher's whole cache
         // (no depth limit) — this is what makes late joiners work; the
         // default 10 s query timeout is too tight for a large replay.

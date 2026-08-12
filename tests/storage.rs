@@ -90,8 +90,8 @@ async fn publish_to_storage_then_download_without_server() {
     // chunks — when it returns Ok, a client can fetch immediately (no sleeps).
     publish_snapshot(
         &session,
-        &store_prefix,
-        &tree_prefix,
+        &common::serve(store_prefix.clone()),
+        &common::serve(tree_prefix.clone()),
         &index,
         &producer_store,
         zblob::ChunkCompression::default(),
@@ -105,9 +105,13 @@ async fn publish_to_storage_then_download_without_server() {
 
     // The producer is "gone": only the storage answers from here on.
     let client_dir = tempfile::tempdir().unwrap();
-    let client = TreeClient::builder(session.clone(), store_prefix, tree_prefix)
-        .query_timeout(Duration::from_secs(5))
-        .build();
+    let client = TreeClient::builder(
+        session.clone(),
+        common::query(store_prefix),
+        common::query(tree_prefix),
+    )
+    .query_timeout(Duration::from_secs(5))
+    .build();
     let client_store: Arc<dyn ContentStore> = Arc::new(MemoryStore::new());
     client
         .download_tree(
@@ -170,8 +174,8 @@ async fn publish_snapshot_exports_only_the_snapshot() {
 
     publish_snapshot(
         &session,
-        &store_prefix,
-        &tree_prefix,
+        &common::serve(store_prefix.clone()),
+        &common::serve(tree_prefix.clone()),
         &published,
         &producer_store,
         zblob::ChunkCompression::default(),

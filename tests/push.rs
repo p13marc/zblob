@@ -22,7 +22,7 @@ impl PushPolicy for TokenPolicy {
 }
 
 fn test_client(session: Arc<zenoh::Session>, prefix: &str) -> BlobClient {
-    BlobClient::builder(session, prefix)
+    BlobClient::builder(session, common::query(prefix))
         .query_timeout(Duration::from_secs(5))
         .retry(RetryPolicy {
             max_attempts: 2,
@@ -39,7 +39,7 @@ async fn authorized_push_lands_and_serves() {
     let prefix = unique_prefix();
     let spool = tempfile::tempdir().unwrap();
 
-    let server = BlobServer::builder(session.clone(), prefix.clone())
+    let server = BlobServer::builder(session.clone(), common::serve(prefix.clone()))
         .accept_push(Arc::new(TokenPolicy), spool.path())
         .build();
     let handle = server.spawn().await.unwrap();
@@ -90,7 +90,7 @@ async fn unauthorized_or_unconfigured_push_denied() {
     let prefix = unique_prefix();
     let spool = tempfile::tempdir().unwrap();
 
-    let server = BlobServer::builder(session.clone(), prefix.clone())
+    let server = BlobServer::builder(session.clone(), common::serve(prefix.clone()))
         .accept_push(Arc::new(TokenPolicy), spool.path())
         .build();
     let handle = server.spawn().await.unwrap();
@@ -120,7 +120,7 @@ async fn unauthorized_or_unconfigured_push_denied() {
 
     // A server without accept_push refuses outright.
     let plain_prefix = unique_prefix();
-    let plain = BlobServer::new(session.clone(), plain_prefix.clone());
+    let plain = BlobServer::new(session.clone(), common::serve(plain_prefix.clone()));
     let plain_handle = plain.spawn().await.unwrap();
     let client2 = test_client(session.clone(), &plain_prefix);
     let err = client2
@@ -147,7 +147,7 @@ async fn interrupted_upload_resumes_from_spool() {
     let prefix = unique_prefix();
     let spool = tempfile::tempdir().unwrap();
 
-    let server = BlobServer::builder(session.clone(), prefix.clone())
+    let server = BlobServer::builder(session.clone(), common::serve(prefix.clone()))
         .accept_push(Arc::new(TokenPolicy), spool.path())
         .build();
     let handle = server.spawn().await.unwrap();
@@ -246,7 +246,7 @@ async fn empty_blob_push_finalizes_at_offer() {
     let prefix = unique_prefix();
     let spool = tempfile::tempdir().unwrap();
 
-    let server = BlobServer::builder(session.clone(), prefix.clone())
+    let server = BlobServer::builder(session.clone(), common::serve(prefix.clone()))
         .accept_push(Arc::new(TokenPolicy), spool.path())
         .build();
     let handle = server.spawn().await.unwrap();
@@ -295,7 +295,7 @@ async fn push_cannot_hijack_registered_blob() {
     let spool = tempfile::tempdir().unwrap();
 
     let original = pseudo_random(MIN_CHUNK_SIZE as usize * 2, 71);
-    let server = BlobServer::builder(session.clone(), prefix.clone())
+    let server = BlobServer::builder(session.clone(), common::serve(prefix.clone()))
         .accept_push(Arc::new(TokenPolicy), spool.path())
         .build();
     let registered = server
@@ -414,7 +414,7 @@ async fn concurrent_push_cap_enforced() {
     let prefix = unique_prefix();
     let spool = tempfile::tempdir().unwrap();
 
-    let server = BlobServer::builder(session.clone(), prefix.clone())
+    let server = BlobServer::builder(session.clone(), common::serve(prefix.clone()))
         .accept_push(Arc::new(TokenPolicy), spool.path())
         .push_max_concurrent(1)
         .build();
@@ -503,14 +503,14 @@ async fn a_refusing_co_server_cannot_deny_an_accepting_one() {
     let spool = tempfile::tempdir().unwrap();
 
     // One server accepts pushes…
-    let accepting = BlobServer::builder(session.clone(), prefix.clone())
+    let accepting = BlobServer::builder(session.clone(), common::serve(prefix.clone()))
         .accept_push(Arc::new(OpenPolicy), spool.path())
         .build()
         .spawn()
         .await
         .unwrap();
     // …and one on the same prefix has push switched off entirely.
-    let refusing = BlobServer::new(session.clone(), prefix.clone())
+    let refusing = BlobServer::new(session.clone(), common::serve(prefix.clone()))
         .spawn()
         .await
         .unwrap();

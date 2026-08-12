@@ -16,7 +16,7 @@ use zblob::{
 
 /// A client tuned for tests: fail fast instead of the 30 s defaults.
 fn test_client(session: Arc<zenoh::Session>, prefix: &str) -> BlobClient {
-    BlobClient::builder(session, prefix)
+    BlobClient::builder(session, common::query(prefix))
         .query_timeout(Duration::from_secs(5))
         .retry(RetryPolicy {
             max_attempts: 2,
@@ -37,7 +37,7 @@ async fn roundtrip_file_multichunk_pinned() {
     let src_path = src.path().join("artifact.bin");
     std::fs::write(&src_path, &data).unwrap();
 
-    let server = BlobServer::new(session.clone(), prefix.clone());
+    let server = BlobServer::new(session.clone(), common::serve(prefix.clone()));
     let manifest = server
         .register_file(
             BlobSpec::new("blob-1")
@@ -105,7 +105,7 @@ async fn roundtrip_memory_source_tiny_and_empty() {
     let prefix = unique_prefix();
 
     let tiny = pseudo_random(10_000, 2); // < one 16 KiB group
-    let server = BlobServer::new(session.clone(), prefix.clone());
+    let server = BlobServer::new(session.clone(), common::serve(prefix.clone()));
     server
         .register_source(
             BlobSpec::new("tiny"),
@@ -159,7 +159,7 @@ async fn wrong_pin_rejected_before_any_write() {
     let prefix = unique_prefix();
 
     let data = pseudo_random(50_000, 3);
-    let server = BlobServer::new(session.clone(), prefix.clone());
+    let server = BlobServer::new(session.clone(), common::serve(prefix.clone()));
     server
         .register_source(
             BlobSpec::new("blob-p"),
@@ -196,7 +196,7 @@ async fn overwrite_policy_refuse_and_replace() {
     let prefix = unique_prefix();
 
     let data = pseudo_random(30_000, 4);
-    let server = BlobServer::new(session.clone(), prefix.clone());
+    let server = BlobServer::new(session.clone(), common::serve(prefix.clone()));
     server
         .register_source(
             BlobSpec::new("blob-o"),
@@ -232,7 +232,7 @@ async fn overwrite_policy_refuse_and_replace() {
     );
 
     // Replace policy overwrites atomically.
-    let replace = BlobClient::builder(session.clone(), &prefix)
+    let replace = BlobClient::builder(session.clone(), common::query(prefix))
         .overwrite(Overwrite::Replace)
         .query_timeout(Duration::from_secs(5))
         .build();
@@ -256,10 +256,10 @@ async fn unknown_id_is_not_found() {
     let session = open_session().await;
     let prefix = unique_prefix();
     // A server exists but has nothing registered.
-    let server = BlobServer::new(session.clone(), prefix.clone());
+    let server = BlobServer::new(session.clone(), common::serve(prefix.clone()));
     let handle = server.spawn().await.unwrap();
 
-    let client = BlobClient::builder(session.clone(), &prefix)
+    let client = BlobClient::builder(session.clone(), common::query(prefix))
         .query_timeout(Duration::from_secs(2))
         .build();
     let err = client.fetch_manifest("nope").await.expect_err("no blob");

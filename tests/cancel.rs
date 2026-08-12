@@ -13,7 +13,7 @@ use zblob::{
 };
 
 fn test_client(session: Arc<zenoh::Session>, prefix: &str) -> BlobClient {
-    BlobClient::builder(session, prefix)
+    BlobClient::builder(session, common::query(prefix))
         .query_timeout(Duration::from_secs(5))
         .retry(RetryPolicy {
             max_attempts: 2,
@@ -45,7 +45,7 @@ async fn cancel_persists_then_resumes() {
     let dest = dir.path().join("d.bin");
 
     let data = pseudo_random(MIN_CHUNK_SIZE as usize * 8, 0xC0FFEE);
-    let server = BlobServer::new(session.clone(), prefix.clone());
+    let server = BlobServer::new(session.clone(), common::serve(prefix.clone()));
     server
         .register_source(
             BlobSpec::new("blob-x").chunk_size(MIN_CHUNK_SIZE),
@@ -100,7 +100,7 @@ async fn delete_partial_clears_state() {
     let dest = dir.path().join("d.bin");
 
     let data = pseudo_random(MIN_CHUNK_SIZE as usize * 4, 0xBEEF);
-    let server = BlobServer::new(session.clone(), prefix.clone());
+    let server = BlobServer::new(session.clone(), common::serve(prefix.clone()));
     server
         .register_source(
             BlobSpec::new("blob-y").chunk_size(MIN_CHUNK_SIZE),

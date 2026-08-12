@@ -24,9 +24,13 @@ fn small_cdc() -> CdcParams {
 }
 
 fn test_client(session: Arc<zenoh::Session>, store_prefix: &str, tree_prefix: &str) -> TreeClient {
-    TreeClient::builder(session, store_prefix, tree_prefix)
-        .query_timeout(Duration::from_secs(3))
-        .build()
+    TreeClient::builder(
+        session,
+        common::query(store_prefix),
+        common::query(tree_prefix),
+    )
+    .query_timeout(Duration::from_secs(3))
+    .build()
 }
 
 /// Serve a hand-crafted (possibly malicious) index + chunk set.
@@ -395,8 +399,8 @@ async fn pinned_tree_root_rejects_substitution() {
     let index = build_tree(src.path(), "pinned", &small_cdc(), &*server_store).unwrap();
     let server = TreeServer::new(
         session.clone(),
-        store_prefix.clone(),
-        tree_prefix.clone(),
+        common::serve(store_prefix.clone()),
+        common::serve(tree_prefix.clone()),
         server_store,
     );
     server.register(index).await;
@@ -459,9 +463,13 @@ async fn wrong_content_chunk_ignored() {
     .await;
 
     let dest = tempfile::tempdir().unwrap();
-    let client = TreeClient::builder(session.clone(), &store_prefix, &tree_prefix)
-        .query_timeout(Duration::from_secs(2))
-        .build();
+    let client = TreeClient::builder(
+        session.clone(),
+        common::query(store_prefix),
+        common::query(tree_prefix),
+    )
+    .query_timeout(Duration::from_secs(2))
+    .build();
     let store: Arc<dyn ContentStore> = Arc::new(MemoryStore::new());
     let err = client
         .download_tree(
@@ -547,10 +555,14 @@ async fn existing_directory_is_not_silently_destroyed() {
     let dest2 = tempfile::tempdir().unwrap();
     std::fs::create_dir(dest2.path().join("Documents")).unwrap();
     std::fs::write(dest2.path().join("Documents/thesis.txt"), b"years of work").unwrap();
-    let permissive = TreeClient::builder(session.clone(), &store_prefix, &tree_prefix)
-        .query_timeout(Duration::from_secs(3))
-        .materialize_policy(zblob::MaterializePolicy::default().replace_directories(true))
-        .build();
+    let permissive = TreeClient::builder(
+        session.clone(),
+        common::query(store_prefix),
+        common::query(tree_prefix),
+    )
+    .query_timeout(Duration::from_secs(3))
+    .materialize_policy(zblob::MaterializePolicy::default().replace_directories(true))
+    .build();
     let store2: Arc<dyn ContentStore> = Arc::new(MemoryStore::new());
     permissive
         .download_tree(
@@ -633,19 +645,23 @@ async fn setid_bits_are_masked_unless_requested() {
     // assertion above is about the mask, not about set_mode being a no-op.
     let dest2 = tempfile::tempdir().unwrap();
     let store2: Arc<dyn ContentStore> = Arc::new(MemoryStore::new());
-    TreeClient::builder(session.clone(), &store_prefix, &tree_prefix)
-        .query_timeout(Duration::from_secs(3))
-        .materialize_policy(zblob::MaterializePolicy::default().restore_setid(true))
-        .build()
-        .download_tree(
-            &DownloadRequest::new("setuid"),
-            dest2.path(),
-            &store2,
-            &(),
-            &CancelToken::new(),
-        )
-        .await
-        .expect("opted-in restore");
+    TreeClient::builder(
+        session.clone(),
+        common::query(store_prefix),
+        common::query(tree_prefix),
+    )
+    .query_timeout(Duration::from_secs(3))
+    .materialize_policy(zblob::MaterializePolicy::default().restore_setid(true))
+    .build()
+    .download_tree(
+        &DownloadRequest::new("setuid"),
+        dest2.path(),
+        &store2,
+        &(),
+        &CancelToken::new(),
+    )
+    .await
+    .expect("opted-in restore");
     let mode2 = std::fs::metadata(dest2.path().join("rooted"))
         .unwrap()
         .permissions()
@@ -905,8 +921,8 @@ async fn a_corrupt_store_cannot_materialize_wrong_bytes() {
     let victim = index.needed_chunks()[0];
     let server = TreeServer::new(
         session.clone(),
-        store_prefix.clone(),
-        tree_prefix.clone(),
+        common::serve(store_prefix.clone()),
+        common::serve(tree_prefix.clone()),
         server_store,
     );
     server.register(index.clone()).await;

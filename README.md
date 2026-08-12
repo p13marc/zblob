@@ -39,16 +39,23 @@ A download is a manifest GET, then range-set slice GETs
 arbitrary-hole fetch are the same code path. Memory stays `O(chunk_size)`
 regardless of blob size and arrival order.
 
+Key prefixes are typed by the role they play: a server owns a concrete
+`ServePrefix`, a client asks through a `QueryPrefix` (which may name several
+origins). Serving something implies being able to ask for it, so the
+conversion one way is free and the other way is fallible.
+
 ```rust,ignore
 // Server
-let server = zblob::BlobServer::new(session.clone(), "demo/blobs");
+let serve = zblob::ServePrefix::new("demo/blobs")?;
+let query = zblob::QueryPrefix::from(&serve);
+let server = zblob::BlobServer::new(session.clone(), serve);
 let manifest = server
     .register_file(zblob::BlobSpec::new("blob-1").filename("report.pcap"), &path)
     .await?;
 let handle = server.spawn().await?; // distribute (id, manifest.root) out of band
 
 // Client — the caller picks the destination; pin the root when you know it.
-let client = zblob::BlobClient::new(session, "demo/blobs");
+let client = zblob::BlobClient::new(session, query);
 let stats = client
     .download_to(
         &zblob::DownloadRequest::pinned("blob-1", manifest.root),
@@ -83,18 +90,23 @@ change re-transfers only its neighborhood.
 let store: Arc<dyn zblob::ContentStore> = Arc::new(zblob::MemoryStore::new());
 let index = zblob::build_tree(dir, "snap-1", &zblob::CdcParams::default(), &*store)?;
 
+let store_p = zblob::ServePrefix::new("demo/store")?;
+let tree_p = zblob::ServePrefix::new("demo/tree")?;
+
 // serve live...
-let server = zblob::TreeServer::new(session.clone(), "demo/store", "demo/tree", store.clone());
+let server = zblob::TreeServer::new(
+    session.clone(), store_p.clone(), tree_p.clone(), store.clone());
 server.register(index.clone()).await;
 let handle = server.spawn().await?;
 
 // ...or publish into a router storage (with read-back settling) and exit:
-zblob::publish_snapshot(&session, "demo/store", "demo/tree", &index, &*store,
+zblob::publish_snapshot(&session, &store_p, &tree_p, &index, &*store,
                         zblob::ChunkCompression::default(),
                         zblob::SettleCoverage::All, settle).await?;
 
 // client
-let client = zblob::TreeClient::new(session, "demo/store", "demo/tree");
+let client = zblob::TreeClient::new(
+    session, (&store_p).into(), (&tree_p).into());
 client.download_tree(
     &zblob::DownloadRequest::pinned("snap-1", index.root_hash),
     &dest, &content_store, &(), &zblob::CancelToken::new(),

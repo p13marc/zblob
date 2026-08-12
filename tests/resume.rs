@@ -15,7 +15,7 @@ use zblob::{
 };
 
 fn test_client(session: Arc<zenoh::Session>, prefix: &str) -> BlobClient {
-    BlobClient::builder(session, prefix)
+    BlobClient::builder(session, common::query(prefix))
         .query_timeout(Duration::from_secs(5))
         .retry(RetryPolicy {
             max_attempts: 3,
@@ -48,7 +48,7 @@ async fn interrupt_then_resume_across_clients() {
     let dest = dir.path().join("data.bin");
 
     let data = pseudo_random(MIN_CHUNK_SIZE as usize * 8, 0x1234);
-    let server = BlobServer::new(session.clone(), prefix.clone());
+    let server = BlobServer::new(session.clone(), common::serve(prefix.clone()));
     server
         .register_source(
             BlobSpec::new("blob-r").chunk_size(MIN_CHUNK_SIZE),

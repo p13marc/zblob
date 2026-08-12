@@ -26,6 +26,7 @@ use zenoh::query::ConsolidationMode;
 use crate::compress::{ChunkCompression, pack};
 use crate::error::{BlobError, Result};
 use crate::hash::Hash;
+use crate::prefix::ServePrefix;
 use crate::store::ContentStore;
 use crate::tree::TreeIndex;
 use crate::wire::{ENC_CHUNK, ENC_INDEX, encode};
@@ -39,15 +40,14 @@ use crate::{store_key, tree_key};
 /// the wire. Idempotent — re-PUTting an identical chunk is a no-op.
 pub async fn publish_chunk(
     session: &zenoh::Session,
-    store_prefix: &str,
+    store_prefix: &ServePrefix,
     hash: &Hash,
     bytes: &[u8],
     compression: ChunkCompression,
 ) -> Result<()> {
-    crate::paths::validate_serve_prefix(store_prefix)?;
     session
         .put(
-            store_key(store_prefix, Hash::ALGO, hash),
+            store_key(store_prefix.as_str(), Hash::ALGO, hash),
             pack(bytes, compression)?,
         )
         .encoding(ENC_CHUNK)
@@ -71,7 +71,7 @@ pub async fn publish_chunk(
 /// storage being published into is typically fleet-wide.
 pub async fn publish_snapshot_chunks(
     session: &zenoh::Session,
-    store_prefix: &str,
+    store_prefix: &ServePrefix,
     index: &TreeIndex,
     store: &dyn ContentStore,
     compression: ChunkCompression,
@@ -95,7 +95,7 @@ pub async fn publish_snapshot_chunks(
 /// content store to a router).
 pub async fn publish_store(
     session: &zenoh::Session,
-    store_prefix: &str,
+    store_prefix: &ServePrefix,
     store: &dyn ContentStore,
     compression: ChunkCompression,
 ) -> Result<u32> {
@@ -104,7 +104,7 @@ pub async fn publish_store(
 
 async fn publish_hashes(
     session: &zenoh::Session,
-    store_prefix: &str,
+    store_prefix: &ServePrefix,
     hashes: &[Hash],
     store: &dyn ContentStore,
     compression: ChunkCompression,
@@ -125,13 +125,12 @@ async fn publish_hashes(
 /// other index.
 pub async fn publish_index(
     session: &zenoh::Session,
-    tree_prefix: &str,
+    tree_prefix: &ServePrefix,
     index: &TreeIndex,
 ) -> Result<()> {
-    crate::paths::validate_serve_prefix(tree_prefix)?;
     let payload = encode(index)?;
     session
-        .put(tree_key(tree_prefix, &index.id), payload)
+        .put(tree_key(tree_prefix.as_str(), &index.id), payload)
         .encoding(ENC_INDEX)
         // See publish_chunk: publications default to Drop, and losing the
         // index loses the snapshot.
@@ -180,8 +179,8 @@ impl Default for SettleCoverage {
 #[allow(clippy::too_many_arguments)]
 pub async fn publish_snapshot(
     session: &zenoh::Session,
-    store_prefix: &str,
-    tree_prefix: &str,
+    store_prefix: &ServePrefix,
+    tree_prefix: &ServePrefix,
     index: &TreeIndex,
     store: &dyn ContentStore,
     compression: ChunkCompression,
@@ -194,7 +193,7 @@ pub async fn publish_snapshot(
     // Read-back: the index, plus chunk keys per `coverage` (deterministic,
     // no RNG).
     let needed = index.needed_chunks();
-    let mut probes: Vec<String> = vec![tree_key(tree_prefix, &index.id)];
+    let mut probes: Vec<String> = vec![tree_key(tree_prefix.as_str(), &index.id)];
     let n = needed.len();
     if n > 0 {
         let picked: Vec<usize> = match coverage {
@@ -211,7 +210,7 @@ pub async fn publish_snapshot(
         probes.extend(
             picked
                 .into_iter()
-                .map(|i| store_key(store_prefix, Hash::ALGO, &needed[i])),
+                .map(|i| store_key(store_prefix.as_str(), Hash::ALGO, &needed[i])),
         );
     }
 

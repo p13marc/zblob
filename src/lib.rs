@@ -68,6 +68,7 @@ mod hash;
 mod manifest;
 mod obs;
 mod paths;
+mod prefix;
 mod progress;
 mod publish;
 mod resume;
@@ -88,6 +89,7 @@ pub use error::{BlobError, Result};
 pub use hash::{Hash, HashParseError};
 pub use manifest::{BlobSpec, Manifest};
 pub use obs::TransferStats;
+pub use prefix::{QueryPrefix, ServePrefix};
 pub use progress::{Progress, ProgressSink};
 pub use publish::{
     SettleCoverage, publish_chunk, publish_index, publish_snapshot, publish_snapshot_chunks,

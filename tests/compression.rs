@@ -43,8 +43,8 @@ async fn compressed_wire_and_store_roundtrip() {
 
     let server = TreeServer::builder(
         session.clone(),
-        store_prefix.clone(),
-        tree_prefix.clone(),
+        common::serve(store_prefix.clone()),
+        common::serve(tree_prefix.clone()),
         server_store,
     )
     .compression(ChunkCompression::Zstd { level: 3 })
@@ -61,9 +61,13 @@ async fn compressed_wire_and_store_roundtrip() {
             .with_verify_on_read(true),
     );
     let dest = tempfile::tempdir().unwrap();
-    let client = TreeClient::builder(session.clone(), &store_prefix, &tree_prefix)
-        .query_timeout(Duration::from_secs(5))
-        .build();
+    let client = TreeClient::builder(
+        session.clone(),
+        common::query(store_prefix),
+        common::query(tree_prefix),
+    )
+    .query_timeout(Duration::from_secs(5))
+    .build();
     client
         .download_tree(
             &DownloadRequest::pinned("zsnap", expected_root),

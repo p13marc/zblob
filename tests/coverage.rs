@@ -13,7 +13,7 @@ use zblob::{
 };
 
 fn test_client(session: Arc<zenoh::Session>, prefix: &str) -> BlobClient {
-    BlobClient::builder(session, prefix)
+    BlobClient::builder(session, common::query(prefix))
         .query_timeout(Duration::from_secs(5))
         .retry(RetryPolicy {
             max_attempts: 3,
@@ -33,7 +33,7 @@ async fn large_blob_spans_multiple_queries() {
     let prefix = unique_prefix();
 
     let data = pseudo_random(MIN_CHUNK_SIZE as usize * 12, 51);
-    let server = BlobServer::builder(session.clone(), prefix.clone())
+    let server = BlobServer::builder(session.clone(), common::serve(prefix.clone()))
         .max_chunks_per_query(4)
         .build();
     server
@@ -47,7 +47,7 @@ async fn large_blob_spans_multiple_queries() {
 
     let dir = tempfile::tempdir().unwrap();
     let dest = dir.path().join("big.bin");
-    let client = BlobClient::builder(session.clone(), &prefix)
+    let client = BlobClient::builder(session.clone(), common::query(prefix))
         .query_timeout(Duration::from_secs(5))
         .max_chunks_per_query(4)
         .build();
@@ -81,7 +81,7 @@ async fn stray_or_mismatched_partial_restarts_clean() {
     let prefix = unique_prefix();
 
     let data = pseudo_random(MIN_CHUNK_SIZE as usize * 3, 52);
-    let server = BlobServer::new(session.clone(), prefix.clone());
+    let server = BlobServer::new(session.clone(), common::serve(prefix.clone()));
     server
         .register_source(
             BlobSpec::new("clean").chunk_size(MIN_CHUNK_SIZE),
@@ -170,7 +170,7 @@ async fn concurrent_downloads_to_different_destinations() {
     let prefix = unique_prefix();
 
     let data = pseudo_random(MIN_CHUNK_SIZE as usize * 5, 53);
-    let server = BlobServer::new(session.clone(), prefix.clone());
+    let server = BlobServer::new(session.clone(), common::serve(prefix.clone()));
     server
         .register_source(
             BlobSpec::new("shared").chunk_size(MIN_CHUNK_SIZE),
@@ -218,7 +218,7 @@ async fn download_to_writer_roundtrip() {
     let prefix = unique_prefix();
 
     let data = pseudo_random(MIN_CHUNK_SIZE as usize * 2 + 500, 54);
-    let server = BlobServer::new(session.clone(), prefix.clone());
+    let server = BlobServer::new(session.clone(), common::serve(prefix.clone()));
     let manifest = server
         .register_source(
             BlobSpec::new("wr").chunk_size(MIN_CHUNK_SIZE),
@@ -258,7 +258,7 @@ async fn file_outboard_spill_roundtrip() {
     let src_path = src.path().join("spill.bin");
     std::fs::write(&src_path, &data).unwrap();
 
-    let server = BlobServer::builder(session.clone(), prefix.clone())
+    let server = BlobServer::builder(session.clone(), common::serve(prefix.clone()))
         .outboard_mem_limit(0) // force the file-backed outboard path
         .build();
     let manifest = server
@@ -297,29 +297,27 @@ async fn file_outboard_spill_roundtrip() {
 async fn unusable_prefixes_and_ids_fail_loudly() {
     let session = open_session().await;
 
-    // Wildcard / malformed prefixes are refused when the server declares.
-    for bad_prefix in ["", "wild/*/card", "trailing/", "/leading", "a//b"] {
-        let server = BlobServer::new(session.clone(), bad_prefix);
-        let err = server
-            .spawn()
-            .await
-            .err()
-            .unwrap_or_else(|| panic!("prefix {bad_prefix:?} should be refused"));
+    // Malformed prefixes never reach a server or a client at all: they are
+    // refused at construction, so there is no way to build one and discover
+    // the problem at declare time. (The role rules themselves are asserted in
+    // the `prefix` module's own tests; this is the end-to-end consequence.)
+    for bad_prefix in ["", "trailing/", "/leading", "a//b"] {
         assert!(
-            matches!(err, zblob::BlobError::Protocol(_)),
-            "{bad_prefix:?}: {err}"
+            zblob::ServePrefix::new(bad_prefix).is_err(),
+            "{bad_prefix:?} must not be constructible as a serve prefix"
         );
-        // …and by clients, before any query goes out.
-        let client = BlobClient::new(session.clone(), bad_prefix);
         assert!(
-            client.fetch_manifest("x").await.is_err(),
-            "client accepted prefix {bad_prefix:?}"
+            zblob::QueryPrefix::new(bad_prefix).is_err(),
+            "{bad_prefix:?} must not be constructible as a query prefix"
         );
     }
+    // A wildcard is queryable but not servable — the asymmetry is the point.
+    assert!(zblob::QueryPrefix::new("wild/*/card").is_ok());
+    assert!(zblob::ServePrefix::new("wild/*/card").is_err());
 
     // A convention-style verbatim prefix must keep working.
     let good = format!("{}/@blob/artifact", unique_prefix());
-    let server = BlobServer::new(session.clone(), good.clone());
+    let server = BlobServer::new(session.clone(), common::serve(good.clone()));
     let data = pseudo_random(MIN_CHUNK_SIZE as usize, 60);
     let manifest = server
         .register_source(
@@ -373,7 +371,7 @@ async fn wildcard_prefixes_are_queryable_but_not_servable() {
     let wildcard = format!("{base}/*/@blob/artifact");
 
     // A server on the concrete prefix.
-    let server = BlobServer::new(session.clone(), concrete.clone());
+    let server = BlobServer::new(session.clone(), common::serve(concrete.clone()));
     let data = pseudo_random(MIN_CHUNK_SIZE as usize, 61);
     let manifest = server
         .register_source(
@@ -406,11 +404,11 @@ async fn wildcard_prefixes_are_queryable_but_not_servable() {
         .expect("concrete fetch");
     assert_eq!(std::fs::read(&dest).unwrap(), data);
 
-    // Serving under a wildcard prefix is refused.
-    let bad = BlobServer::new(session.clone(), wildcard.clone());
+    // Serving under a wildcard prefix does not typecheck: there is no
+    // `ServePrefix` to build from one.
     assert!(
-        bad.spawn().await.is_err(),
-        "a server must not declare under a wildcard prefix"
+        zblob::ServePrefix::new(wildcard.clone()).is_err(),
+        "a server must not be constructible on a wildcard prefix"
     );
 
     handle.shutdown().await.unwrap();
@@ -447,7 +445,7 @@ async fn a_mutated_source_is_diagnosed_not_served_forever() {
     let original = pseudo_random(MIN_CHUNK_SIZE as usize * 2, 31);
     std::fs::write(&path, &original).unwrap();
 
-    let server = BlobServer::new(session.clone(), prefix.clone());
+    let server = BlobServer::new(session.clone(), common::serve(prefix.clone()));
     let manifest = server
         .register_file(BlobSpec::new("mut").chunk_size(MIN_CHUNK_SIZE), &path)
         .await
@@ -499,7 +497,7 @@ async fn a_mutated_source_is_diagnosed_not_served_forever() {
 async fn re_registration_cannot_silently_swap_content() {
     let session = open_session().await;
     let prefix = unique_prefix();
-    let server = BlobServer::new(session.clone(), prefix.clone());
+    let server = BlobServer::new(session.clone(), common::serve(prefix.clone()));
 
     let first = pseudo_random(4096, 41);
     let spec = || BlobSpec::new("stable").chunk_size(MIN_CHUNK_SIZE);

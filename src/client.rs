@@ -26,6 +26,7 @@ use crate::error::{BlobError, Result};
 use crate::hash::Hash;
 use crate::manifest::{BlobSpec, Manifest, validate_id};
 use crate::obs::{TransferStats, zdebug};
+use crate::prefix::QueryPrefix;
 use crate::progress::{Progress, ProgressSink};
 use crate::resume::ResumeState;
 use crate::wire::{Availability, ENC_AVAIL, ENC_MANIFEST, ENC_PUSH, ENC_SLICE, decode};
@@ -162,7 +163,7 @@ impl DownloadRequest {
 /// Downloads blobs served by a [`crate::BlobServer`] under the same key prefix.
 pub struct BlobClient {
     session: Arc<zenoh::Session>,
-    prefix: String,
+    prefix: QueryPrefix,
     cfg: ClientConfig,
     // Single-flight guard: destinations with a download in progress *through
     // this client*. Two concurrent downloads to one path would corrupt each
@@ -173,7 +174,7 @@ pub struct BlobClient {
 /// Builder for a [`BlobClient`] (see [`BlobClient::builder`]).
 pub struct BlobClientBuilder {
     session: Arc<zenoh::Session>,
-    prefix: String,
+    prefix: QueryPrefix,
     cfg: ClientConfig,
 }
 
@@ -239,19 +240,16 @@ impl BlobClientBuilder {
 
 impl BlobClient {
     /// Start building a client for blobs under `key_prefix`.
-    pub fn builder(
-        session: Arc<zenoh::Session>,
-        key_prefix: impl Into<String>,
-    ) -> BlobClientBuilder {
+    pub fn builder(session: Arc<zenoh::Session>, key_prefix: QueryPrefix) -> BlobClientBuilder {
         BlobClientBuilder {
             session,
-            prefix: key_prefix.into(),
+            prefix: key_prefix,
             cfg: ClientConfig::default(),
         }
     }
 
     /// Build a client with default configuration (see [`BlobClient::builder`]).
-    pub fn new(session: Arc<zenoh::Session>, key_prefix: impl Into<String>) -> Self {
+    pub fn new(session: Arc<zenoh::Session>, key_prefix: QueryPrefix) -> Self {
         Self::builder(session, key_prefix).build()
     }
 
@@ -272,9 +270,8 @@ impl BlobClient {
         id: &str,
         expected_root: Option<Hash>,
     ) -> Result<Manifest> {
-        crate::paths::validate_query_prefix(&self.prefix)?;
         validate_id(id)?;
-        let key = manifest_key(&self.prefix, id);
+        let key = manifest_key(self.prefix.as_str(), id);
         let replies = self
             .session
             .get(&key)
@@ -352,9 +349,8 @@ impl BlobClient {
     /// caller sees the swarm (with reply consolidation disabled, ordinary
     /// downloads already accept whichever replica answers each chunk first).
     pub async fn fetch_availability(&self, id: &str) -> Result<Vec<Availability>> {
-        crate::paths::validate_query_prefix(&self.prefix)?;
         validate_id(id)?;
-        let key = availability_key(&self.prefix, id);
+        let key = availability_key(self.prefix.as_str(), id);
         let replies = self
             .session
             .get(&key)
@@ -414,7 +410,15 @@ impl BlobClient {
         cancel: &CancelToken,
     ) -> Result<Manifest> {
         use crate::verify::{MemOutboard, chunk_range};
-        crate::paths::validate_upload_prefix(&self.prefix)?;
+        // An upload has exactly one destination: the receiver spools state
+        // keyed by the id, and its acknowledgements echo the query key
+        // verbatim — which for a wildcard query is a key *expression*.
+        if !self.prefix.is_concrete() {
+            return Err(BlobError::Protocol(format!(
+                "cannot upload to the wildcard prefix {} — an upload has exactly one destination",
+                self.prefix
+            )));
+        }
         let path = path.into();
 
         // Hash the source once: outboard + manifest, exactly like server-side
@@ -442,7 +446,7 @@ impl BlobClient {
         manifest.validate(u64::MAX)?;
 
         // Offer: the reply lists the chunk ranges the server still wants.
-        let offer_key = push_offer_key(&self.prefix, &manifest.id);
+        let offer_key = push_offer_key(self.prefix.as_str(), &manifest.id);
         let mut builder = self
             .session
             .get(&offer_key)
@@ -554,7 +558,7 @@ impl BlobClient {
 
                 let mut b = self
                     .session
-                    .get(push_slice_key(&self.prefix, &manifest.id, index))
+                    .get(push_slice_key(self.prefix.as_str(), &manifest.id, index))
                     .consolidation(ConsolidationMode::None)
                     .priority(self.cfg.priority)
                     .timeout(self.cfg.query_timeout)
@@ -822,7 +826,7 @@ impl BlobClient {
             }
             holes.retain(|r| !r.is_empty());
 
-            let selector = slice_selector(&self.prefix, &manifest.id, &holes);
+            let selector = slice_selector(self.prefix.as_str(), &manifest.id, &holes);
             let before = state.received();
             let replies = self
                 .session

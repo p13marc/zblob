@@ -74,3 +74,17 @@ pub mod bao {
         out
     }
 }
+
+/// A `ServePrefix` for a prefix the test knows is concrete.
+#[allow(dead_code)]
+pub fn serve(p: impl Into<String>) -> zblob::ServePrefix {
+    let p = p.into();
+    zblob::ServePrefix::new(&p).unwrap_or_else(|e| panic!("test serve prefix {p:?}: {e}"))
+}
+
+/// A `QueryPrefix` for a prefix the test knows is well-formed.
+#[allow(dead_code)]
+pub fn query(p: impl Into<String>) -> zblob::QueryPrefix {
+    let p = p.into();
+    zblob::QueryPrefix::new(&p).unwrap_or_else(|e| panic!("test query prefix {p:?}: {e}"))
+}

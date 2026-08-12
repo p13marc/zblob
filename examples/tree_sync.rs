@@ -9,8 +9,8 @@
 use std::sync::Arc;
 
 use zblob::{
-    CancelToken, CdcParams, ContentStore, DownloadRequest, MemoryStore, TreeClient, TreeServer,
-    build_tree,
+    CancelToken, CdcParams, ContentStore, DownloadRequest, MemoryStore, QueryPrefix, ServePrefix,
+    TreeClient, TreeServer, build_tree,
 };
 
 #[tokio::main]
@@ -20,7 +20,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             .await
             .map_err(|e| e.to_string())?,
     );
-    let (store_prefix, tree_prefix) = ("demo/store", "demo/tree");
+    // Prefixes are typed by role; a server's converts to a client's for free.
+    let store_serve = ServePrefix::new("demo/store")?;
+    let tree_serve = ServePrefix::new("demo/tree")?;
+    let (store_query, tree_query) = (
+        QueryPrefix::from(&store_serve),
+        QueryPrefix::from(&tree_serve),
+    );
 
     // --- producer: build + serve a snapshot ---------------------------------
     let src = tempfile::tempdir()?;
@@ -40,8 +46,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let server = TreeServer::new(
         session.clone(),
-        store_prefix,
-        tree_prefix,
+        store_serve,
+        tree_serve,
         server_store.clone(),
     );
     server.register(index.clone()).await;
@@ -49,7 +55,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // --- consumer: sync (pinned), then re-sync after an edit ----------------
     let dest = tempfile::tempdir()?;
-    let client = TreeClient::new(session.clone(), store_prefix, tree_prefix);
+    let client = TreeClient::new(session.clone(), store_query, tree_query);
     let client_store: Arc<dyn ContentStore> = Arc::new(MemoryStore::new());
 
     let stats = client

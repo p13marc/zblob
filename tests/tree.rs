@@ -84,9 +84,13 @@ fn assert_dirs_equal(a: &std::path::Path, b: &std::path::Path) {
 }
 
 fn test_client(session: Arc<zenoh::Session>, store_prefix: &str, tree_prefix: &str) -> TreeClient {
-    TreeClient::builder(session, store_prefix, tree_prefix)
-        .query_timeout(Duration::from_secs(5))
-        .build()
+    TreeClient::builder(
+        session,
+        common::query(store_prefix),
+        common::query(tree_prefix),
+    )
+    .query_timeout(Duration::from_secs(5))
+    .build()
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -116,8 +120,8 @@ async fn tree_roundtrip_with_modes_and_mtime() {
 
     let server = TreeServer::new(
         session.clone(),
-        store_prefix.clone(),
-        tree_prefix.clone(),
+        common::serve(store_prefix.clone()),
+        common::serve(tree_prefix.clone()),
         server_store,
     );
     server.register(index).await;
@@ -181,8 +185,8 @@ async fn reedit_transfers_only_changed_chunks() {
     let index1 = build_tree(src.path(), "snap1", &small_cdc(), &*server_store).unwrap();
     let server = TreeServer::new(
         session.clone(),
-        store_prefix.clone(),
-        tree_prefix.clone(),
+        common::serve(store_prefix.clone()),
+        common::serve(tree_prefix.clone()),
         server_store.clone(),
     );
     server.register(index1).await;
@@ -262,8 +266,8 @@ async fn resume_from_prepopulated_store() {
 
     let server = TreeServer::new(
         session.clone(),
-        store_prefix.clone(),
-        tree_prefix.clone(),
+        common::serve(store_prefix.clone()),
+        common::serve(tree_prefix.clone()),
         server_store.clone(),
     );
     server.register(index.clone()).await;
@@ -327,18 +331,22 @@ async fn cancellable_reports_progress_and_resumes() {
 
     let server = TreeServer::new(
         session.clone(),
-        store_prefix.clone(),
-        tree_prefix.clone(),
+        common::serve(store_prefix.clone()),
+        common::serve(tree_prefix.clone()),
         server_store,
     );
     server.register(index).await;
     let handle = server.spawn().await.unwrap();
 
     // Serial fetch so the cancel lands mid-stream deterministically.
-    let client = TreeClient::builder(session.clone(), &store_prefix, &tree_prefix)
-        .query_timeout(Duration::from_secs(5))
-        .fetch_concurrency(1)
-        .build();
+    let client = TreeClient::builder(
+        session.clone(),
+        common::query(store_prefix),
+        common::query(tree_prefix),
+    )
+    .query_timeout(Duration::from_secs(5))
+    .fetch_concurrency(1)
+    .build();
 
     // 1) Cancel after the first chunk: the call returns Cancelled and the store
     //    is left with whatever it fetched, so a resume can finish.
@@ -441,8 +449,8 @@ async fn hardlinks_roundtrip() {
     let index = build_tree(src.path(), "hl", &small_cdc(), &*server_store).unwrap();
     let server = TreeServer::new(
         session.clone(),
-        store_prefix.clone(),
-        tree_prefix.clone(),
+        common::serve(store_prefix.clone()),
+        common::serve(tree_prefix.clone()),
         server_store,
     );
     server.register(index).await;
@@ -491,8 +499,8 @@ async fn empty_file_dir_and_tree_roundtrip() {
     let index = build_tree(src.path(), "edges", &small_cdc(), &*server_store).unwrap();
     let server = TreeServer::new(
         session.clone(),
-        store_prefix.clone(),
-        tree_prefix.clone(),
+        common::serve(store_prefix.clone()),
+        common::serve(tree_prefix.clone()),
         server_store.clone(),
     );
     server.register(index).await;
@@ -564,8 +572,8 @@ async fn readonly_dir_roundtrips_with_mode_restored() {
     let index = build_tree(src.path(), "ro", &small_cdc(), &*server_store).unwrap();
     let server = TreeServer::new(
         session.clone(),
-        store_prefix.clone(),
-        tree_prefix.clone(),
+        common::serve(store_prefix.clone()),
+        common::serve(tree_prefix.clone()),
         server_store,
     );
     server.register(index).await;
@@ -627,8 +635,8 @@ async fn concurrent_tree_downloads_share_one_dirstore() {
     let total = index.needed_chunks().len();
     let server = TreeServer::new(
         session.clone(),
-        store_prefix.clone(),
-        tree_prefix.clone(),
+        common::serve(store_prefix.clone()),
+        common::serve(tree_prefix.clone()),
         server_store,
     );
     server.register(index).await;
@@ -719,8 +727,8 @@ async fn content_addressed_trees_pin_by_construction() {
 
     let server = TreeServer::new(
         session.clone(),
-        store_prefix.clone(),
-        tree_prefix.clone(),
+        common::serve(store_prefix.clone()),
+        common::serve(tree_prefix.clone()),
         server_store,
     );
     server.register(index).await;
@@ -786,8 +794,8 @@ async fn a_sweep_cannot_collect_an_in_flight_download() {
     let index = build_tree(src.path(), "swept", &small_cdc(), &*server_store).unwrap();
     let server = TreeServer::new(
         session.clone(),
-        store_prefix.clone(),
-        tree_prefix.clone(),
+        common::serve(store_prefix.clone()),
+        common::serve(tree_prefix.clone()),
         server_store,
     );
     server.register(index.clone()).await;
@@ -799,10 +807,14 @@ async fn a_sweep_cannot_collect_an_in_flight_download() {
     let tag_dir = tempfile::tempdir().unwrap();
     let tags = gc::SnapshotTags::open(tag_dir.path()).unwrap();
     let client_store: Arc<dyn ContentStore> = Arc::new(MemoryStore::new());
-    let client = TreeClient::builder(session.clone(), &store_prefix, &tree_prefix)
-        .query_timeout(Duration::from_secs(5))
-        .temp_tags(temps.clone())
-        .build();
+    let client = TreeClient::builder(
+        session.clone(),
+        common::query(store_prefix),
+        common::query(tree_prefix),
+    )
+    .query_timeout(Duration::from_secs(5))
+    .temp_tags(temps.clone())
+    .build();
 
     let dest = tempfile::tempdir().unwrap();
     // Sweep repeatedly while the download runs.
@@ -879,8 +891,8 @@ async fn a_wildcard_origin_tier2_prefix_is_answerable() {
     let index = build_tree(src.path(), "anyorigin", &small_cdc(), &*server_store).unwrap();
     let server = TreeServer::new(
         session.clone(),
-        store_prefix.clone(),
-        tree_prefix.clone(),
+        common::serve(store_prefix.clone()),
+        common::serve(tree_prefix.clone()),
         server_store,
     );
     server.register(index.clone()).await;
@@ -888,18 +900,22 @@ async fn a_wildcard_origin_tier2_prefix_is_answerable() {
 
     let dest = tempfile::tempdir().unwrap();
     let client_store: Arc<dyn ContentStore> = Arc::new(MemoryStore::new());
-    TreeClient::builder(session.clone(), &store_query, &tree_query)
-        .query_timeout(Duration::from_secs(5))
-        .build()
-        .download_tree(
-            &DownloadRequest::pinned("anyorigin", index.root_hash),
-            dest.path(),
-            &client_store,
-            &(),
-            &CancelToken::new(),
-        )
-        .await
-        .expect("a wildcard-origin prefix must reach the server that owns the id");
+    TreeClient::builder(
+        session.clone(),
+        common::query(store_query),
+        common::query(tree_query),
+    )
+    .query_timeout(Duration::from_secs(5))
+    .build()
+    .download_tree(
+        &DownloadRequest::pinned("anyorigin", index.root_hash),
+        dest.path(),
+        &client_store,
+        &(),
+        &CancelToken::new(),
+    )
+    .await
+    .expect("a wildcard-origin prefix must reach the server that owns the id");
     assert_eq!(std::fs::read(dest.path().join("wide.bin")).unwrap(), body);
 
     handle.shutdown().await.unwrap();

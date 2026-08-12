@@ -7,7 +7,10 @@
 
 use std::sync::Arc;
 
-use zblob::{BlobClient, BlobServer, BlobSpec, CancelToken, DownloadRequest, Progress};
+use zblob::{
+    BlobClient, BlobServer, BlobSpec, CancelToken, DownloadRequest, Progress, QueryPrefix,
+    ServePrefix,
+};
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -16,14 +19,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             .await
             .map_err(|e| e.to_string())?,
     );
-    let prefix = "demo/blobs";
+    // Prefixes are typed by role: a server owns a concrete `ServePrefix`, a
+    // client asks through a `QueryPrefix` (which may name several origins).
+    let serve_prefix = ServePrefix::new("demo/blobs")?;
+    let query_prefix = QueryPrefix::from(&serve_prefix);
 
     // --- producer: write a source file and serve it -------------------------
     let dir = tempfile::tempdir()?;
     let src = dir.path().join("artifact.bin");
     std::fs::write(&src, vec![42u8; 3 * 1024 * 1024])?;
 
-    let server = BlobServer::new(session.clone(), prefix);
+    let server = BlobServer::new(session.clone(), serve_prefix);
     let manifest = server
         .register_file(BlobSpec::new("demo-blob").filename("artifact.bin"), &src)
         .await?;
@@ -32,7 +38,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // --- consumer: download with the root pinned ----------------------------
     let dest = dir.path().join("downloaded.bin");
-    let client = BlobClient::new(session.clone(), prefix);
+    let client = BlobClient::new(session.clone(), query_prefix);
     let stats = client
         .download_to(
             &DownloadRequest::pinned("demo-blob", manifest.root),

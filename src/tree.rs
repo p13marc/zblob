@@ -48,6 +48,7 @@ use crate::obs::{TransferStats, zdebug};
 use crate::paths::{
     assert_parent_within, create_dir_confined, sanitize_rel_path, sanitize_symlink_target,
 };
+use crate::prefix::{QueryPrefix, ServePrefix};
 use crate::progress::{Progress, ProgressSink};
 use crate::server::{ErrorCallback, FifoQueryable, ServerHandle, report_error};
 use crate::store::ContentStore;
@@ -620,8 +621,8 @@ pub struct TreeServer {
 
 struct TreeInner {
     session: Arc<zenoh::Session>,
-    store_prefix: String,
-    tree_prefix: String,
+    store_prefix: ServePrefix,
+    tree_prefix: ServePrefix,
     store: Arc<dyn ContentStore>,
     index: tokio::sync::RwLock<std::collections::HashMap<String, TreeIndex>>,
     inflight: Arc<Semaphore>,
@@ -632,8 +633,8 @@ struct TreeInner {
 /// Builder for a [`TreeServer`] (see [`TreeServer::builder`]).
 pub struct TreeServerBuilder {
     session: Arc<zenoh::Session>,
-    store_prefix: String,
-    tree_prefix: String,
+    store_prefix: ServePrefix,
+    tree_prefix: ServePrefix,
     store: Arc<dyn ContentStore>,
     max_inflight: usize,
     compression: ChunkCompression,
@@ -683,14 +684,14 @@ impl TreeServer {
     /// `tree_prefix` serves `<prefix>/<id>`.
     pub fn builder(
         session: Arc<zenoh::Session>,
-        store_prefix: impl Into<String>,
-        tree_prefix: impl Into<String>,
+        store_prefix: ServePrefix,
+        tree_prefix: ServePrefix,
         store: Arc<dyn ContentStore>,
     ) -> TreeServerBuilder {
         TreeServerBuilder {
             session,
-            store_prefix: store_prefix.into(),
-            tree_prefix: tree_prefix.into(),
+            store_prefix,
+            tree_prefix,
             store,
             max_inflight: 8,
             compression: ChunkCompression::default(),
@@ -701,8 +702,8 @@ impl TreeServer {
     /// Build a server with default configuration.
     pub fn new(
         session: Arc<zenoh::Session>,
-        store_prefix: impl Into<String>,
-        tree_prefix: impl Into<String>,
+        store_prefix: ServePrefix,
+        tree_prefix: ServePrefix,
         store: Arc<dyn ContentStore>,
     ) -> Self {
         Self::builder(session, store_prefix, tree_prefix, store).build()
@@ -724,8 +725,6 @@ impl TreeServer {
     }
 
     async fn declare(&self) -> Result<(FifoQueryable, FifoQueryable)> {
-        crate::paths::validate_serve_prefix(&self.inner.store_prefix)?;
-        crate::paths::validate_serve_prefix(&self.inner.tree_prefix)?;
         let store_q = self
             .inner
             .session
@@ -802,7 +801,7 @@ impl TreeServer {
 
 async fn serve_chunk_query(inner: &TreeInner, query: zenoh::query::Query) -> Result<()> {
     let key = query.key_expr().as_str();
-    let Some(hash) = parse_store_key(&inner.store_prefix, key) else {
+    let Some(hash) = parse_store_key(inner.store_prefix.as_str(), key) else {
         return Ok(()); // not a chunk key (or foreign algo); ignore.
     };
     let store = inner.store.clone();
@@ -824,7 +823,7 @@ async fn serve_chunk_query(inner: &TreeInner, query: zenoh::query::Query) -> Res
 
 async fn serve_index_query(inner: &TreeInner, query: zenoh::query::Query) -> Result<()> {
     let key = query.key_expr().as_str().to_string();
-    let Some(tail) = crate::parse_tier2_tail(&inner.tree_prefix, &key) else {
+    let Some(tail) = crate::parse_tier2_tail(inner.tree_prefix.as_str(), &key) else {
         return Ok(());
     };
     let [id] = tail[..] else { return Ok(()) };
@@ -854,8 +853,8 @@ fn parse_store_key(store_prefix: &str, key: &str) -> Option<Hash> {
 /// Downloads a tree snapshot. Stateless server; persistent client (the store).
 pub struct TreeClient {
     session: Arc<zenoh::Session>,
-    store_prefix: String,
-    tree_prefix: String,
+    store_prefix: QueryPrefix,
+    tree_prefix: QueryPrefix,
     cfg: TreeClientConfig,
 }
 
@@ -894,8 +893,8 @@ impl Default for TreeClientConfig {
 /// Builder for a [`TreeClient`] (see [`TreeClient::builder`]).
 pub struct TreeClientBuilder {
     session: Arc<zenoh::Session>,
-    store_prefix: String,
-    tree_prefix: String,
+    store_prefix: QueryPrefix,
+    tree_prefix: QueryPrefix,
     cfg: TreeClientConfig,
 }
 
@@ -992,13 +991,13 @@ impl TreeClient {
     /// Start building a client matching a [`TreeServer`]'s prefixes.
     pub fn builder(
         session: Arc<zenoh::Session>,
-        store_prefix: impl Into<String>,
-        tree_prefix: impl Into<String>,
+        store_prefix: QueryPrefix,
+        tree_prefix: QueryPrefix,
     ) -> TreeClientBuilder {
         TreeClientBuilder {
             session,
-            store_prefix: store_prefix.into(),
-            tree_prefix: tree_prefix.into(),
+            store_prefix,
+            tree_prefix,
             cfg: TreeClientConfig::default(),
         }
     }
@@ -1006,8 +1005,8 @@ impl TreeClient {
     /// Build a client with default configuration.
     pub fn new(
         session: Arc<zenoh::Session>,
-        store_prefix: impl Into<String>,
-        tree_prefix: impl Into<String>,
+        store_prefix: QueryPrefix,
+        tree_prefix: QueryPrefix,
     ) -> Self {
         Self::builder(session, store_prefix, tree_prefix).build()
     }
@@ -1026,10 +1025,8 @@ impl TreeClient {
         id: &str,
         expected_root: Option<Hash>,
     ) -> Result<TreeIndex> {
-        crate::paths::validate_query_prefix(&self.store_prefix)?;
-        crate::paths::validate_query_prefix(&self.tree_prefix)?;
         validate_id(id)?;
-        let key = tree_key(&self.tree_prefix, id);
+        let key = tree_key(self.tree_prefix.as_str(), id);
         let replies = self
             .session
             .get(&key)
@@ -1225,7 +1222,7 @@ impl TreeClient {
                 }
                 let session = self.session.clone();
                 let hash = chunk.hash;
-                let key = store_key(&self.store_prefix, Hash::ALGO, &hash);
+                let key = store_key(self.store_prefix.as_str(), Hash::ALGO, &hash);
                 let timeout = self.cfg.query_timeout;
                 let priority = self.cfg.priority;
                 let store = store.clone();

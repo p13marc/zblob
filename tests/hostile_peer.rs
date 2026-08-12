@@ -95,7 +95,7 @@ fn mutate(payload: Vec<u8>, m: Mutation) -> Vec<u8> {
 }
 
 fn test_client(session: Arc<zenoh::Session>, prefix: &str) -> BlobClient {
-    BlobClient::builder(session, prefix)
+    BlobClient::builder(session, common::query(prefix))
         .query_timeout(Duration::from_millis(700))
         .retry(RetryPolicy {
             max_attempts: 2,
@@ -418,7 +418,7 @@ async fn a_hostile_responder_cannot_deny_an_honest_one() {
         let data = pseudo_random(MIN_CHUNK_SIZE as usize * 2, 93);
 
         // Honest server.
-        let server = zblob::BlobServer::new(session.clone(), prefix.clone());
+        let server = zblob::BlobServer::new(session.clone(), common::serve(prefix.clone()));
         let manifest = server
             .register_source(
                 zblob::BlobSpec::new("contested").chunk_size(MIN_CHUNK_SIZE),

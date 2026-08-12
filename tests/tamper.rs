@@ -17,7 +17,7 @@ use zblob::{
 };
 
 fn test_client(session: Arc<zenoh::Session>, prefix: &str) -> BlobClient {
-    BlobClient::builder(session, prefix)
+    BlobClient::builder(session, common::query(prefix))
         .query_timeout(Duration::from_secs(3))
         .retry(RetryPolicy {
             max_attempts: 2,
@@ -37,7 +37,7 @@ async fn pinned_root_rejects_substituted_content() {
     let expected = pseudo_random(MIN_CHUNK_SIZE as usize * 2, 1);
     let substituted = pseudo_random(MIN_CHUNK_SIZE as usize * 2, 2);
 
-    let server = BlobServer::new(session.clone(), prefix.clone());
+    let server = BlobServer::new(session.clone(), common::serve(prefix.clone()));
     server
         .register_source(
             BlobSpec::new("blob-s").chunk_size(MIN_CHUNK_SIZE),
