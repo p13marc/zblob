@@ -229,10 +229,15 @@ struct Inner {
 ///
 /// Two consequences follow from it:
 ///
-/// - **An unknown id costs a client its full query timeout**, since silence is
-///   how "not mine" is expressed. That is the price of the arrangement: a
-///   server cannot answer "I don't have it" without also answering for ids a
-///   co-server *does* have.
+/// - **Silence is cheap, not expensive.** It is tempting to assume an unknown
+///   id costs the client its query timeout, and to design a negative reply to
+///   avoid that. It does not: a Zenoh query finalizes once every matching
+///   queryable has completed, and completing without replying is immediate.
+///   Measured at roughly a millisecond against a 30-second timeout, with a
+///   server present, with none present, and across a wildcard fan-out. A
+///   negative reply would buy nothing here and would have to carry an
+///   awkward rule — "authoritative only when no positive reply arrives" —
+///   precisely because of this arrangement.
 /// - **A refusal from one server is not a refusal from all of them.** The push
 ///   path treats an error reply as one responder's opinion and keeps waiting
 ///   for an acceptance, exactly as every download loop treats an unusable
@@ -469,6 +474,18 @@ impl BlobServer {
             chunk_size: spec.chunk_size,
             root: outboard.root().into(),
             created_ms: spec.created_ms,
+            // Advertise this server's limits so a client with different
+            // defaults clamps to them instead of having its queries rejected.
+            ext: vec![
+                (
+                    crate::wire::EXT_MAX_CHUNKS_PER_QUERY,
+                    self.inner.cfg.max_chunks_per_query.to_le_bytes().to_vec(),
+                ),
+                (
+                    crate::wire::EXT_MAX_BLOB_SIZE,
+                    push_max_blob_size(&self.inner.cfg).to_le_bytes().to_vec(),
+                ),
+            ],
         };
         // Replacing an id's content is refused, matching the push path — which
         // goes to considerable lengths to prevent exactly this hijack
@@ -567,6 +584,13 @@ impl BlobServer {
     }
 }
 
+/// What this server will accept as a whole blob, for advertisement. Only the
+/// push path configures a limit; a read-only server has none of its own, so it
+/// reports the widest value rather than inventing one.
+fn push_max_blob_size(cfg: &ServerConfig) -> u64 {
+    cfg.push.as_ref().map_or(u64::MAX, |p| p.max_blob_size)
+}
+
 /// Surface a serve error: the configured callback wins; otherwise a `tracing`
 /// warn event (with the feature) or stderr in debug builds.
 pub(crate) fn report_error(cb: &Option<ErrorCallback>, e: &BlobError) {
@@ -614,7 +638,17 @@ async fn serve_one(inner: &Inner, query: zenoh::query::Query) -> Result<()> {
                 r.outboard.clone(),
                 r.fingerprint,
             ),
-            None => return Ok(()), // unknown id → client times out → NotFound.
+            None => {
+                // Unknown id: drop the query without replying.
+                //
+                // This does *not* cost the client its timeout — a query
+                // finalizes once every matching queryable has completed, and
+                // completing without replying is immediate (measured: ~1 ms
+                // against a 30 s timeout; see the coverage test). Silence is
+                // therefore the correct way to say "not mine", and it is what
+                // lets several servers share one prefix.
+                return Ok(());
+            }
         }
     };
 

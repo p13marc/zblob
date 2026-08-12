@@ -540,3 +540,168 @@ async fn re_registration_cannot_silently_swap_content() {
     handle.shutdown().await.unwrap();
     session.close().await.unwrap();
 }
+
+/// An id nobody serves fails **fast**, not after the query timeout.
+///
+/// Worth pinning, because the opposite was widely believed: the serving code
+/// carried the comment "unknown id → client times out → NotFound", and a whole
+/// negative-reply message was designed on that premise. It is not how Zenoh
+/// behaves. A query finalizes when every matching queryable has completed, and
+/// a queryable that drops the `Query` without replying completes immediately —
+/// so silence resolves in about a millisecond, whatever the timeout is.
+///
+/// Silence is therefore the *right* way to say "not mine", which is what lets
+/// several servers share one prefix without any of them having to answer for
+/// ids they do not own. This test is what would catch a change that made
+/// silence expensive again.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_unknown_id_fails_fast_not_on_the_timeout() {
+    let session = open_session().await;
+    // A generous timeout: if any of these waits for it, the test fails on
+    // duration rather than on outcome.
+    let timeout = Duration::from_secs(30);
+    let budget = Duration::from_secs(2);
+
+    let served = unique_prefix();
+    let handle = BlobServer::new(session.clone(), common::serve(served.clone()))
+        .spawn()
+        .await
+        .unwrap();
+
+    let base = unique_prefix();
+    let mut wide_handles = Vec::new();
+    for host in ["host-a", "host-b"] {
+        wide_handles.push(
+            BlobServer::new(session.clone(), common::serve(format!("{base}/{host}/x")))
+                .spawn()
+                .await
+                .unwrap(),
+        );
+    }
+
+    let cases: Vec<(&str, String)> = vec![
+        // A server is listening on the prefix; it just does not own this id.
+        ("a server that does not own the id", served),
+        // Nothing is listening at all.
+        ("no server on the prefix", unique_prefix()),
+        // The fan-out shape: several origins, none of which hold it.
+        ("a wildcard across two servers", format!("{base}/*/x")),
+    ];
+    for (what, prefix) in cases {
+        let client = BlobClient::builder(session.clone(), common::query(prefix))
+            .query_timeout(timeout)
+            .build();
+        let started = std::time::Instant::now();
+        let err = client
+            .fetch_manifest("nonexistent")
+            .await
+            .expect_err("must not resolve");
+        let elapsed = started.elapsed();
+        assert!(
+            matches!(err, zblob::BlobError::NotFound(_)),
+            "{what}: {err}"
+        );
+        assert!(
+            elapsed < budget,
+            "{what}: took {elapsed:?}, which means silence is costing the timeout"
+        );
+    }
+
+    handle.shutdown().await.unwrap();
+    for h in wide_handles {
+        h.shutdown().await.unwrap();
+    }
+    session.close().await.unwrap();
+}
+
+/// A server that lowers its per-query cap must still serve an unmodified
+/// client, because the client clamps to what the manifest advertises.
+///
+/// Before this, both sides defaulted to 512 and neither could tell the other:
+/// a server that lowered its cap rejected every existing client's queries with
+/// `InvalidRanges`, and the client had no way to discover why. It was
+/// documented, which is not the same as being a protocol.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_client_clamps_to_the_server_s_advertised_cap() {
+    let session = open_session().await;
+    let prefix = unique_prefix();
+
+    // Six chunks, but the server will only serve two per query.
+    let data = pseudo_random(MIN_CHUNK_SIZE as usize * 6, 71);
+    let server = BlobServer::builder(session.clone(), common::serve(prefix.clone()))
+        .max_chunks_per_query(2)
+        .build();
+    let manifest = server
+        .register_source(
+            BlobSpec::new("capped").chunk_size(MIN_CHUNK_SIZE),
+            Arc::new(MemoryBlobSource::new(data.clone())),
+        )
+        .await
+        .unwrap();
+    let handle = server.spawn().await.unwrap();
+
+    // The manifest says so, and says it in a form a consumer can read.
+    assert_eq!(manifest.max_chunks_per_query(), Some(2));
+
+    // A client with the stock 512 default downloads successfully anyway.
+    let dir = tempfile::tempdir().unwrap();
+    let dest = dir.path().join("out.bin");
+    let client = BlobClient::builder(session.clone(), common::query(prefix))
+        .query_timeout(Duration::from_secs(5))
+        .retry(RetryPolicy {
+            max_attempts: 3,
+            base_backoff: Duration::from_millis(20),
+            max_backoff: Duration::from_millis(100),
+        })
+        // Deliberately far above the server's cap.
+        .max_chunks_per_query(512)
+        .build();
+    client
+        .download_to(
+            &DownloadRequest::pinned("capped", manifest.root),
+            &dest,
+            &(),
+            &CancelToken::new(),
+        )
+        .await
+        .expect("a client must clamp to the advertised cap, not be rejected by it");
+    assert_eq!(std::fs::read(&dest).unwrap(), data);
+
+    handle.shutdown().await.unwrap();
+    session.close().await.unwrap();
+}
+
+/// A peer sending an extension id we do not know about is handled without
+/// error — which is the entire point of having an extension list.
+#[test]
+fn unknown_extension_ids_are_skipped() {
+    let mut m = zblob::Manifest {
+        version: zblob::wire::WIRE_VERSION,
+        id: "x".into(),
+        filename: None,
+        total_len: 1024,
+        chunk_size: MIN_CHUNK_SIZE,
+        root: zblob::Hash::of(b"x"),
+        created_ms: 0,
+        ext: vec![
+            (60_000, b"from a future version".to_vec()),
+            (
+                zblob::wire::EXT_MAX_CHUNKS_PER_QUERY,
+                7u32.to_le_bytes().to_vec(),
+            ),
+            (60_001, Vec::new()),
+        ],
+    };
+    m.validate(u64::MAX)
+        .expect("unknown ids must not invalidate");
+    assert_eq!(
+        m.max_chunks_per_query(),
+        Some(7),
+        "known ids still readable"
+    );
+    assert_eq!(m.max_blob_size(), None, "absent ids report absent");
+
+    // A known id carrying the wrong width is ignored rather than misread.
+    m.ext = vec![(zblob::wire::EXT_MAX_CHUNKS_PER_QUERY, vec![1, 2])];
+    assert_eq!(m.max_chunks_per_query(), None);
+}

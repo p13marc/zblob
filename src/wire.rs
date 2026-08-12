@@ -16,20 +16,54 @@ use crate::error::{BlobError, Result};
 
 /// The wire schema version this crate speaks. Carried as the first field of
 /// every control struct; any shape change bumps it.
-pub const WIRE_VERSION: u16 = 2;
+pub const WIRE_VERSION: u16 = 3;
 
 /// Zenoh [`Encoding`](zenoh::bytes::Encoding) tag of a manifest reply.
-pub const ENC_MANIFEST: &str = "zblob/manifest;v=2";
+pub const ENC_MANIFEST: &str = "zblob/manifest;v=3";
 /// Encoding tag of a bao slice reply (BlockSize 4 = 16 KiB groups).
-pub const ENC_SLICE: &str = "zblob/bao4;v=2";
+pub const ENC_SLICE: &str = "zblob/bao4;v=3";
 /// Encoding tag of a Tier-2 tree index reply.
-pub const ENC_INDEX: &str = "zblob/index;v=2";
-/// Encoding tag of a Tier-2 raw content-addressed chunk reply.
-pub const ENC_CHUNK: &str = "zblob/chunk";
+pub const ENC_INDEX: &str = "zblob/index;v=3";
+/// Encoding tag of a Tier-2 content-addressed chunk reply.
+///
+/// Versioned as of v3. It was the one tag that carried no version, on the
+/// reasoning that a chunk container is self-describing — which is true of the
+/// *container* and says nothing about the surrounding protocol. A tag whose
+/// job is "diagnosable instead of garbage" should not have an exception.
+pub const ENC_CHUNK: &str = "zblob/chunk;v=3";
 /// Encoding tag of push-protocol acknowledgement replies.
-pub const ENC_PUSH: &str = "zblob/push;v=2";
+pub const ENC_PUSH: &str = "zblob/push;v=3";
 /// Encoding tag of availability (`…/have`) replies.
-pub const ENC_AVAIL: &str = "zblob/have;v=2";
+pub const ENC_AVAIL: &str = "zblob/have;v=3";
+
+/// A trailing, length-prefixed extension list carried by the *metadata*
+/// messages ([`crate::Manifest`]).
+///
+/// postcard is positional, so without this every additive field costs a wire
+/// break — and a wire break costs a fleet a coordinated upgrade. Unknown ids
+/// are skipped, order is irrelevant, and duplicates take the first.
+///
+/// Deliberately **not** on the slice or chunk path, which stays exactly as
+/// tight as it is: this exists so metadata can grow, not so the bulk path can.
+pub type Ext = Vec<(u16, Vec<u8>)>;
+
+/// Extension id: the server's `max_chunks_per_query`, as a little-endian `u32`.
+pub const EXT_MAX_CHUNKS_PER_QUERY: u16 = 1;
+
+/// Extension id: the server's `max_blob_size`, as a little-endian `u64`.
+pub const EXT_MAX_BLOB_SIZE: u16 = 2;
+
+/// Read a `u32` extension value, if present and well-formed.
+pub fn ext_u32(ext: &Ext, id: u16) -> Option<u32> {
+    let (_, v) = ext.iter().find(|(k, _)| *k == id)?;
+    Some(u32::from_le_bytes(v.as_slice().try_into().ok()?))
+}
+
+/// Read a `u64` extension value, if present and well-formed.
+pub fn ext_u64(ext: &Ext, id: u16) -> Option<u64> {
+    let (_, v) = ext.iter().find(|(k, _)| *k == id)?;
+    Some(u64::from_le_bytes(v.as_slice().try_into().ok()?))
+}
 
 /// A responder's chunk availability for one blob: which transfer chunks it
 /// can serve right now. A full server answers all-ones; the shape exists so

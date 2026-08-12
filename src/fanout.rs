@@ -136,6 +136,9 @@ pub async fn fanout_file(
         chunk_size: spec.chunk_size,
         root: Hash::from(outboard.root),
         created_ms: spec.created_ms,
+        // A publisher has no per-query limits to advertise: fanout is a
+        // publication, not a query surface.
+        ext: Vec::new(),
     };
     manifest.validate(u64::MAX)?;
 

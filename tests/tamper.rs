@@ -84,13 +84,14 @@ async fn tampered_slice_dropped_alone_and_healed() {
 
     let ob = common::bao::outboard(&data);
     let manifest = zblob::Manifest {
-        version: 2,
+        version: zblob::wire::WIRE_VERSION,
         id: "blob-t".into(),
         filename: None,
         total_len: data.len() as u64,
         chunk_size: chunk,
         root: ob.root.into(),
         created_ms: 0,
+        ext: Vec::new(),
     };
     let root: Hash = ob.root.into();
 
@@ -182,13 +183,14 @@ async fn manifest_id_mismatch_rejected() {
     let data = pseudo_random(20_000, 5);
     let ob = common::bao::outboard(&data);
     let manifest = zblob::Manifest {
-        version: 2,
+        version: zblob::wire::WIRE_VERSION,
         id: "other-blob".into(), // not what the client asked for
         filename: None,
         total_len: data.len() as u64,
         chunk_size: MIN_CHUNK_SIZE,
         root: ob.root.into(),
         created_ms: 0,
+        ext: Vec::new(),
     };
 
     let (srv_session, srv_prefix) = (session.clone(), prefix.clone());

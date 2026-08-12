@@ -92,13 +92,14 @@ fn wire_decoders_never_panic_on_garbage() {
     }
     // Truncations of a *valid* encoding must error, not panic.
     let m = Manifest {
-        version: 2,
+        version: wire::WIRE_VERSION,
         id: "fuzz".into(),
         filename: Some("f".into()),
         total_len: 123_456,
         chunk_size: 65_536,
         root: Hash::of(b"x"),
         created_ms: 1,
+        ext: Vec::new(),
     };
     let full = wire::encode(&m).unwrap();
     for cut in 0..full.len() {
@@ -125,7 +126,7 @@ fn index_validation_never_panics_on_hostile_paths() {
             },
         ];
         let index = TreeIndex {
-            version: 2,
+            version: wire::WIRE_VERSION,
             id: "fuzz".into(),
             algo: Hash::ALGO.into(),
             cdc: zblob::CdcParams::default(),

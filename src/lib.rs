@@ -5,14 +5,14 @@
 //! **BLAKE3 verified streaming**, **range resume**, and **bounded memory**. It
 //! carries no application-specific types.
 //!
-//! # Model (wire v2)
+//! # Model (wire v3)
 //!
 //! One queryable serves every blob under a key prefix:
 //!
 //! ```text
 //! queryable on:   <prefix>/**
 //! manifest GET:   <prefix>/<id>/manifest                -> the Manifest (one reply)
-//! slice GET:      <prefix>/<id>/**?v=2&ranges=<spec>    -> bao slice replies (any order)
+//! slice GET:      <prefix>/<id>/**?ranges=<spec>       -> bao slice replies (any order)
 //! slice reply:    <prefix>/<id>/slice/<index>
 //! ```
 //!
@@ -42,11 +42,20 @@
 //!    `ConsolidationMode::None` so replies stream instead of being buffered
 //!    until query finalization. Publications — the `fanout` tier — are not
 //!    queries and *do* set `Block` explicitly, since their default is `Drop`.)
-//! 2. **Reply keys must match the query.** Replies use `ReplyKeyExpr::MatchingQuery`
-//!    by default, so the client **must** GET the wildcard `<prefix>/<id>/**` for
-//!    the `slice/<i>` replies to be accepted. A bare-`<id>` GET would silently
-//!    reject every slice. [`slice_selector`] enforces the wildcard.
-//! 3. **Any peer can answer, so one bad reply must not be fatal.** A queryable
+//! 2. **Reply keys must *intersect* the query.** Replies use
+//!    `ReplyKeyExpr::MatchingQuery` by default, so the client **must** GET the
+//!    wildcard `<prefix>/<id>/**` for the `slice/<i>` replies to be accepted.
+//!    [`slice_selector`] enforces the wildcard. The failure is not silent and
+//!    not on the client: a bare-`<id>` GET makes the *server's* `reply()` fail
+//!    with a "does not intersect" error, so the diagnosis appears on the
+//!    serving origin. (`accept_replies(ReplyKeyExpr::Any)` lifts the rule where
+//!    a protocol genuinely needs disjoint reply keys.)
+//! 3. **Silence is how a server says "not mine", and it is cheap.** A query
+//!    finalizes once every matching queryable has completed, and completing
+//!    without replying is immediate — an unknown id resolves in about a
+//!    millisecond, not on the query timeout. That is what lets several servers
+//!    share one prefix, each owning a disjoint set of ids.
+//! 4. **Any peer can answer, so one bad reply must not be fatal.** A queryable
 //!    key range is open: replies that fail decoding, validation, id matching,
 //!    or root pinning are *skipped* rather than aborting the query, so a
 //!    hostile or stale responder cannot deny a fetch that an honest replica
@@ -141,12 +150,15 @@ pub fn push_slice_key(prefix: &str, id: &str, index: u32) -> String {
 /// Always ends in the `/**` wildcard so the `slice/<i>` replies match the
 /// query (see the crate docs, fact 2). `ranges` must be sorted and disjoint —
 /// the resume bitfield's hole computation produces exactly that.
+///
+/// v3 dropped the `v=` parameter this used to carry. The wire version was
+/// stated twice — here, and as the version-first field of every struct the
+/// query's replies contain — and the selector copy cost a `String` allocation
+/// per query to compare. Every `fetch_*` loop already filters on the reply's
+/// `ENC_*` tag before decoding, so a foreign or stale peer stays diagnosable
+/// without it.
 pub fn slice_selector(prefix: &str, id: &str, ranges: &[std::ops::Range<u32>]) -> String {
-    format!(
-        "{prefix}/{id}/**?v={}&ranges={}",
-        wire::WIRE_VERSION,
-        format_ranges(ranges)
-    )
+    format!("{prefix}/{id}/**?ranges={}", format_ranges(ranges))
 }
 
 /// Render sorted, disjoint chunk ranges as the `ranges` parameter value:
@@ -172,33 +184,25 @@ pub fn format_ranges(ranges: &[std::ops::Range<u32>]) -> String {
 /// Maximum number of spans a single `ranges` parameter may carry.
 pub const MAX_RANGE_SPANS: usize = 128;
 
-/// Parse and validate a slice-query parameter string (`v=2&ranges=<spec>`).
+/// Parse and validate a slice-query parameter string (`ranges=<spec>`).
 ///
-/// Enforced: the `v=2` version marker; spans well-formed (`a-b` half-open with
-/// `a < b`, or a bare index), sorted, disjoint, within `chunk_count`; at most
+/// Enforced: spans well-formed (`a-b` half-open with `a < b`, or a bare
+/// index), sorted, disjoint, within `chunk_count`; at most
 /// [`MAX_RANGE_SPANS`] spans and `max_chunks` total chunks. Anything else is
 /// an [`BlobError::InvalidRanges`] — a server must never let a remote peer
 /// drive it into unbounded work from a malformed selector.
+///
+/// Unknown parameters are ignored rather than refused, so a later version can
+/// add one without this rejecting the whole query.
 pub fn parse_ranges(
     params: &str,
     chunk_count: u32,
     max_chunks: u32,
 ) -> Result<Vec<std::ops::Range<u32>>> {
-    let mut version: Option<&str> = None;
     let mut spec: Option<&str> = None;
     for pair in params.split('&') {
-        if let Some(v) = pair.strip_prefix("v=") {
-            version = Some(v);
-        } else if let Some(r) = pair.strip_prefix("ranges=") {
+        if let Some(r) = pair.strip_prefix("ranges=") {
             spec = Some(r);
-        }
-    }
-    match version {
-        Some(v) if v == wire::WIRE_VERSION.to_string() => {}
-        other => {
-            return Err(BlobError::InvalidRanges(format!(
-                "missing or unsupported version marker: {other:?}"
-            )));
         }
     }
     let Some(spec) = spec else {
@@ -405,7 +409,7 @@ mod range_properties {
         fn parse_ranges_never_panics(params in prop::collection::vec(any::<u8>(), 0..200)) {
             let s = String::from_utf8_lossy(&params);
             let _ = parse_ranges(&s, 1000, 512);
-            let _ = parse_ranges(&format!("v=2&ranges={s}"), 1000, 512);
+            let _ = parse_ranges(&format!("ranges={s}"), 1000, 512);
         }
 
         /// Any legal hole set the client can produce must survive the round
@@ -425,7 +429,7 @@ mod range_properties {
             ranges.truncate(MAX_RANGE_SPANS);
             let chunk_count = cursor + 1;
             let total: u32 = ranges.iter().map(|r| r.end - r.start).sum();
-            let rendered = format!("v=2&ranges={}", format_ranges(&ranges));
+            let rendered = format!("ranges={}", format_ranges(&ranges));
             let parsed = parse_ranges(&rendered, chunk_count, total)
                 .map_err(|e| TestCaseError::fail(format!("rejected own output {rendered:?}: {e}")))?;
             prop_assert_eq!(parsed, ranges);
@@ -446,7 +450,7 @@ mod key_tests {
         assert_eq!(slice_key("p", "A", 7), "p/A/slice/7");
         assert_eq!(
             slice_selector("p", "A", &[0..5, 9..10, 12..20]),
-            "p/A/**?v=2&ranges=0-5,9,12-20"
+            "p/A/**?ranges=0-5,9,12-20"
         );
     }
 
@@ -525,25 +529,24 @@ mod key_tests {
     #[test]
     fn ranges_roundtrip() {
         let ranges = vec![0..5, 9..10, 12..20];
-        let params = format!("v=2&ranges={}", format_ranges(&ranges));
+        let params = format!("ranges={}", format_ranges(&ranges));
         assert_eq!(parse_ranges(&params, 20, 512).unwrap(), ranges);
     }
 
     #[test]
     fn ranges_rejects_malformed() {
         let cases: &[(&str, u32, u32)] = &[
-            ("ranges=0-5", 10, 512),            // missing v=2
-            ("v=1&ranges=0-5", 10, 512),        // wrong version
-            ("v=2", 10, 512),                   // missing ranges
-            ("v=2&ranges=", 10, 512),           // empty
-            ("v=2&ranges=5-5", 10, 512),        // empty span
-            ("v=2&ranges=6-2", 10, 512),        // inverted
-            ("v=2&ranges=0-11", 10, 512),       // out of bounds
-            ("v=2&ranges=3-6,5-8", 10, 512),    // overlap
-            ("v=2&ranges=5-8,0-2", 10, 512),    // unsorted
-            ("v=2&ranges=x", 10, 512),          // garbage
-            ("v=2&ranges=0-9", 10, 4),          // over the chunk cap
-            ("v=2&ranges=4294967295", 10, 512), // index overflow edge (oob too)
+            ("", 10, 512),                  // missing ranges
+            ("other=1", 10, 512),           // no ranges among the parameters
+            ("ranges=", 10, 512),           // empty
+            ("ranges=5-5", 10, 512),        // empty span
+            ("ranges=6-2", 10, 512),        // inverted
+            ("ranges=0-11", 10, 512),       // out of bounds
+            ("ranges=3-6,5-8", 10, 512),    // overlap
+            ("ranges=5-8,0-2", 10, 512),    // unsorted
+            ("ranges=x", 10, 512),          // garbage
+            ("ranges=0-9", 10, 4),          // over the chunk cap
+            ("ranges=4294967295", 10, 512), // index overflow edge (oob too)
         ];
         for (params, count, cap) in cases {
             assert!(
@@ -551,6 +554,16 @@ mod key_tests {
                 "should reject {params:?}"
             );
         }
+    }
+
+    #[test]
+    fn unknown_parameters_are_tolerated() {
+        // A later version must be able to add a parameter without every
+        // existing server rejecting the whole query.
+        assert_eq!(
+            parse_ranges("future=7&ranges=0-3&other=x", 10, 512).unwrap(),
+            vec![0..3]
+        );
     }
 
     #[test]

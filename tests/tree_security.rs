@@ -75,7 +75,7 @@ async fn fake_tree_server(
 /// Build a syntactically valid index around the given entries.
 fn index_for(id: &str, entries: Vec<Entry>) -> TreeIndex {
     let mut idx = TreeIndex {
-        version: 2,
+        version: wire::WIRE_VERSION,
         id: id.into(),
         algo: Hash::ALGO.into(),
         cdc: small_cdc(),

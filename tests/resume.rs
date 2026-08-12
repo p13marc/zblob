@@ -136,13 +136,14 @@ async fn middle_hole_is_refetched_as_a_range() {
 
     let ob = common::bao::outboard(&data);
     let manifest = zblob::Manifest {
-        version: 2,
+        version: zblob::wire::WIRE_VERSION,
         id: "holey".into(),
         filename: None,
         total_len: data.len() as u64,
         chunk_size: chunk,
         root: ob.root.into(),
         created_ms: 0,
+        ext: Vec::new(),
     };
 
     let pinned_root = manifest.root;

@@ -43,6 +43,17 @@ pub struct Manifest {
     /// Creation time, Unix epoch milliseconds (caller-supplied; the crate
     /// avoids reading the wall clock so it stays side-effect-free).
     pub created_ms: i64,
+    /// Trailing extension list — see [`wire::Ext`](crate::wire::Ext).
+    ///
+    /// **Always last.** postcard is positional, so a trailing extension list is
+    /// the only place a field can be added without a wire break; putting it
+    /// anywhere else would defeat its own purpose.
+    ///
+    /// A server advertises its limits here (see
+    /// [`max_chunks_per_query`](Self::max_chunks_per_query)), which is what
+    /// lets a client with a larger default clamp instead of having its queries
+    /// rejected with no way to discover why.
+    pub ext: crate::wire::Ext,
 }
 
 impl Manifest {
@@ -71,6 +82,22 @@ impl Manifest {
     /// on an invalid `chunk_size` but applies no size cap.
     pub fn chunks(&self) -> Result<TransferChunks> {
         TransferChunks::new(self.chunk_size, self.total_len)
+    }
+
+    /// The server's advertised `max_chunks_per_query`, if it said.
+    ///
+    /// Advertisement, not negotiation: one field, no handshake, no round trip.
+    /// Both sides defaulted to 512 and neither could tell the other, so a
+    /// server that lowered its cap rejected every existing client's queries
+    /// with `InvalidRanges` and nothing to explain it. Documented behaviour is
+    /// not a protocol.
+    pub fn max_chunks_per_query(&self) -> Option<u32> {
+        crate::wire::ext_u32(&self.ext, crate::wire::EXT_MAX_CHUNKS_PER_QUERY)
+    }
+
+    /// The server's advertised `max_blob_size`, if it said.
+    pub fn max_blob_size(&self) -> Option<u64> {
+        crate::wire::ext_u64(&self.ext, crate::wire::EXT_MAX_BLOB_SIZE)
     }
 
     /// How many transfer chunks this manifest describes.
@@ -194,6 +221,7 @@ mod tests {
             chunk_size: DEFAULT_CHUNK_SIZE,
             root: Hash::of(b"whatever"),
             created_ms: 42,
+            ext: Vec::new(),
         }
     }
 
@@ -206,14 +234,19 @@ mod tests {
 
     #[test]
     fn wrong_version_rejected() {
-        let m = Manifest {
-            version: 3,
-            ..manifest()
-        };
-        assert!(matches!(
-            m.validate(u64::MAX),
-            Err(BlobError::UnsupportedVersion(3))
-        ));
+        // Any version but ours, in either direction: a v2 peer and a
+        // hypothetical v4 one are equally unusable, and must say so rather
+        // than half-decode.
+        for v in [2u16, 4] {
+            let m = Manifest {
+                version: v,
+                ..manifest()
+            };
+            assert!(
+                matches!(m.validate(u64::MAX), Err(BlobError::UnsupportedVersion(got)) if got == v),
+                "version {v} should be refused"
+            );
+        }
     }
 
     #[test]

@@ -626,6 +626,9 @@ impl BlobClient {
             chunk_size: spec.chunk_size,
             root: crate::hash::Hash::from(outboard.root),
             created_ms: spec.created_ms,
+            // The uploader has nothing to advertise; the *receiver* is the one
+            // with limits, and it states them in its offer reply.
+            ext: Vec::new(),
         };
         manifest.validate(u64::MAX)?;
 
@@ -999,10 +1002,18 @@ impl BlobClient {
                 return Self::persist_cancel(file, state, part, sink, count).await;
             }
 
-            // Take as many holes as one query may carry.
+            // Take as many holes as one query may carry — clamped to whatever
+            // the *server* said it accepts. Without this a server that lowered
+            // its cap rejected every query from a client with the old default,
+            // and the client had no way to find out why.
             let mut holes = state.missing_ranges(count);
             holes.truncate(MAX_RANGE_SPANS);
-            let mut budget = self.cfg.max_chunks_per_query;
+            let mut budget = manifest
+                .max_chunks_per_query()
+                .map_or(self.cfg.max_chunks_per_query, |served| {
+                    self.cfg.max_chunks_per_query.min(served)
+                })
+                .max(1);
             for r in holes.iter_mut() {
                 let take = (r.end - r.start).min(budget);
                 r.end = r.start + take;

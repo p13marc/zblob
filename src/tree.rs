@@ -828,7 +828,11 @@ async fn serve_index_query(inner: &TreeInner, query: zenoh::query::Query) -> Res
     };
     let [id] = tail[..] else { return Ok(()) };
     let Some(index) = inner.index.read().await.get(id).cloned() else {
-        return Ok(()); // unknown id → client times out → NotFound.
+        // Unknown id: silence, not an error reply. A query finalizes when
+        // its matching queryables complete, so this resolves on the client
+        // in about a millisecond rather than on the timeout — see the
+        // `BlobServer` docs on sharing a prefix.
+        return Ok(());
     };
     let payload = encode(&index)?;
     query

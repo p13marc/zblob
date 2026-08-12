@@ -119,13 +119,14 @@ async fn slice_reply_mutations_never_yield_wrong_bytes() {
     for &mutation in MUTATIONS {
         let prefix = unique_prefix();
         let manifest = Manifest {
-            version: 2,
+            version: wire::WIRE_VERSION,
             id: "hostile".into(),
             filename: None,
             total_len: data.len() as u64,
             chunk_size: MIN_CHUNK_SIZE,
             root,
             created_ms: 0,
+            ext: Vec::new(),
         };
         let count = manifest.chunks().unwrap().count();
 
@@ -277,78 +278,85 @@ async fn manifest_reply_mutations_are_survivable() {
                 chunk_size: MIN_CHUNK_SIZE,
                 root,
                 created_ms: 0,
+                ext: Vec::new(),
             },
         ),
         (
             "huge_total_len",
             Manifest {
-                version: 2,
+                version: wire::WIRE_VERSION,
                 id: "m".into(),
                 filename: None,
                 total_len: u64::MAX,
                 chunk_size: MIN_CHUNK_SIZE,
                 root,
                 created_ms: 0,
+                ext: Vec::new(),
             },
         ),
         (
             "zero_chunk_size",
             Manifest {
-                version: 2,
+                version: wire::WIRE_VERSION,
                 id: "m".into(),
                 filename: None,
                 total_len: 1024,
                 chunk_size: 0,
                 root,
                 created_ms: 0,
+                ext: Vec::new(),
             },
         ),
         (
             "unaligned_chunk_size",
             Manifest {
-                version: 2,
+                version: wire::WIRE_VERSION,
                 id: "m".into(),
                 filename: None,
                 total_len: 1024,
                 chunk_size: MIN_CHUNK_SIZE + 1,
                 root,
                 created_ms: 0,
+                ext: Vec::new(),
             },
         ),
         (
             "traversal_filename",
             Manifest {
-                version: 2,
+                version: wire::WIRE_VERSION,
                 id: "m".into(),
                 filename: Some("../../../etc/pwned".into()),
                 total_len: data.len() as u64,
                 chunk_size: MIN_CHUNK_SIZE,
                 root,
                 created_ms: 0,
+                ext: Vec::new(),
             },
         ),
         (
             "wrong_id",
             Manifest {
-                version: 2,
+                version: wire::WIRE_VERSION,
                 id: "someone-else".into(),
                 filename: None,
                 total_len: data.len() as u64,
                 chunk_size: MIN_CHUNK_SIZE,
                 root,
                 created_ms: 0,
+                ext: Vec::new(),
             },
         ),
         (
             "empty_claim",
             Manifest {
-                version: 2,
+                version: wire::WIRE_VERSION,
                 id: "m".into(),
                 filename: None,
                 total_len: 0,
                 chunk_size: MIN_CHUNK_SIZE,
                 root,
                 created_ms: 0,
+                ext: Vec::new(),
             },
         ),
     ];
@@ -444,23 +452,25 @@ async fn a_hostile_responder_cannot_deny_an_honest_one() {
                 let payload = match kind.as_str() {
                     "garbage" => vec![0xFF; 40],
                     "wrong-id" => wire::encode(&Manifest {
-                        version: 2,
+                        version: wire::WIRE_VERSION,
                         id: "not-contested".into(),
                         filename: None,
                         total_len: 4096,
                         chunk_size: MIN_CHUNK_SIZE,
                         root: Hash::of(b"nope"),
                         created_ms: 0,
+                        ext: Vec::new(),
                     })
                     .unwrap(),
                     _ => wire::encode(&Manifest {
-                        version: 2,
+                        version: wire::WIRE_VERSION,
                         id: "contested".into(),
                         filename: None,
                         total_len: 4096,
                         chunk_size: MIN_CHUNK_SIZE,
                         root: Hash::of(b"substituted"),
                         created_ms: 0,
+                        ext: Vec::new(),
                     })
                     .unwrap(),
                 };

@@ -195,6 +195,7 @@ mod properties {
             chunk_size: DEFAULT_CHUNK_SIZE,
             root: Hash::of(b"prop"),
             created_ms: 0,
+            ext: Vec::new(),
         }
     }
 
@@ -324,6 +325,7 @@ mod tests {
             chunk_size: DEFAULT_CHUNK_SIZE,
             root: Hash::of(b"data"),
             created_ms: 0,
+            ext: Vec::new(),
         }
     }
 
