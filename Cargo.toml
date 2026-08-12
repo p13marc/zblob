@@ -35,6 +35,7 @@ zstd = { version = "0.13", optional = true }
 tracing = { version = "0.1", optional = true }
 zenoh-ext = { version = "1.9", features = ["unstable"], optional = true }
 chacha20poly1305 = { version = "0.10", optional = true }
+zeroize = { version = "1.9", features = ["zeroize_derive"], optional = true }
 
 [features]
 # Per-chunk zstd compression for Tier-2 chunk containers (wire + at rest).
@@ -44,7 +45,7 @@ tracing = ["dep:tracing"]
 # One-to-many fanout tier over zenoh-ext AdvancedPublisher.
 fanout = ["dep:zenoh-ext"]
 # Per-chunk XChaCha20-Poly1305 encryption at rest for DirStore.
-encryption = ["dep:chacha20poly1305"]
+encryption = ["dep:chacha20poly1305", "dep:zeroize"]
 
 [dev-dependencies]
 serde_json = "1"

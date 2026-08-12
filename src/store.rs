@@ -378,10 +378,9 @@ mod tests {
     fn encrypted_store_roundtrip_and_key_required() {
         use crate::crypt::StoreKey;
         let dir = tempfile::tempdir().unwrap();
-        let key = StoreKey([7u8; 32]);
         let s = DirStore::open(dir.path())
             .unwrap()
-            .with_encryption(key.clone());
+            .with_encryption(StoreKey::new([7u8; 32]));
         let plaintext = b"very secret chunk contents".to_vec();
         let hash = h(&plaintext);
         s.put(&hash, &plaintext).unwrap();
@@ -404,7 +403,7 @@ mod tests {
         // Wrong key: same safety.
         let wrong = DirStore::open(dir.path())
             .unwrap()
-            .with_encryption(StoreKey([8u8; 32]));
+            .with_encryption(StoreKey::new([8u8; 32]));
         assert!(wrong.get(&hash).is_none());
 
         // Tampered ciphertext: detected as corruption by a keyed scrub.

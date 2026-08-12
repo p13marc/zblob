@@ -10,10 +10,19 @@
 //!
 //! - The cipher key and a nonce key are derived from the store key with
 //!   domain-separated BLAKE3 `derive_key` contexts.
-//! - The nonce is `keyed_hash(nonce_key, chunk_hash)[..24]` — deterministic,
-//!   so an identical chunk seals to identical bytes: dedup keeps working and
-//!   re-`put`s stay idempotent. Determinism is safe here because a given
-//!   (key, chunk hash) pair only ever seals one plaintext.
+//! - The nonce is `keyed_hash(nonce_key, chunk_hash ‖ container)[..24]` —
+//!   deterministic, so sealing an identical container yields identical bytes:
+//!   dedup keeps working and re-`put`s stay idempotent.
+//!
+//!   **It must cover the container, not just the chunk hash.** Deriving it
+//!   from `(key, chunk_hash)` alone assumes one (key, hash) pair only ever
+//!   seals one plaintext, and that is false: what gets sealed is the
+//!   *compression container*, and `DirStore::put` re-packs and re-seals
+//!   unconditionally. Re-`put` one chunk into a store reconfigured with a
+//!   different [`ChunkCompression`](crate::ChunkCompression) — or merely a
+//!   different zstd level — and two distinct plaintexts would go under one
+//!   (key, nonce): XChaCha20 keystream reuse, and a reused Poly1305 one-time
+//!   key. Hashing the container in costs nothing and removes the assumption.
 //! - The chunk's content hash is the AAD, binding each ciphertext to its
 //!   store address: ciphertexts cannot be swapped between keys.
 //!
@@ -27,14 +36,26 @@
 
 use chacha20poly1305::aead::{Aead, Payload};
 use chacha20poly1305::{Key, KeyInit, XChaCha20Poly1305, XNonce};
+use zeroize::{Zeroize, ZeroizeOnDrop, Zeroizing};
 
 use crate::compress::TAG_SEALED;
 use crate::hash::Hash;
 
 /// A 32-byte store encryption key. Generate it randomly, keep it outside the
 /// store directory, and give every store its own key.
-#[derive(Clone)]
-pub struct StoreKey(pub [u8; 32]);
+///
+/// Deliberately **not** `Clone` and **not** `Copy`: `ZeroizeOnDrop` can only
+/// scrub the value it is dropping, so every copy left behind would outlive the
+/// scrub and defeat the point.
+#[derive(Zeroize, ZeroizeOnDrop)]
+pub struct StoreKey([u8; 32]);
+
+impl StoreKey {
+    /// Wrap 32 bytes of key material.
+    pub fn new(bytes: [u8; 32]) -> Self {
+        StoreKey(bytes)
+    }
+}
 
 impl std::fmt::Debug for StoreKey {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -46,19 +67,25 @@ const CIPHER_CONTEXT: &str = "zblob v2 2026-07 store chunk cipher key";
 const NONCE_CONTEXT: &str = "zblob v2 2026-07 store chunk nonce key";
 
 fn cipher_for(key: &StoreKey) -> XChaCha20Poly1305 {
-    let k = blake3::derive_key(CIPHER_CONTEXT, &key.0);
-    XChaCha20Poly1305::new(Key::from_slice(&k))
+    let k = Zeroizing::new(blake3::derive_key(CIPHER_CONTEXT, &key.0));
+    XChaCha20Poly1305::new(Key::from_slice(&*k))
 }
 
-fn nonce_for(key: &StoreKey, hash: &Hash) -> [u8; 24] {
-    let nk = blake3::derive_key(NONCE_CONTEXT, &key.0);
-    let full = blake3::keyed_hash(&nk, hash.as_bytes());
+/// Derive the sealing nonce from the key, the chunk address **and the exact
+/// container being sealed** — see the module docs for why the container has to
+/// be in there.
+fn nonce_for(key: &StoreKey, hash: &Hash, container: &[u8]) -> [u8; 24] {
+    let nk = Zeroizing::new(blake3::derive_key(NONCE_CONTEXT, &key.0));
+    let mut h = blake3::Hasher::new_keyed(&nk);
+    h.update(hash.as_bytes());
+    h.update(container);
+    let full = h.finalize();
     full.as_bytes()[..24].try_into().expect("24 bytes")
 }
 
 /// Seal a (already compression-framed) chunk container for storage.
 pub(crate) fn seal(key: &StoreKey, hash: &Hash, container: &[u8]) -> std::io::Result<Vec<u8>> {
-    let nonce = nonce_for(key, hash);
+    let nonce = nonce_for(key, hash, container);
     let ciphertext = cipher_for(key)
         .encrypt(
             XNonce::from_slice(&nonce),

@@ -60,7 +60,7 @@ fn stores() -> Vec<(&'static str, StoreFactory)> {
             Arc::new(
                 DirStore::open(p)
                     .unwrap()
-                    .with_encryption(zblob::StoreKey([9u8; 32])),
+                    .with_encryption(zblob::StoreKey::new([9u8; 32])),
             ) as Arc<dyn ContentStore>
         }),
     ));
@@ -208,7 +208,7 @@ fn a_store_never_claims_what_it_cannot_decode() {
     // Written sealed…
     let sealed = DirStore::open(dir.path())
         .unwrap()
-        .with_encryption(zblob::StoreKey([1u8; 32]));
+        .with_encryption(zblob::StoreKey::new([1u8; 32]));
     sealed.put(&h, &payload).unwrap();
     assert!(sealed.has(&h) && sealed.get(&h).unwrap() == payload);
 
@@ -218,7 +218,7 @@ fn a_store_never_claims_what_it_cannot_decode() {
         DirStore::open(dir.path()).unwrap(),
         DirStore::open(dir.path())
             .unwrap()
-            .with_encryption(zblob::StoreKey([2u8; 32])),
+            .with_encryption(zblob::StoreKey::new([2u8; 32])),
     ] {
         assert_eq!(
             other.has(&h),
@@ -229,11 +229,80 @@ fn a_store_never_claims_what_it_cannot_decode() {
     }
     let reopened = DirStore::open(dir.path())
         .unwrap()
-        .with_encryption(zblob::StoreKey([1u8; 32]));
+        .with_encryption(zblob::StoreKey::new([1u8; 32]));
     assert_eq!(
         reopened.get(&h).unwrap(),
         payload,
         "a keyless reader destroyed sealed data"
+    );
+}
+
+/// Sealing the same chunk under different compression settings must not reuse
+/// the nonce.
+///
+/// What `seal` protects is the *compression container*, not the chunk, and
+/// `put` re-packs and re-seals unconditionally. So deriving the nonce from
+/// `(key, chunk hash)` alone — which reads as safe, since a content address
+/// determines its content — puts two different plaintexts under one
+/// (key, nonce): XChaCha20 keystream reuse plus a reused Poly1305 one-time
+/// key. Only a store-*configuration* change triggers it, which is why no
+/// single-configuration test could find it and why it belongs here.
+#[cfg(all(feature = "encryption", feature = "zstd"))]
+#[test]
+fn resealing_under_different_compression_does_not_reuse_the_nonce() {
+    /// The frame is `[0x02][24-byte nonce][ciphertext]`.
+    fn nonce_of(path: &std::path::Path) -> Vec<u8> {
+        let bytes = std::fs::read(path).unwrap();
+        assert_eq!(bytes[0], 0x02, "expected a sealed container");
+        bytes[1..25].to_vec()
+    }
+
+    // Compressible, so the two containers genuinely differ.
+    let payload = vec![b'a'; 60_000];
+    let h = Hash::of(&payload);
+    let sealed_path = |root: &std::path::Path| {
+        let hex = h.to_string();
+        root.join("blake3").join(&hex[..2]).join(hex)
+    };
+
+    let dir = tempfile::tempdir().unwrap();
+    DirStore::open(dir.path())
+        .unwrap()
+        .with_encryption(zblob::StoreKey::new([3u8; 32]))
+        .put(&h, &payload)
+        .unwrap();
+    let raw_nonce = nonce_of(&sealed_path(dir.path()));
+
+    // Same key, same chunk, same store directory — only the compression
+    // policy changed, exactly as reconfiguring a store would.
+    DirStore::open(dir.path())
+        .unwrap()
+        .with_encryption(zblob::StoreKey::new([3u8; 32]))
+        .with_compression(zblob::ChunkCompression::Zstd { level: 3 })
+        .put(&h, &payload)
+        .unwrap();
+    let zstd_nonce = nonce_of(&sealed_path(dir.path()));
+
+    assert_ne!(
+        raw_nonce, zstd_nonce,
+        "two different plaintexts were sealed under the same nonce"
+    );
+
+    // Discriminating power, and the property the determinism was for: sealing
+    // a byte-identical container twice must still be byte-identical, or
+    // idempotent re-puts would start churning the store.
+    let dir2 = tempfile::tempdir().unwrap();
+    for _ in 0..2 {
+        DirStore::open(dir2.path())
+            .unwrap()
+            .with_encryption(zblob::StoreKey::new([3u8; 32]))
+            .put(&h, &payload)
+            .unwrap();
+    }
+    assert_eq!(
+        nonce_of(&sealed_path(dir2.path())),
+        raw_nonce,
+        "an identical re-put must still seal identically"
     );
 }
 
