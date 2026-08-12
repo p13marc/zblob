@@ -405,14 +405,26 @@ pub fn build_tree(
     let mut entries = Vec::new();
     walk(root, cdc, store, &mut entries)?;
     let root_hash = root_digest(&entries)?;
-    Ok(TreeIndex {
+    let index = TreeIndex {
         version: WIRE_VERSION,
         id,
         algo: Hash::ALGO.to_string(),
         cdc: *cdc,
         entries,
         root_hash,
-    })
+    };
+    // Refuse to hand back a snapshot no client would accept.
+    //
+    // Every consumer runs `validate()` on receipt, and it rejects things a
+    // *source tree* can perfectly well contain — an absolute symlink such as
+    // `/etc/localtime`, or one pointing above the tree. Without this check
+    // such a snapshot builds, registers and publishes without complaint, and
+    // is then rejected by every consumer forever, with the error surfacing on
+    // machines that did not build it. That is the same shape as the leading-`@`
+    // id rule (see `manifest::validate_id`): reject it at the door, where the
+    // producer can act on it.
+    index.validate()?;
+    Ok(index)
 }
 
 fn rel_path_of(root: &Path, path: &Path) -> Result<String> {
@@ -1331,7 +1343,23 @@ fn reconstruct_tree(
                         .get(&c.hash)
                         .ok_or_else(|| BlobError::NotFound(c.hash.to_string()))?;
                     if bytes.len() as u32 != c.len {
-                        return Err(BlobError::HashMismatch);
+                        return Err(BlobError::ChunkLengthMismatch {
+                            expected: c.len,
+                            actual: bytes.len() as u32,
+                        });
+                    }
+                    // Verify on the way *out* of the store, not only on the way
+                    // in. Tier 1 guarantees every byte it writes was checked
+                    // against the root; tier 2 checked chunks when it fetched
+                    // them and then trusted the store, so local rot — or a
+                    // `ContentStore` implementation that breaks its contract,
+                    // and there are third-party ones — could still materialize
+                    // wrong bytes under a snapshot the caller believes is
+                    // verified. `root_hash` does not cover this: it covers the
+                    // entry list, not chunk contents. One BLAKE3 pass over the
+                    // tree is the price of the same guarantee tier 1 gives.
+                    if Hash::of(&bytes) != c.hash {
+                        return Err(BlobError::CorruptStore { hash: c.hash });
                     }
                     f.write_all(&bytes)?;
                     written += bytes.len() as u64;

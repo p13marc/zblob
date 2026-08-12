@@ -62,9 +62,26 @@ impl TransferChunks {
         Ok(())
     }
 
-    /// Build the chunk geometry for a blob, validating `chunk_size`.
+    /// Build the chunk geometry for a blob, validating `chunk_size` **and**
+    /// that the resulting chunk count is representable.
+    ///
+    /// The count check is not theoretical bookkeeping. Chunk indices are `u32`
+    /// on the wire, and `count()` used to cast a `u64` division down to `u32`:
+    /// at the minimum chunk size, a `total_len` that is a multiple of
+    /// `2^32 × 65536` truncates to **0**, and a zero-count non-empty blob
+    /// finishes its (empty) hole set immediately — renaming an all-zero file
+    /// of the claimed length into place as "verified". Unreachable at the
+    /// default `max_blob_size`, reachable through a raised one, so it is
+    /// refused at construction rather than relied on not to happen.
     pub fn new(chunk_size: u32, total_len: u64) -> Result<Self> {
         Self::validate_chunk_size(chunk_size)?;
+        if total_len.div_ceil(chunk_size as u64) > u32::MAX as u64 {
+            return Err(BlobError::InvalidManifest(format!(
+                "total_len {total_len} at chunk_size {chunk_size} needs more than \
+                 {} chunks, which cannot be indexed",
+                u32::MAX
+            )));
+        }
         Ok(TransferChunks {
             chunk_size,
             total_len,
@@ -82,7 +99,11 @@ impl TransferChunks {
     }
 
     /// Number of chunks (`ceil(total_len / chunk_size)`; 0 for an empty blob).
+    ///
+    /// Always representable: [`TransferChunks::new`] refuses a geometry whose
+    /// count would not fit.
     pub fn count(&self) -> u32 {
+        debug_assert!(self.total_len.div_ceil(self.chunk_size as u64) <= u32::MAX as u64);
         self.total_len.div_ceil(self.chunk_size as u64) as u32
     }
 
@@ -255,6 +276,20 @@ mod properties {
                 start.is_multiple_of(crate::verify::GROUP_SIZE) || start == total_len,
                 "chunk {} starts at {} which is not group-aligned", index, start
             );
+        }
+
+        /// Any geometry `new` accepts must have a chunk count that fits in the
+        /// `u32` the wire uses to index it. The count was a truncating cast,
+        /// so a large enough blob wrapped to a small number — and to zero at
+        /// exact multiples, which reads as "already complete".
+        #[test]
+        fn accepted_geometries_have_representable_counts(
+            chunk_size in valid_chunk_size(),
+            total_len in any::<u64>(),
+        ) {
+            if TransferChunks::new(chunk_size, total_len).is_ok() {
+                prop_assert!(total_len.div_ceil(chunk_size as u64) <= u32::MAX as u64);
+            }
         }
 
         /// Validation is total: no input panics, and acceptance implies the

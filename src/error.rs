@@ -32,8 +32,11 @@ pub enum BlobError {
     InvalidManifest(String),
 
     /// The transfer's root hash did not match the caller-pinned expectation.
-    /// Nothing was written for `expected == None` flows; for pinned flows the
-    /// mismatch is detected before any byte is fetched.
+    ///
+    /// On the download paths this is detected before any byte is fetched. On
+    /// the *upload* path it is not: `finalize_push` spools the whole blob
+    /// before checking, so a rejected push has already written its spool file
+    /// (which the server then discards).
     #[error("integrity: root mismatch (expected {expected}, got {actual})")]
     RootMismatch {
         /// The root the caller pinned.
@@ -42,10 +45,36 @@ pub enum BlobError {
         actual: Hash,
     },
 
-    /// A received chunk's content hash did not match its content-addressed key
-    /// (Tier 2), or a fully-reassembled artifact failed its digest check.
-    #[error("integrity: content hash mismatch")]
-    HashMismatch,
+    /// A [`ContentStore`](crate::ContentStore) returned bytes that do not hash
+    /// to the address they were stored under.
+    ///
+    /// Chunks are verified when fetched, so this means the store itself is
+    /// wrong: local corruption between fetch and materialization, or an
+    /// implementation that broke the `has`/`get` contract. The snapshot's
+    /// `root_hash` cannot catch it — that covers the entry list, not chunk
+    /// contents. Re-running the download after removing the chunk heals it;
+    /// [`DirStore::with_verify_on_read`](crate::DirStore::with_verify_on_read)
+    /// and [`DirStore::scrub`](crate::DirStore::scrub) do the removal.
+    #[error("integrity: store returned corrupt bytes for chunk {hash}")]
+    CorruptStore {
+        /// The address whose contents did not match.
+        hash: Hash,
+    },
+
+    /// A stored chunk's length disagreed with the length its index declared.
+    ///
+    /// Distinct from a content mismatch, which cannot reach this point: chunks
+    /// are verified against their content address the moment they are fetched
+    /// (a mismatching reply is skipped and the fetch waits for an honest one).
+    /// This fires when a [`ContentStore`](crate::ContentStore) hands back
+    /// something other than what was put in it.
+    #[error("integrity: chunk length {actual} does not match the declared {expected}")]
+    ChunkLengthMismatch {
+        /// The length the index declared.
+        expected: u32,
+        /// The length the store returned.
+        actual: u32,
+    },
 
     /// A `ranges` selector parameter was malformed (unsorted, overlapping,
     /// out of bounds, over the span/chunk caps, or missing the `v=2` marker).

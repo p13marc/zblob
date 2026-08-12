@@ -824,3 +824,130 @@ async fn an_over_long_chunk_reply_is_skipped_not_fatal() {
     honest.abort();
     session.close().await.unwrap();
 }
+
+/// A source tree containing an absolute symlink must fail at *build* time.
+///
+/// Every consumer validates on receipt and rejects such an index, so without
+/// this the snapshot builds, registers and publishes without complaint and is
+/// then unusable everywhere — with the error surfacing on machines that did
+/// not build it. Same shape as the leading-`@` id rule for tier 1.
+#[cfg(unix)]
+#[test]
+fn build_tree_refuses_a_snapshot_no_client_would_accept() {
+    let src = tempfile::tempdir().unwrap();
+    std::fs::write(src.path().join("ok.txt"), b"fine").unwrap();
+    std::os::unix::fs::symlink("/etc/localtime", src.path().join("tz")).unwrap();
+
+    let store = MemoryStore::new();
+    let err = build_tree(src.path(), "abs", &small_cdc(), &store)
+        .expect_err("an absolute symlink must be refused at build time");
+    assert!(
+        format!("{err}").contains("absolute symlink target"),
+        "wrong diagnosis: {err}"
+    );
+
+    // Discriminating power: the same tree without the offending link builds,
+    // and what it builds validates.
+    std::fs::remove_file(src.path().join("tz")).unwrap();
+    std::os::unix::fs::symlink("ok.txt", src.path().join("rel")).unwrap();
+    let index =
+        build_tree(src.path(), "rel", &small_cdc(), &store).expect("a relative link is fine");
+    index
+        .validate()
+        .expect("build_tree output must always validate");
+}
+
+/// Chunks are verified when fetched, but they are then read back out of a
+/// `ContentStore` to be written — so a store that corrupts them in between, or
+/// an implementation that breaks its contract, must not materialize wrong
+/// bytes under a snapshot the caller believes is verified. `root_hash` cannot
+/// catch this: it covers the entry list, not chunk contents.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_corrupt_store_cannot_materialize_wrong_bytes() {
+    /// A store that hands back something other than what was put in.
+    struct LyingStore {
+        inner: MemoryStore,
+        corrupt: Hash,
+    }
+    impl ContentStore for LyingStore {
+        fn has(&self, hash: &Hash) -> bool {
+            self.inner.has(hash)
+        }
+        fn get(&self, hash: &Hash) -> Option<Vec<u8>> {
+            let bytes = self.inner.get(hash)?;
+            if *hash == self.corrupt {
+                // Same length, different content — so only a hash check finds it.
+                return Some(vec![0xFFu8; bytes.len()]);
+            }
+            Some(bytes)
+        }
+        fn put(&self, hash: &Hash, bytes: &[u8]) -> std::io::Result<()> {
+            self.inner.put(hash, bytes)
+        }
+        fn hashes(&self) -> std::io::Result<Vec<Hash>> {
+            self.inner.hashes()
+        }
+        fn remove(&self, hash: &Hash) -> std::io::Result<bool> {
+            self.inner.remove(hash)
+        }
+    }
+
+    let session = open_session().await;
+    let p = unique_prefix();
+    let store_prefix = format!("{p}/store");
+    let tree_prefix = format!("{p}/tree");
+
+    let src = tempfile::tempdir().unwrap();
+    let body = common::pseudo_random(40_000, 11);
+    std::fs::write(src.path().join("payload.bin"), &body).unwrap();
+    let server_store: Arc<dyn ContentStore> = Arc::new(MemoryStore::new());
+    let index = build_tree(src.path(), "rot", &small_cdc(), &*server_store).unwrap();
+    let victim = index.needed_chunks()[0];
+    let server = TreeServer::new(
+        session.clone(),
+        store_prefix.clone(),
+        tree_prefix.clone(),
+        server_store,
+    );
+    server.register(index.clone()).await;
+    let handle = server.spawn().await.unwrap();
+
+    let client = test_client(session.clone(), &store_prefix, &tree_prefix);
+    let dest = tempfile::tempdir().unwrap();
+    let lying: Arc<dyn ContentStore> = Arc::new(LyingStore {
+        inner: MemoryStore::new(),
+        corrupt: victim,
+    });
+    let err = client
+        .download_tree(
+            &DownloadRequest::pinned("rot", index.root_hash),
+            dest.path(),
+            &lying,
+            &(),
+            &CancelToken::new(),
+        )
+        .await
+        .expect_err("a corrupt store must not produce a 'verified' tree");
+    assert!(matches!(err, BlobError::CorruptStore { .. }), "{err}");
+
+    // Discriminating power: an honest store materializes the same snapshot.
+    let dest2 = tempfile::tempdir().unwrap();
+    let honest: Arc<dyn ContentStore> = Arc::new(MemoryStore::new());
+    client
+        .download_tree(
+            &DownloadRequest::pinned("rot", index.root_hash),
+            dest2.path(),
+            &honest,
+            &(),
+            &CancelToken::new(),
+        )
+        .await
+        .expect("an honest store must still work");
+    assert_eq!(
+        std::fs::read(dest2.path().join("payload.bin")).unwrap(),
+        body
+    );
+
+    handle.shutdown().await.unwrap();
+    session.close().await.unwrap();
+}
