@@ -75,13 +75,16 @@ mod resume;
 pub mod seed;
 mod server;
 mod store;
+mod store_client;
 mod tree;
 mod verify;
 pub mod wire;
 
 pub use cancel::CancelToken;
 pub use chunk::{CdcParams, DEFAULT_CHUNK_SIZE, MAX_CHUNK_SIZE, MIN_CHUNK_SIZE, TransferChunks};
-pub use client::{BlobClient, BlobClientBuilder, DownloadRequest, Overwrite, RetryPolicy};
+pub use client::{
+    BlobClient, BlobClientBuilder, BlobProbe, DownloadRequest, Overwrite, RetryPolicy, Staged,
+};
 pub use compress::ChunkCompression;
 #[cfg(feature = "encryption")]
 pub use crypt::StoreKey;
@@ -100,6 +103,7 @@ pub use server::{
     PushPolicy, ReadAtSize, ServerHandle, SourceFingerprint,
 };
 pub use store::{ContentStore, DirStore, MemoryStore};
+pub use store_client::{StoreClient, StoreClientBuilder};
 pub use tree::{
     ChunkRef, Entry, MaterializePolicy, TreeClient, TreeClientBuilder, TreeIndex, TreeServer,
     TreeServerBuilder, build_tree,
@@ -292,6 +296,34 @@ pub fn parse_id(prefix: &str, key_expr: &str) -> Option<String> {
     } else {
         Some(id.to_string())
     }
+}
+
+/// Decode a Tier-2 chunk container back to the chunk's raw bytes.
+///
+/// Chunk values on the wire and at rest are **self-describing containers** —
+/// a tag byte, then the content (raw, or a compressed frame). Content
+/// addressing is by the *uncompressed* bytes, so a receiver unframes first and
+/// then verifies the hash against the key it asked for.
+///
+/// [`StoreClient`] does this for you. This is here for a caller that already
+/// holds a container — one materialized from a router storage, say, or read
+/// back from its own cache — and needs to get the content out of it. Without
+/// it, such a caller cannot correctly decode a chunk it fetched by hand, which
+/// is a strange thing for a crate that defines the framing to withhold.
+///
+/// **This does not verify anything.** Hash the result against the address it
+/// came from; that check is what makes the tier trustworthy.
+pub fn unframe_chunk(container: &[u8]) -> Result<Vec<u8>> {
+    compress::unpack(container)
+}
+
+/// Frame raw chunk bytes into a Tier-2 container (the inverse of
+/// [`unframe_chunk`]).
+///
+/// Note that a holder may re-frame a chunk however it likes without changing
+/// the chunk's address — compression is not part of identity.
+pub fn frame_chunk(bytes: &[u8], compression: ChunkCompression) -> Result<Vec<u8>> {
+    compress::pack(bytes, compression)
 }
 
 /// Key of a content-addressed chunk (Tier 2): `<prefix>/<algo>/<hex>`. Immutable,

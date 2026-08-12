@@ -160,6 +160,46 @@ impl DownloadRequest {
     }
 }
 
+/// Where a staged download landed, from [`BlobClient::download_staged`].
+#[derive(Debug, Clone)]
+pub struct Staged {
+    /// The file, named by the blob's id inside the directory you gave.
+    pub path: PathBuf,
+    /// The server's advisory filename, reduced to a single safe component —
+    /// `None` if it offered none, or offered something unusable.
+    ///
+    /// A *suggestion*: nothing has been named this, and this crate will never
+    /// name anything this. Renaming to it is the caller's decision (and
+    /// usually the user's).
+    pub suggested: Option<String>,
+    /// Transfer statistics, as [`BlobClient::download_to`] returns.
+    pub stats: TransferStats,
+}
+
+/// What one origin said about a blob, from [`BlobClient::probe`].
+#[derive(Debug, Clone)]
+pub struct BlobProbe {
+    /// The prefix that answered — pass it to a [`BlobClient`] to fetch from
+    /// this holder specifically.
+    pub origin: QueryPrefix,
+    /// The manifest this holder serves: identity, size and geometry.
+    pub manifest: Manifest,
+    /// Which chunks it holds, if it answered the `have` endpoint.
+    pub availability: Option<Availability>,
+}
+
+/// Recover the origin prefix from a reply key of the form
+/// `<origin>/<id>/<endpoint>`.
+///
+/// The *server* built this key from its own concrete prefix, whatever
+/// wildcard the query went through — which is precisely why a probe can
+/// attribute its answers at all.
+fn origin_of(reply_key: &str, id: &str, endpoint: &str) -> Option<String> {
+    let rest = reply_key.strip_suffix(endpoint)?.strip_suffix('/')?;
+    let rest = rest.strip_suffix(id)?.strip_suffix('/')?;
+    (!rest.is_empty()).then(|| rest.to_string())
+}
+
 /// Downloads blobs served by a [`crate::BlobServer`] under the same key prefix.
 pub struct BlobClient {
     session: Arc<zenoh::Session>,
@@ -259,6 +299,104 @@ impl BlobClient {
         self.fetch_manifest_matching(id, None).await
     }
 
+    /// Ask every origin that answers what it knows about `id`.
+    ///
+    /// This is the sequence RFC 07 §2.5 prescribes for a consumer that cannot
+    /// name the origin holding a blob: ask for something *tiny* across
+    /// origins, then fetch from one chosen origin's concrete key. Both replies
+    /// here are small and bounded — a manifest, and a bitfield — so a
+    /// wildcard-origin probe is legitimate where a wildcard-origin *fetch*
+    /// would be one full copy per responder.
+    ///
+    /// Each result carries the `origin` that answered, as a prefix you can
+    /// hand straight to another [`BlobClient`]. That attribution is the whole
+    /// point of probing and was previously left for callers to reconstruct
+    /// from raw reply keys.
+    ///
+    /// Availability is `None` for a holder that answered `manifest` but not
+    /// `have`.
+    pub async fn probe(&self, id: &str) -> Result<Vec<BlobProbe>> {
+        validate_id(id)?;
+        let mut found: Vec<BlobProbe> = Vec::new();
+
+        let replies = self
+            .session
+            .get(manifest_key(self.prefix.as_str(), id))
+            .consolidation(ConsolidationMode::None)
+            .priority(self.cfg.priority)
+            .timeout(self.cfg.query_timeout)
+            .await
+            .map_err(BlobError::zenoh)?;
+        while let Ok(reply) = replies.recv_async().await {
+            if found.len() >= self.cfg.max_probe_replies {
+                break;
+            }
+            let Ok(sample) = reply.result() else { continue };
+            if sample.encoding().to_string() != ENC_MANIFEST {
+                continue;
+            }
+            // The reply key names the origin: it is the prefix the *server*
+            // built the key from, whatever wildcard we asked through.
+            let Some(origin) = origin_of(sample.key_expr().as_str(), id, "manifest") else {
+                continue;
+            };
+            let Ok(manifest) = decode::<Manifest>(&sample.payload().to_bytes()) else {
+                continue;
+            };
+            if manifest.validate(self.cfg.max_blob_size).is_err() || manifest.id != id {
+                continue;
+            }
+            let Ok(origin) = QueryPrefix::new(origin) else {
+                continue;
+            };
+            if found.iter().any(|p| p.origin == origin) {
+                continue; // one entry per origin, not per reply
+            }
+            found.push(BlobProbe {
+                origin,
+                manifest,
+                availability: None,
+            });
+        }
+        if found.is_empty() {
+            return Ok(found);
+        }
+
+        // Second question, same shape: which chunks does each holder have?
+        // A holder that does not answer keeps `None` rather than being
+        // dropped — `have` is optional, `manifest` is what makes it a holder.
+        let replies = self
+            .session
+            .get(availability_key(self.prefix.as_str(), id))
+            .consolidation(ConsolidationMode::None)
+            .priority(self.cfg.priority)
+            .timeout(self.cfg.query_timeout)
+            .await
+            .map_err(BlobError::zenoh)?;
+        while let Ok(reply) = replies.recv_async().await {
+            let Ok(sample) = reply.result() else { continue };
+            if sample.encoding().to_string() != ENC_AVAIL {
+                continue;
+            }
+            let Some(origin) = origin_of(sample.key_expr().as_str(), id, "have") else {
+                continue;
+            };
+            let Ok(avail) = decode::<Availability>(&sample.payload().to_bytes()) else {
+                continue;
+            };
+            let Some(entry) = found.iter_mut().find(|p| p.origin.as_str() == origin) else {
+                continue; // answered `have` but not `manifest`; nothing to attach to
+            };
+            if avail
+                .validate(entry.manifest.chunk_count().unwrap_or(u32::MAX))
+                .is_ok()
+            {
+                entry.availability = Some(avail);
+            }
+        }
+        Ok(found)
+    }
+
     /// Like [`fetch_manifest`](Self::fetch_manifest), but with multi-responder
     /// resilience: a malformed, invalid, mismatched-id, or (when pinned)
     /// wrong-root reply is *skipped*, not fatal — one hostile or stale
@@ -314,6 +452,52 @@ impl BlobClient {
             }
         }
         Err(rejected.unwrap_or_else(|| BlobError::NotFound(id.to_string())))
+    }
+
+    /// Download into `dir`, staged under the blob's id.
+    ///
+    /// [`download_to`](Self::download_to) is deliberately caller-chooses-the
+    /// -destination: the server's filename is advisory and this crate never
+    /// joins it to a path, which is the structural fix for v1's traversal
+    /// vector — applied at the API's shape rather than at the write site. That
+    /// stays true here and is not negotiable.
+    ///
+    /// What it left every caller to reinvent is the *convention* around it,
+    /// and both downstream GUIs reinvented the same one: stage under the id,
+    /// keep the suggested name aside, offer it in a save-as dialog later.
+    /// Staging under the **id** rather than the suggested name is the load
+    /// bearing part — two concurrent downloads whose servers both claim
+    /// `report.pcap` must not collide.
+    ///
+    /// Pairing the two in one call means the safe path is also the shortest
+    /// one, which is the only way a security property reliably survives
+    /// contact with application code.
+    pub async fn download_staged(
+        &self,
+        req: &DownloadRequest,
+        dir: &Path,
+        sink: &dyn ProgressSink,
+        cancel: &CancelToken,
+    ) -> Result<Staged> {
+        validate_id(&req.id)?;
+        tokio::fs::create_dir_all(dir).await?;
+        // `validate_id` has already refused separators, `..` and wildcards, so
+        // the id is a single safe component.
+        let path = dir.join(&req.id);
+        let stats = self.download_to(req, &path, sink, cancel).await?;
+        // Re-read rather than plumbing it out of the transfer: the manifest is
+        // cheap, and the alternative is threading a value through a function
+        // whose whole job is bytes.
+        let suggested = self
+            .fetch_manifest_matching(&req.id, req.expected_root)
+            .await
+            .ok()
+            .and_then(|m| m.suggested_filename());
+        Ok(Staged {
+            path,
+            suggested,
+            stats,
+        })
     }
 
     /// Download a blob to the file at `dest` (written via `<dest>.part` + a

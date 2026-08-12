@@ -73,6 +73,18 @@ impl Manifest {
         TransferChunks::new(self.chunk_size, self.total_len)
     }
 
+    /// How many transfer chunks this manifest describes.
+    ///
+    /// v2 removed a stored `chunk_count` deliberately: a second source of
+    /// truth is something a hostile peer can make disagree with the first, so
+    /// the count is *derived* from `total_len` and `chunk_size`. Deriving it
+    /// is right; making every consumer re-derive it is not — the expression
+    /// was being rewritten by hand in two separate downstream crates, against
+    /// geometry this crate defines.
+    pub fn chunk_count(&self) -> Result<u32> {
+        Ok(self.chunks()?.count())
+    }
+
     /// The advisory filename reduced to something safe to join: the last
     /// `Normal` path component, or `None` if there isn't one. Callers who want
     /// to honor the server's suggestion should use this, never `filename` raw.

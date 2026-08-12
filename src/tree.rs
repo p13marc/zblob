@@ -40,7 +40,7 @@ use zenoh::query::ConsolidationMode;
 use crate::cancel::CancelToken;
 use crate::chunk::CdcParams;
 use crate::client::DownloadRequest;
-use crate::compress::{ChunkCompression, pack, unpack};
+use crate::compress::{ChunkCompression, pack};
 use crate::error::{BlobError, Result};
 use crate::hash::Hash;
 use crate::manifest::validate_id;
@@ -1013,8 +1013,31 @@ impl TreeClient {
 
     /// Fetch and fully validate the snapshot index `id` (schema, paths,
     /// size↔chunk consistency, root recomputation).
+    ///
+    /// Validation proves the index is *internally* consistent — it says
+    /// nothing about *which* snapshot you got, so this is trust-on-first-use
+    /// unless the id happens to be a root. Prefer
+    /// [`fetch_index_by_root`](Self::fetch_index_by_root).
     pub async fn fetch_index(&self, id: &str) -> Result<TreeIndex> {
         self.fetch_index_matching(id, None).await
+    }
+
+    /// Fetch and fully validate the snapshot whose identity **is** `root`.
+    ///
+    /// Content-addressed by construction, so it cannot be
+    /// trust-on-first-use: the caller has already named the identity it
+    /// demands, and an index that recomputes to anything else is rejected like
+    /// any other unusable reply — one wrong-root responder cannot mask an
+    /// honest replica.
+    ///
+    /// This is the shape RFC 07 §2.3 prescribes for tier 2 and the natural
+    /// partner of [`TreeIndex::keyed_by_root`]. Note that it needs no
+    /// [`ContentStore`]: an explorer that wants to *inspect* a snapshot —
+    /// entry count, total size, chunk references — is not obliged to
+    /// materialize one.
+    pub async fn fetch_index_by_root(&self, root: &Hash) -> Result<TreeIndex> {
+        self.fetch_index_matching(&root.to_string(), Some(*root))
+            .await
     }
 
     /// Pin-aware fetch: when `expected_root` is set, replies with a different
@@ -1227,9 +1250,16 @@ impl TreeClient {
                 let priority = self.cfg.priority;
                 let store = store.clone();
                 join.spawn(async move {
-                    let (bytes, rejected) =
-                        fetch_one_chunk(&session, &key, &hash, chunk.len, timeout, priority)
-                            .await?;
+                    let (bytes, rejected) = crate::store_client::fetch_one_chunk(
+                        &session,
+                        &key,
+                        &hash,
+                        Some(chunk.len),
+                        crate::compress::MAX_UNPACKED,
+                        timeout,
+                        priority,
+                    )
+                    .await?;
                     let len = bytes.len() as u64;
                     let put_store = store.clone();
                     tokio::task::spawn_blocking(move || put_store.put(&hash, &bytes))
@@ -1269,53 +1299,6 @@ impl TreeClient {
         }
         Ok(stats)
     }
-}
-
-/// GET one content-addressed chunk and verify it by re-hashing — corruption
-/// and substitution are impossible past this point.
-async fn fetch_one_chunk(
-    session: &zenoh::Session,
-    key: &str,
-    hash: &Hash,
-    expected_len: u32,
-    timeout: Duration,
-    priority: Priority,
-) -> Result<(Vec<u8>, u32)> {
-    // A container is one tag byte plus the chunk (a compressed frame is
-    // smaller still), so anything longer than that cannot be the chunk we
-    // asked for. Checking the length *before* unframing means a hostile
-    // holder cannot pick our allocation size, which it otherwise could —
-    // multiplied by `fetch_concurrency`.
-    let max_frame = expected_len as usize + 1 + 4;
-    let mut rejected = 0u32;
-    let replies = session
-        .get(key)
-        .consolidation(ConsolidationMode::None)
-        .priority(priority)
-        .timeout(timeout)
-        .await
-        .map_err(BlobError::zenoh)?;
-    while let Ok(reply) = replies.recv_async().await {
-        let Ok(sample) = reply.result() else { continue };
-        if sample.encoding().to_string() != ENC_CHUNK {
-            continue;
-        }
-        let payload = sample.payload().to_bytes();
-        if payload.len() > max_frame {
-            rejected += 1;
-            continue; // over-long for the declared chunk; do not unframe it.
-        }
-        let Ok(bytes) = unpack(&payload) else {
-            rejected += 1;
-            continue; // malformed frame; wait for a good replier.
-        };
-        if bytes.len() as u32 != expected_len || Hash::of(&bytes) != *hash {
-            rejected += 1;
-            continue; // hostile or corrupt replier; wait for a good one.
-        }
-        return Ok((bytes, rejected));
-    }
-    Err(BlobError::NotFound(hash.to_string()))
 }
 
 /// Materialize `entries` under `dest_root`, defensively:
