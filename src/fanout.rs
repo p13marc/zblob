@@ -136,6 +136,7 @@ impl Default for FanoutConfig {
 const EARLY_SLICE_MAX_FRAMES: usize = 512;
 
 /// Keeps a fanout publication (and its replay cache) alive.
+#[derive(Debug)]
 pub struct FanoutHandle {
     stop: Arc<tokio::sync::Notify>,
     join: tokio::task::JoinHandle<Result<()>>,
@@ -154,7 +155,7 @@ impl FanoutHandle {
 /// returned handle is shut down. Returns the manifest — distribute
 /// `(id, root)` so receivers can pin.
 pub async fn fanout_file(
-    session: Arc<zenoh::Session>,
+    session: &zenoh::Session,
     prefix: &ServePrefix,
     spec: BlobSpec,
     path: impl Into<PathBuf>,
@@ -190,6 +191,7 @@ pub async fn fanout_file(
     let stop2 = stop.clone();
     let key = fanout_key(prefix.as_str(), &manifest.id);
     let task_manifest = manifest.clone();
+    let session = session.clone();
     let join = tokio::spawn(async move {
         let publisher = session
             .declare_publisher(key)
@@ -220,7 +222,7 @@ pub async fn fanout_file(
                 version: crate::wire::WIRE_VERSION,
                 frame: FanoutFrame::Manifest(task_manifest.clone()),
             })?)
-            .encoding(crate::wire::ENC_FANOUT)
+            .encoding(&crate::wire::ENC_FANOUT)
             .await
             .map_err(BlobError::zenoh)?;
 
@@ -242,7 +244,7 @@ pub async fn fanout_file(
                     version: crate::wire::WIRE_VERSION,
                     frame: FanoutFrame::Slice { index, bao: slice? },
                 })?)
-                .encoding(crate::wire::ENC_FANOUT)
+                .encoding(&crate::wire::ENC_FANOUT)
                 .await
                 .map_err(BlobError::zenoh)?;
         }
@@ -270,7 +272,7 @@ pub async fn fanout_file(
 /// makes that cheap).
 #[allow(clippy::too_many_arguments)] // transfer surface mirrors download_to
 pub async fn receive_fanout(
-    session: Arc<zenoh::Session>,
+    session: &zenoh::Session,
     prefix: &QueryPrefix,
     id: &str,
     expected_root: Option<Hash>,
@@ -346,7 +348,7 @@ pub async fn receive_fanout(
         // receive path in the crate. Relying on decode failure to reject a
         // foreign sample is the "opaque error deep in a transfer" failure mode
         // v2 removed everywhere else — and this was the one place it survived.
-        if sample.encoding().to_string() != crate::wire::ENC_FANOUT {
+        if !crate::wire::ENC_FANOUT.matches(sample.encoding()) {
             continue;
         }
         let Ok(msg) = crate::wire::decode::<FanoutMessage>(&sample.payload().to_bytes()) else {

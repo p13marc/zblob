@@ -3,7 +3,6 @@
 //! byte sources.
 #![allow(dead_code)] // each test binary uses a different subset of these.
 
-use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use zblob::Hash;
@@ -19,8 +18,8 @@ pub fn isolated_config() -> zenoh::Config {
     config
 }
 
-pub async fn open_session() -> Arc<zenoh::Session> {
-    Arc::new(zenoh::open(isolated_config()).await.expect("open zenoh"))
+pub async fn open_session() -> zenoh::Session {
+    zenoh::open(isolated_config()).await.expect("open zenoh")
 }
 
 pub fn unique_prefix() -> String {

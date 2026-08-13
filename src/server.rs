@@ -71,6 +71,7 @@ pub struct SourceFingerprint {
 }
 
 /// A [`BlobSource`] backed by a file on disk (e.g. a TTL'd report bundle).
+#[derive(Debug)]
 pub struct FileBlobSource {
     path: PathBuf,
 }
@@ -103,6 +104,7 @@ impl BlobSource for FileBlobSource {
 /// A [`BlobSource`] serving a shared in-memory buffer (generated artifacts,
 /// tests). The buffer is behind an `Arc`, so opening is free and concurrent
 /// transfers share one allocation.
+#[derive(Debug)]
 pub struct MemoryBlobSource(Arc<Vec<u8>>);
 
 impl MemoryBlobSource {
@@ -273,7 +275,7 @@ impl Default for ServerConfig {
 }
 
 struct Inner {
-    session: Arc<zenoh::Session>,
+    session: zenoh::Session,
     prefix: ServePrefix,
     registry: RwLock<HashMap<BlobId, Registered>>,
     inflight: Arc<Semaphore>,
@@ -313,16 +315,37 @@ pub struct BlobServer {
     inner: Arc<Inner>,
 }
 
+impl std::fmt::Debug for BlobServer {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("BlobServer")
+            .field("prefix", &self.inner.prefix)
+            .finish_non_exhaustive()
+    }
+}
+
 /// Builder for a [`BlobServer`] (see [`BlobServer::builder`]).
 pub struct BlobServerBuilder {
-    session: Arc<zenoh::Session>,
+    session: zenoh::Session,
     prefix: ServePrefix,
     cfg: ServerConfig,
+}
+
+impl std::fmt::Debug for BlobServerBuilder {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("BlobServerBuilder")
+            .field("prefix", &self.prefix)
+            .field("max_inflight", &self.cfg.max_inflight)
+            .field("max_chunks_per_query", &self.cfg.max_chunks_per_query)
+            .field("outboard_mem_limit", &self.cfg.outboard_mem_limit)
+            .field("push", &self.cfg.push)
+            .finish_non_exhaustive()
+    }
 }
 
 impl BlobServerBuilder {
     /// Max concurrent in-flight queries served at once (default 8). A coarse
     /// anti-DoS backstop; real authorization is the caller's job.
+    #[must_use]
     pub fn max_inflight(mut self, n: usize) -> Self {
         self.cfg.max_inflight = n.max(1);
         self
@@ -330,6 +353,7 @@ impl BlobServerBuilder {
 
     /// Max chunks one range query may request (default 512). Clients split
     /// larger hole sets across sequential queries.
+    #[must_use]
     pub fn max_chunks_per_query(mut self, n: u32) -> Self {
         self.cfg.max_chunks_per_query = n.max(1);
         self
@@ -338,6 +362,7 @@ impl BlobServerBuilder {
     /// Outboard size above which [`BlobServer::register_file`] keeps the
     /// outboard in a sibling `<path>.obao4` file instead of memory
     /// (default 16 MiB of outboard ≈ a 4 GiB blob).
+    #[must_use]
     pub fn outboard_mem_limit(mut self, bytes: u64) -> Self {
         self.cfg.outboard_mem_limit = bytes;
         self
@@ -345,6 +370,7 @@ impl BlobServerBuilder {
 
     /// Invoke `cb` with every serve error (default: a `tracing` warn event
     /// with the `tracing` feature, else stderr in debug builds only).
+    #[must_use]
     pub fn on_error(mut self, cb: ErrorCallback) -> Self {
         self.cfg.on_error = Some(cb);
         self
@@ -363,7 +389,7 @@ impl BlobServerBuilder {
     /// ```no_run
     /// # use std::sync::Arc;
     /// # use zblob::{BlobServer, PushConfig, PushPolicy, Manifest, ServePrefix};
-    /// # fn f(session: Arc<zenoh::Session>, prefix: ServePrefix, policy: Arc<dyn PushPolicy>) {
+    /// # fn f(session: zenoh::Session, prefix: ServePrefix, policy: Arc<dyn PushPolicy>) {
     /// let server = BlobServer::builder(session, prefix)
     ///     .accept_push(
     ///         PushConfig::new(policy, "/var/spool/zblob")
@@ -373,6 +399,7 @@ impl BlobServerBuilder {
     ///     .build();
     /// # }
     /// ```
+    #[must_use]
     pub fn accept_push(mut self, cfg: PushConfig) -> Self {
         self.cfg.push = Some(cfg);
         self
@@ -394,6 +421,7 @@ impl BlobServerBuilder {
 }
 
 /// Handle to a spawned server task: keeps it running, stops it on demand.
+#[derive(Debug)]
 pub struct ServerHandle {
     join: tokio::task::JoinHandle<Result<()>>,
     stop: Arc<Notify>,
@@ -414,16 +442,16 @@ impl ServerHandle {
 
 impl BlobServer {
     /// Start building a server for blobs under `key_prefix`.
-    pub fn builder(session: Arc<zenoh::Session>, key_prefix: ServePrefix) -> BlobServerBuilder {
+    pub fn builder(session: &zenoh::Session, key_prefix: ServePrefix) -> BlobServerBuilder {
         BlobServerBuilder {
-            session,
+            session: session.clone(),
             prefix: key_prefix,
             cfg: ServerConfig::default(),
         }
     }
 
     /// Build a server with default configuration (see [`BlobServer::builder`]).
-    pub fn new(session: Arc<zenoh::Session>, key_prefix: ServePrefix) -> Self {
+    pub fn new(session: &zenoh::Session, key_prefix: ServePrefix) -> Self {
         Self::builder(session, key_prefix).build()
     }
 
@@ -654,20 +682,20 @@ async fn serve_one(inner: &Inner, query: zenoh::query::Query) -> Result<()> {
     // Push protocol (upload): dispatched before the registry lookup — a blob
     // being pushed is not registered yet.
     if key_str.ends_with("/push/offer") {
-        return handle_push_offer(inner, query, &id).await;
+        return handle_push_offer(inner, query, id).await;
     }
     if let Some(idx) = key_str
         .rsplit_once("/push/slice/")
         .and_then(|(head, i)| head.ends_with(&id).then(|| i.parse::<u32>().ok()).flatten())
     {
-        return handle_push_slice(inner, query, &id, idx).await;
+        return handle_push_slice(inner, query, id, idx).await;
     }
 
     // Snapshot the registration (clone the cheap manifest + Arc the rest) so we
     // don't hold the registry lock across the stream.
     let (manifest, chunks, source, outboard, registered_fingerprint) = {
         let reg = inner.registry.read().await;
-        match reg.get(id.as_str()) {
+        match reg.get(id) {
             Some(r) => (
                 r.manifest.clone(),
                 r.chunks,
@@ -732,10 +760,10 @@ async fn serve_one(inner: &Inner, query: zenoh::query::Query) -> Result<()> {
         let avail = Availability::full(chunks.count());
         query
             .reply(
-                crate::availability_key(inner.prefix.as_str(), &id),
+                crate::availability_key(inner.prefix.as_str(), id),
                 encode(&avail)?,
             )
-            .encoding(ENC_AVAIL)
+            .encoding(&ENC_AVAIL)
             .await
             .map_err(BlobError::zenoh)?;
         return Ok(());
@@ -745,8 +773,8 @@ async fn serve_one(inner: &Inner, query: zenoh::query::Query) -> Result<()> {
     if key_str.ends_with("/manifest") {
         let payload = encode(&manifest)?;
         query
-            .reply(manifest_key(inner.prefix.as_str(), &id), payload)
-            .encoding(ENC_MANIFEST)
+            .reply(manifest_key(inner.prefix.as_str(), id), payload)
+            .encoding(&ENC_MANIFEST)
             .await
             .map_err(BlobError::zenoh)?;
         return Ok(());
@@ -789,8 +817,8 @@ async fn serve_one(inner: &Inner, query: zenoh::query::Query) -> Result<()> {
             // A reply error means the client dropped the GET (query finalized):
             // stop promptly instead of streaming the rest into the void.
             if query
-                .reply(slice_key(inner.prefix.as_str(), &id, index), slice)
-                .encoding(ENC_SLICE)
+                .reply(slice_key(inner.prefix.as_str(), id, index), slice)
+                .encoding(&ENC_SLICE)
                 .await
                 .is_err()
             {
@@ -877,7 +905,7 @@ async fn push_offer_inner(inner: &Inner, query: &zenoh::query::Query, key_id: &s
                 let ack = crate::wire::encode(&Vec::<(u32, u32)>::new())?;
                 query
                     .reply(query.key_expr().clone(), ack)
-                    .encoding(ENC_PUSH)
+                    .encoding(&ENC_PUSH)
                     .await
                     .map_err(BlobError::zenoh)?;
                 return Ok(());
@@ -932,7 +960,7 @@ async fn push_offer_inner(inner: &Inner, query: &zenoh::query::Query, key_id: &s
                 }
                 query
                     .reply(query.key_expr().clone(), ack)
-                    .encoding(ENC_PUSH)
+                    .encoding(&ENC_PUSH)
                     .await
                     .map_err(BlobError::zenoh)?;
                 return Ok(());
@@ -1003,7 +1031,7 @@ async fn push_offer_inner(inner: &Inner, query: &zenoh::query::Query, key_id: &s
     }
     query
         .reply(query.key_expr().clone(), ack)
-        .encoding(ENC_PUSH)
+        .encoding(&ENC_PUSH)
         .await
         .map_err(BlobError::zenoh)?;
     Ok(())
@@ -1068,7 +1096,7 @@ async fn push_slice_inner(
                 let ack = crate::wire::encode(&0u32)?;
                 query
                     .reply(query.key_expr().clone(), ack)
-                    .encoding(ENC_PUSH)
+                    .encoding(&ENC_PUSH)
                     .await
                     .map_err(BlobError::zenoh)?;
                 return Ok(());
@@ -1138,7 +1166,7 @@ async fn push_slice_inner(
             let ack = crate::wire::encode(&0u32)?;
             query
                 .reply(query.key_expr().clone(), ack)
-                .encoding(ENC_PUSH)
+                .encoding(&ENC_PUSH)
                 .await
                 .map_err(BlobError::zenoh)?;
             return Ok(());
@@ -1164,7 +1192,7 @@ async fn push_slice_inner(
     }
     query
         .reply(query.key_expr().clone(), ack)
-        .encoding(ENC_PUSH)
+        .encoding(&ENC_PUSH)
         .await
         .map_err(BlobError::zenoh)?;
     Ok(())

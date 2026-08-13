@@ -138,7 +138,7 @@ impl<T: ContentStore + ?Sized> ContentStore for std::sync::Arc<T> {
 }
 
 /// An in-memory [`ContentStore`] (tests, ephemeral caches).
-#[derive(Default)]
+#[derive(Default, Debug)]
 pub struct MemoryStore(Mutex<HashMap<Hash, Vec<u8>>>);
 
 impl MemoryStore {
@@ -205,6 +205,7 @@ impl ContentStore for MemoryStore {
 /// temp file → fsync → rename → dir fsync), and optional verify-on-read.
 ///
 /// Survives process restart, so it's the natural resume/dedup backing.
+#[derive(Debug)]
 pub struct DirStore {
     root: PathBuf,
     verify_on_read: bool,
@@ -233,6 +234,7 @@ impl DirStore {
     /// side by side; a sealed chunk read without the key reports missing —
     /// never deleted, never garbage.
     #[cfg(feature = "encryption")]
+    #[must_use]
     pub fn with_encryption(mut self, key: crate::crypt::StoreKey) -> Self {
         self.encryption = Some(key);
         self
@@ -241,6 +243,7 @@ impl DirStore {
     /// Compress chunks at rest (see [`ChunkCompression`]; requires the `zstd`
     /// feature for [`ChunkCompression::Zstd`]). Reading understands both
     /// compressed and raw frames regardless of this setting.
+    #[must_use]
     pub fn with_compression(mut self, compression: ChunkCompression) -> Self {
         self.compression = compression;
         self
@@ -250,6 +253,7 @@ impl DirStore {
     /// deleted and reported missing, so the caller re-fetches instead of
     /// silently materializing garbage (local disk corruption is otherwise
     /// invisible — `root_hash` covers the entry list, not chunk contents).
+    #[must_use]
     pub fn with_verify_on_read(mut self, verify: bool) -> Self {
         self.verify_on_read = verify;
         self

@@ -55,7 +55,7 @@ async fn a_snapshot_costs_one_query_per_round_not_one_per_chunk() {
     assert!(chunks >= 40, "fixture should be many chunks, got {chunks}");
 
     let server = TreeServer::new(
-        session.clone(),
+        &session,
         common::serve(store_prefix.clone()),
         common::serve(tree_prefix.clone()),
         server_store,
@@ -65,7 +65,7 @@ async fn a_snapshot_costs_one_query_per_round_not_one_per_chunk() {
 
     let batch = 16usize;
     let client = TreeClient::builder(
-        session.clone(),
+        &session,
         common::query(store_prefix.clone()),
         common::query(tree_prefix.clone()),
     )
@@ -102,7 +102,7 @@ async fn a_snapshot_costs_one_query_per_round_not_one_per_chunk() {
     // per chunk. Without this, the assertion above would also pass if the
     // counter were simply broken.
     let unbatched = TreeClient::builder(
-        session.clone(),
+        &session,
         common::query(store_prefix),
         common::query(tree_prefix),
     )
@@ -155,7 +155,7 @@ async fn a_partial_holder_shortens_the_round_instead_of_failing_it() {
             }
         }
         let srv = TreeServer::new(
-            session.clone(),
+            &session,
             common::serve(store_prefix.clone()),
             // Only one of them serves the index, so the other is purely a
             // partial chunk holder.
@@ -169,7 +169,7 @@ async fn a_partial_holder_shortens_the_round_instead_of_failing_it() {
     }
 
     let client = TreeClient::builder(
-        session.clone(),
+        &session,
         common::query(store_prefix),
         common::query(format!("{tree_prefix}/h0")),
     )
@@ -226,7 +226,7 @@ async fn a_tier2_probe_answers_possession_without_shipping_anything() {
     ] {
         handles.push(
             TreeServer::new(
-                session.clone(),
+                &session,
                 common::serve(format!("{base}/{host}/store")),
                 common::serve(format!("{base}/{host}/tree")),
                 store,
@@ -238,7 +238,7 @@ async fn a_tier2_probe_answers_possession_without_shipping_anything() {
     }
 
     // One wildcard-origin probe: legitimate here, because the reply is bits.
-    let prober = StoreClient::builder(session.clone(), common::query(format!("{base}/*/store")))
+    let prober = StoreClient::builder(&session, common::query(format!("{base}/*/store")))
         .query_timeout(Duration::from_secs(5))
         .build();
     let holders = prober.probe(&all).await.expect("probe");
@@ -255,7 +255,7 @@ async fn a_tier2_probe_answers_possession_without_shipping_anything() {
     assert_eq!(a.held.len(), all.len() / 2, "host-a reports its half");
     assert!(b.held.is_empty(), "host-b holds nothing and says so");
     // What it reports is true: every address it claimed is actually fetchable.
-    let from_a = StoreClient::builder(session.clone(), a.origin.clone())
+    let from_a = StoreClient::builder(&session, a.origin.clone())
         .query_timeout(Duration::from_secs(5))
         .build();
     for h in &a.held {
@@ -297,7 +297,7 @@ async fn a_snapshot_probe_reports_partial_possession() {
     let mut handles = Vec::new();
     for (host, store) in [("host-a", full.clone()), ("host-b", partial)] {
         let srv = TreeServer::new(
-            session.clone(),
+            &session,
             common::serve(format!("{base}/{host}/store")),
             common::serve(format!("{base}/{host}/tree")),
             store,
@@ -307,7 +307,7 @@ async fn a_snapshot_probe_reports_partial_possession() {
     }
 
     let prober = TreeClient::builder(
-        session.clone(),
+        &session,
         common::query(format!("{base}/*/store")),
         common::query(format!("{base}/*/tree")),
     )
@@ -334,7 +334,7 @@ async fn a_snapshot_probe_reports_partial_possession() {
     let dest = tempfile::tempdir().unwrap();
     let store: Arc<dyn ContentStore> = Arc::new(MemoryStore::new());
     TreeClient::builder(
-        session.clone(),
+        &session,
         common::query(complete.0.as_str().replace("/tree", "/store")),
         complete.0.clone(),
     )
@@ -397,7 +397,7 @@ async fn a_large_index_is_sharded_and_a_small_one_is_not() {
         let chunks_before = server_store.hashes().unwrap().len();
 
         let server = TreeServer::builder(
-            session.clone(),
+            &session,
             common::serve(store_prefix.clone()),
             common::serve(tree_prefix.clone()),
             server_store.clone(),
@@ -420,7 +420,7 @@ async fn a_large_index_is_sharded_and_a_small_one_is_not() {
         // Either way the client gets the same validated index back, and the
         // same tree on disk.
         let client = TreeClient::builder(
-            session.clone(),
+            &session,
             common::query(store_prefix),
             common::query(tree_prefix),
         )

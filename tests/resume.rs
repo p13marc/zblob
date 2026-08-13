@@ -15,7 +15,7 @@ use zblob::{
     wire::{ENC_MANIFEST, ENC_SLICE, encode},
 };
 
-fn test_client(session: Arc<zenoh::Session>, prefix: &str) -> BlobClient {
+fn test_client(session: &zenoh::Session, prefix: &str) -> BlobClient {
     BlobClient::builder(session, common::query(prefix))
         .query_timeout(Duration::from_secs(5))
         .retry(RetryPolicy {
@@ -49,7 +49,7 @@ async fn interrupt_then_resume_across_clients() {
     let dest = dir.path().join("data.bin");
 
     let data = pseudo_random(MIN_CHUNK_SIZE as usize * 8, 0x1234);
-    let server = BlobServer::new(session.clone(), common::serve(prefix.clone()));
+    let server = BlobServer::new(&session, common::serve(prefix.clone()));
     server
         .register_source(
             BlobSpec::new("blob-r").chunk_size(MIN_CHUNK_SIZE),
@@ -60,7 +60,7 @@ async fn interrupt_then_resume_across_clients() {
     let handle = server.spawn().await.unwrap();
 
     // Round 1: cancel after 3 chunks → Cancelled, partial + sidecar persisted.
-    let client = test_client(session.clone(), &prefix);
+    let client = test_client(&session, &prefix);
     let token = CancelToken::new();
     let sink = CancelAt {
         token: token.clone(),
@@ -79,7 +79,7 @@ async fn interrupt_then_resume_across_clients() {
     let events: Arc<Mutex<Vec<Progress>>> = Arc::new(Mutex::new(Vec::new()));
     let ev = events.clone();
     let sink = move |p: Progress| ev.lock().unwrap().push(p);
-    let client2 = test_client(session.clone(), &prefix);
+    let client2 = test_client(&session, &prefix);
     let stats = tokio::time::timeout(
         Duration::from_secs(20),
         client2.download_to(
@@ -150,7 +150,7 @@ async fn middle_hole_is_refetched_as_a_range() {
     let pinned_root = manifest.root;
     let params_log: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
     let plog = params_log.clone();
-    let (srv_session, srv_prefix, srv_data) = (session.clone(), prefix.clone(), data.clone());
+    let (srv_session, srv_prefix, srv_data) = (&session, prefix.clone(), data.clone());
     // Declare before spawning so the client can query immediately.
     let q = srv_session
         .declare_queryable(format!("{srv_prefix}/**"))
@@ -166,7 +166,7 @@ async fn middle_hole_is_refetched_as_a_range() {
                         manifest_key(&srv_prefix, "holey"),
                         encode(&manifest).unwrap(),
                     )
-                    .encoding(ENC_MANIFEST)
+                    .encoding(&ENC_MANIFEST)
                     .await;
                 continue;
             }
@@ -182,14 +182,14 @@ async fn middle_hole_is_refetched_as_a_range() {
                     let payload = common::bao::slice(&srv_data, &ob, chunk, index);
                     let _ = query
                         .reply(slice_key(&srv_prefix, "holey", index), payload)
-                        .encoding(ENC_SLICE)
+                        .encoding(&ENC_SLICE)
                         .await;
                 }
             }
         }
     });
 
-    let client = test_client(session.clone(), &prefix);
+    let client = test_client(&session, &prefix);
     tokio::time::timeout(
         Duration::from_secs(20),
         client.download_to(

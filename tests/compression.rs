@@ -42,7 +42,7 @@ async fn compressed_wire_and_store_roundtrip() {
     let expected_root = index.root_hash;
 
     let server = TreeServer::builder(
-        session.clone(),
+        &session,
         common::serve(store_prefix.clone()),
         common::serve(tree_prefix.clone()),
         server_store,
@@ -62,7 +62,7 @@ async fn compressed_wire_and_store_roundtrip() {
     );
     let dest = tempfile::tempdir().unwrap();
     let client = TreeClient::builder(
-        session.clone(),
+        &session,
         common::query(store_prefix),
         common::query(tree_prefix),
     )

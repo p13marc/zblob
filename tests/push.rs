@@ -22,7 +22,7 @@ impl PushPolicy for TokenPolicy {
     }
 }
 
-fn test_client(session: Arc<zenoh::Session>, prefix: &str) -> BlobClient {
+fn test_client(session: &zenoh::Session, prefix: &str) -> BlobClient {
     BlobClient::builder(session, common::query(prefix))
         .query_timeout(Duration::from_secs(5))
         .retry(RetryPolicy {
@@ -40,7 +40,7 @@ async fn authorized_push_lands_and_serves() {
     let prefix = unique_prefix();
     let spool = tempfile::tempdir().unwrap();
 
-    let server = BlobServer::builder(session.clone(), common::serve(prefix.clone()))
+    let server = BlobServer::builder(&session, common::serve(prefix.clone()))
         .accept_push(PushConfig::new(Arc::new(TokenPolicy), spool.path()))
         .build();
     let handle = server.spawn().await.unwrap();
@@ -51,7 +51,7 @@ async fn authorized_push_lands_and_serves() {
     let src_path = src.path().join("up.bin");
     std::fs::write(&src_path, &data).unwrap();
 
-    let client = test_client(session.clone(), &prefix);
+    let client = test_client(&session, &prefix);
     let manifest = tokio::time::timeout(
         Duration::from_secs(20),
         client.upload_file(
@@ -91,7 +91,7 @@ async fn unauthorized_or_unconfigured_push_denied() {
     let prefix = unique_prefix();
     let spool = tempfile::tempdir().unwrap();
 
-    let server = BlobServer::builder(session.clone(), common::serve(prefix.clone()))
+    let server = BlobServer::builder(&session, common::serve(prefix.clone()))
         .accept_push(PushConfig::new(Arc::new(TokenPolicy), spool.path()))
         .build();
     let handle = server.spawn().await.unwrap();
@@ -101,7 +101,7 @@ async fn unauthorized_or_unconfigured_push_denied() {
     let src_path = src.path().join("up.bin");
     std::fs::write(&src_path, &data).unwrap();
 
-    let client = test_client(session.clone(), &prefix);
+    let client = test_client(&session, &prefix);
     // Wrong token → denied by policy.
     let err = client
         .upload_file(
@@ -121,9 +121,9 @@ async fn unauthorized_or_unconfigured_push_denied() {
 
     // A server without accept_push refuses outright.
     let plain_prefix = unique_prefix();
-    let plain = BlobServer::new(session.clone(), common::serve(plain_prefix.clone()));
+    let plain = BlobServer::new(&session, common::serve(plain_prefix.clone()));
     let plain_handle = plain.spawn().await.unwrap();
-    let client2 = test_client(session.clone(), &plain_prefix);
+    let client2 = test_client(&session, &plain_prefix);
     let err = client2
         .upload_file(
             BlobSpec::new("x").chunk_size(MIN_CHUNK_SIZE),
@@ -148,7 +148,7 @@ async fn interrupted_upload_resumes_from_spool() {
     let prefix = unique_prefix();
     let spool = tempfile::tempdir().unwrap();
 
-    let server = BlobServer::builder(session.clone(), common::serve(prefix.clone()))
+    let server = BlobServer::builder(&session, common::serve(prefix.clone()))
         .accept_push(PushConfig::new(Arc::new(TokenPolicy), spool.path()))
         .build();
     let handle = server.spawn().await.unwrap();
@@ -172,7 +172,7 @@ async fn interrupted_upload_resumes_from_spool() {
         }
     }
 
-    let client = test_client(session.clone(), &prefix);
+    let client = test_client(&session, &prefix);
     let token = CancelToken::new();
     let sink = CancelAt {
         token: token.clone(),
@@ -247,7 +247,7 @@ async fn empty_blob_push_finalizes_at_offer() {
     let prefix = unique_prefix();
     let spool = tempfile::tempdir().unwrap();
 
-    let server = BlobServer::builder(session.clone(), common::serve(prefix.clone()))
+    let server = BlobServer::builder(&session, common::serve(prefix.clone()))
         .accept_push(PushConfig::new(Arc::new(TokenPolicy), spool.path()))
         .build();
     let handle = server.spawn().await.unwrap();
@@ -256,7 +256,7 @@ async fn empty_blob_push_finalizes_at_offer() {
     let src_path = src.path().join("empty.bin");
     std::fs::write(&src_path, b"").unwrap();
 
-    let client = test_client(session.clone(), &prefix);
+    let client = test_client(&session, &prefix);
     let manifest = client
         .upload_file(
             BlobSpec::new("void"),
@@ -296,7 +296,7 @@ async fn push_cannot_hijack_registered_blob() {
     let spool = tempfile::tempdir().unwrap();
 
     let original = pseudo_random(MIN_CHUNK_SIZE as usize * 2, 71);
-    let server = BlobServer::builder(session.clone(), common::serve(prefix.clone()))
+    let server = BlobServer::builder(&session, common::serve(prefix.clone()))
         .accept_push(PushConfig::new(Arc::new(TokenPolicy), spool.path()))
         .build();
     let registered = server
@@ -314,7 +314,7 @@ async fn push_cannot_hijack_registered_blob() {
     let evil_path = src.path().join("evil.bin");
     std::fs::write(&evil_path, &evil).unwrap();
 
-    let client = test_client(session.clone(), &prefix);
+    let client = test_client(&session, &prefix);
     let err = client
         .upload_file(
             BlobSpec::new("victim").chunk_size(MIN_CHUNK_SIZE),
@@ -380,7 +380,7 @@ async fn hostile_offer_reply_is_rejected_cleanly() {
                     query.key_expr().clone(),
                     zblob::wire::encode(&garbage).unwrap(),
                 )
-                .encoding(zblob::wire::ENC_PUSH)
+                .encoding(&zblob::wire::ENC_PUSH)
                 .await;
         }
     });
@@ -390,7 +390,7 @@ async fn hostile_offer_reply_is_rejected_cleanly() {
     let src_path = src.path().join("up.bin");
     std::fs::write(&src_path, &data).unwrap();
 
-    let client = test_client(session.clone(), &prefix);
+    let client = test_client(&session, &prefix);
     let err = client
         .upload_file(
             BlobSpec::new("garbage").chunk_size(MIN_CHUNK_SIZE),
@@ -415,7 +415,7 @@ async fn concurrent_push_cap_enforced() {
     let prefix = unique_prefix();
     let spool = tempfile::tempdir().unwrap();
 
-    let server = BlobServer::builder(session.clone(), common::serve(prefix.clone()))
+    let server = BlobServer::builder(&session, common::serve(prefix.clone()))
         .accept_push(PushConfig::new(Arc::new(TokenPolicy), spool.path()).max_concurrent(1))
         .build();
     let handle = server.spawn().await.unwrap();
@@ -425,7 +425,7 @@ async fn concurrent_push_cap_enforced() {
     let a = src.path().join("a.bin");
     std::fs::write(&a, &data).unwrap();
 
-    let client = test_client(session.clone(), &prefix);
+    let client = test_client(&session, &prefix);
 
     // Occupy the single slot: cancel after the first slice so the push stays
     // in progress server-side.
@@ -503,14 +503,14 @@ async fn a_refusing_co_server_cannot_deny_an_accepting_one() {
     let spool = tempfile::tempdir().unwrap();
 
     // One server accepts pushes…
-    let accepting = BlobServer::builder(session.clone(), common::serve(prefix.clone()))
+    let accepting = BlobServer::builder(&session, common::serve(prefix.clone()))
         .accept_push(PushConfig::new(Arc::new(OpenPolicy), spool.path()))
         .build()
         .spawn()
         .await
         .unwrap();
     // …and one on the same prefix has push switched off entirely.
-    let refusing = BlobServer::new(session.clone(), common::serve(prefix.clone()))
+    let refusing = BlobServer::new(&session, common::serve(prefix.clone()))
         .spawn()
         .await
         .unwrap();
@@ -520,7 +520,7 @@ async fn a_refusing_co_server_cannot_deny_an_accepting_one() {
     let src_path = src.path().join("shared.bin");
     std::fs::write(&src_path, &data).unwrap();
 
-    let client = test_client(session.clone(), &prefix);
+    let client = test_client(&session, &prefix);
     let manifest = tokio::time::timeout(
         Duration::from_secs(20),
         client.upload_file(
@@ -566,7 +566,7 @@ async fn upload_refuses_a_wildcard_prefix() {
 
     let base = unique_prefix();
     let wildcard = format!("{base}/*/blob");
-    let err = test_client(session.clone(), &wildcard)
+    let err = test_client(&session, &wildcard)
         .upload_file(
             BlobSpec::new("nope").chunk_size(MIN_CHUNK_SIZE),
             &src_path,
@@ -582,7 +582,7 @@ async fn upload_refuses_a_wildcard_prefix() {
     // prefix validation (it then fails because nothing is serving, which is a
     // different error).
     let concrete = format!("{base}/one/blob");
-    let err2 = test_client(session.clone(), &concrete)
+    let err2 = test_client(&session, &concrete)
         .upload_file(
             BlobSpec::new("nope").chunk_size(MIN_CHUNK_SIZE),
             &src_path,

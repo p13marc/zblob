@@ -94,7 +94,7 @@ fn mutate(payload: Vec<u8>, m: Mutation) -> Vec<u8> {
     }
 }
 
-fn test_client(session: Arc<zenoh::Session>, prefix: &str) -> BlobClient {
+fn test_client(session: &zenoh::Session, prefix: &str) -> BlobClient {
     BlobClient::builder(session, common::query(prefix))
         .query_timeout(Duration::from_millis(700))
         .retry(RetryPolicy {
@@ -144,7 +144,7 @@ async fn slice_reply_mutations_never_yield_wrong_bytes() {
                             manifest_key(&srv_prefix, "hostile"),
                             wire::encode(&manifest).unwrap(),
                         )
-                        .encoding(ENC_MANIFEST)
+                        .encoding(&ENC_MANIFEST)
                         .await;
                     continue;
                 }
@@ -166,14 +166,14 @@ async fn slice_reply_mutations_never_yield_wrong_bytes() {
                             index
                         };
                         let enc = if mutation == Mutation::WrongEncoding {
-                            "application/octet-stream"
+                            zenoh::bytes::Encoding::from("application/octet-stream")
                         } else {
-                            ENC_SLICE
+                            zenoh::bytes::Encoding::from(&ENC_SLICE)
                         };
                         let key = slice_key(&srv_prefix, "hostile", reply_index);
                         let _ = query
                             .reply(key.clone(), payload.clone())
-                            .encoding(enc)
+                            .encoding(enc.clone())
                             .await;
                         if mutation == Mutation::Duplicate {
                             let _ = query.reply(key, payload).encoding(enc).await;
@@ -185,7 +185,7 @@ async fn slice_reply_mutations_never_yield_wrong_bytes() {
 
         let dir = tempfile::tempdir().unwrap();
         let dest = dir.path().join("out.bin");
-        let client = test_client(session.clone(), &prefix);
+        let client = test_client(&session, &prefix);
         let outcome = tokio::time::timeout(
             Duration::from_secs(15),
             client.download_to(
@@ -375,7 +375,7 @@ async fn manifest_reply_mutations_are_survivable() {
                         manifest_key(&srv_prefix, "m"),
                         wire::encode(&manifest).unwrap(),
                     )
-                    .encoding(ENC_MANIFEST)
+                    .encoding(&ENC_MANIFEST)
                     .await;
             }
         });
@@ -384,7 +384,7 @@ async fn manifest_reply_mutations_are_survivable() {
         let dest_dir = outer.path().join("dest");
         std::fs::create_dir(&dest_dir).unwrap();
         let dest = dest_dir.join("out.bin");
-        let client = test_client(session.clone(), &prefix);
+        let client = test_client(&session, &prefix);
         let outcome = tokio::time::timeout(
             Duration::from_secs(10),
             client.download_to(
@@ -426,7 +426,7 @@ async fn a_hostile_responder_cannot_deny_an_honest_one() {
         let data = pseudo_random(MIN_CHUNK_SIZE as usize * 2, 93);
 
         // Honest server.
-        let server = zblob::BlobServer::new(session.clone(), common::serve(prefix.clone()));
+        let server = zblob::BlobServer::new(&session, common::serve(prefix.clone()));
         let manifest = server
             .register_source(
                 zblob::BlobSpec::new("contested").chunk_size(MIN_CHUNK_SIZE),
@@ -477,14 +477,14 @@ async fn a_hostile_responder_cannot_deny_an_honest_one() {
                 counter.fetch_add(1, Ordering::SeqCst);
                 let _ = query
                     .reply(manifest_key(&srv_prefix, "contested"), payload)
-                    .encoding(ENC_MANIFEST)
+                    .encoding(&ENC_MANIFEST)
                     .await;
             }
         });
 
         let dir = tempfile::tempdir().unwrap();
         let dest = dir.path().join("out.bin");
-        let client = test_client(session.clone(), &prefix);
+        let client = test_client(&session, &prefix);
         let outcome = tokio::time::timeout(
             Duration::from_secs(15),
             client.download_to(
@@ -548,12 +548,12 @@ async fn hostile_push_offer_replies_are_survivable() {
             while let Ok(query) = q.recv_async().await {
                 let _ = query
                     .reply(query.key_expr().clone(), payload.clone())
-                    .encoding(wire::ENC_PUSH)
+                    .encoding(&wire::ENC_PUSH)
                     .await;
             }
         });
 
-        let client = test_client(session.clone(), &prefix);
+        let client = test_client(&session, &prefix);
         let outcome = tokio::time::timeout(
             Duration::from_secs(15),
             client.upload_file(

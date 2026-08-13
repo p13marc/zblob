@@ -19,32 +19,100 @@ use crate::hash::Hash;
 /// every control struct; any shape change bumps it.
 pub const WIRE_VERSION: u16 = 3;
 
-/// Zenoh [`Encoding`](zenoh::bytes::Encoding) tag of a manifest reply.
-pub const ENC_MANIFEST: &str = "zblob/manifest;v=3";
-/// Encoding tag of a bao slice reply (BlockSize 4 = 16 KiB groups).
-pub const ENC_SLICE: &str = "zblob/bao4;v=3";
-/// Encoding tag of a Tier-2 tree index reply.
-pub const ENC_INDEX: &str = "zblob/index;v=3";
-/// Encoding tag of a Tier-2 *index descriptor* reply (a large index, served
-/// as content-addressed chunks — see [`IndexDescriptor`]).
-pub const ENC_INDEX_DESC: &str = "zblob/indexdesc;v=3";
-/// Encoding tag of a Tier-2 content-addressed chunk reply.
+/// One of the crate's Zenoh [`Encoding`](zenoh::bytes::Encoding) tags.
 ///
-/// Versioned as of v3. It was the one tag that carried no version, on the
-/// reasoning that a chunk container is self-describing — which is true of the
-/// *container* and says nothing about the surrounding protocol. A tag whose
-/// job is "diagnosable instead of garbage" should not have an exception.
-pub const ENC_CHUNK: &str = "zblob/chunk;v=3";
-/// Encoding tag of push-protocol acknowledgement replies.
-pub const ENC_PUSH: &str = "zblob/push;v=3";
-/// Encoding tag of availability (`…/have`) replies.
-pub const ENC_AVAIL: &str = "zblob/have;v=3";
-/// Encoding tag of tier-2 probe replies ([`HaveBits`]).
-pub const ENC_HAVEBITS: &str = "zblob/havebits;v=3";
-/// Encoding tag of tier-2 snapshot probe replies ([`TreeProbe`]).
-pub const ENC_TREEPROBE: &str = "zblob/treeprobe;v=3";
-/// Encoding tag of `fanout` tier samples (feature-gated).
-pub const ENC_FANOUT: &str = "zblob/fanout;v=3";
+/// Every receive path filters on the tag *before* decoding, which used to be
+/// written `!ENC_SLICE.matches(sample.encoding())` — a `String`
+/// allocation per reply (per *chunk*, on the slice path), and a comparison
+/// between two values the type system could not relate, so a typo silently
+/// rejected everything or accepted anything.
+///
+/// A `WireTag` holds both forms: the text, and the parsed `Encoding` built
+/// once on first use. Comparison is then an id and a byte-slice compare.
+pub struct WireTag {
+    text: &'static str,
+    encoding: std::sync::LazyLock<zenoh::bytes::Encoding, fn() -> zenoh::bytes::Encoding>,
+}
+
+impl WireTag {
+    /// The tag's wire text (`"zblob/manifest;v=3"`).
+    #[must_use]
+    pub const fn as_str(&self) -> &'static str {
+        self.text
+    }
+
+    /// The tag as a Zenoh [`Encoding`](zenoh::bytes::Encoding), built once.
+    #[must_use]
+    pub fn encoding(&'static self) -> &'static zenoh::bytes::Encoding {
+        &self.encoding
+    }
+
+    /// Whether `encoding` is this tag. Allocation-free.
+    #[must_use]
+    pub fn matches(&'static self, encoding: &zenoh::bytes::Encoding) -> bool {
+        encoding == self.encoding()
+    }
+}
+
+impl std::fmt::Debug for WireTag {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_tuple("WireTag").field(&self.text).finish()
+    }
+}
+
+impl std::fmt::Display for WireTag {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.text)
+    }
+}
+
+impl From<&'static WireTag> for zenoh::bytes::Encoding {
+    fn from(t: &'static WireTag) -> Self {
+        t.encoding().clone()
+    }
+}
+
+macro_rules! wire_tags {
+    ($($(#[$m:meta])* $name:ident = $text:literal;)*) => {
+        $(
+            $(#[$m])*
+            pub static $name: WireTag = WireTag {
+                text: $text,
+                encoding: std::sync::LazyLock::new(|| zenoh::bytes::Encoding::from($text)),
+            };
+        )*
+    };
+}
+
+wire_tags! {
+    /// Tag of a manifest reply.
+    ENC_MANIFEST = "zblob/manifest;v=3";
+    /// Tag of a bao slice reply (BlockSize 4 = 16 KiB groups).
+    ENC_SLICE = "zblob/bao4;v=3";
+    /// Tag of a Tier-2 tree index reply.
+    ENC_INDEX = "zblob/index;v=3";
+    /// Tag of a Tier-2 *index descriptor* reply (a large index, served as
+    /// content-addressed chunks — see [`IndexDescriptor`]).
+    ENC_INDEX_DESC = "zblob/indexdesc;v=3";
+    /// Tag of a Tier-2 content-addressed chunk reply.
+    ///
+    /// Versioned as of v3. It was the one tag that carried no version, on the
+    /// reasoning that a chunk container is self-describing — which is true of
+    /// the *container* and says nothing about the surrounding protocol. A tag
+    /// whose job is "diagnosable instead of garbage" should not have an
+    /// exception.
+    ENC_CHUNK = "zblob/chunk;v=3";
+    /// Tag of push-protocol acknowledgement replies.
+    ENC_PUSH = "zblob/push;v=3";
+    /// Tag of availability (`…/have`) replies.
+    ENC_AVAIL = "zblob/have;v=3";
+    /// Tag of tier-2 probe replies ([`HaveBits`]).
+    ENC_HAVEBITS = "zblob/havebits;v=3";
+    /// Tag of tier-2 snapshot probe replies ([`TreeProbe`]).
+    ENC_TREEPROBE = "zblob/treeprobe;v=3";
+    /// Tag of `fanout` tier samples (feature-gated).
+    ENC_FANOUT = "zblob/fanout;v=3";
+}
 
 /// A trailing, length-prefixed extension list carried by the *metadata*
 /// messages ([`crate::Manifest`]).

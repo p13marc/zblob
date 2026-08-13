@@ -62,6 +62,9 @@
 //!    still answers.
 
 #![warn(missing_docs)]
+#![warn(missing_debug_implementations)]
+// Builder methods that drop their result silently drop the setting with it.
+#![warn(clippy::return_self_not_must_use)]
 
 mod cancel;
 mod chunk;
@@ -282,7 +285,9 @@ pub fn parse_ranges(
 /// `$*…`) therefore match a literal prefix segment. A `**` inside the prefix
 /// region is refused instead: it can span any number of segments, so the id's
 /// position is genuinely ambiguous and guessing would mis-parse.
-pub fn parse_id(prefix: &str, key_expr: &str) -> Option<String> {
+/// Borrows from `key_expr` rather than allocating: this runs once per served
+/// query, and the caller almost always just compares it or looks it up.
+pub fn parse_id<'k>(prefix: &str, key_expr: &'k str) -> Option<&'k str> {
     let p: Vec<&str> = prefix.split('/').collect();
     let k: Vec<&str> = key_expr.split('/').collect();
     if k.len() <= p.len() {
@@ -301,7 +306,7 @@ pub fn parse_id(prefix: &str, key_expr: &str) -> Option<String> {
     if id.is_empty() || id.contains('*') {
         None
     } else {
-        Some(id.to_string())
+        Some(id)
     }
 }
 
@@ -502,8 +507,8 @@ mod key_tests {
 
     #[test]
     fn parse_id_helper() {
-        assert_eq!(parse_id("p", "p/A/**").as_deref(), Some("A"));
-        assert_eq!(parse_id("p", "p/A/manifest").as_deref(), Some("A"));
+        assert_eq!(parse_id("p", "p/A/**"), Some("A"));
+        assert_eq!(parse_id("p", "p/A/manifest"), Some("A"));
         assert_eq!(parse_id("p", "p/**"), None);
         assert_eq!(parse_id("other", "p/A/**"), None);
         // Multi-segment prefixes align positionally.
@@ -511,14 +516,13 @@ mod key_tests {
             parse_id(
                 "v1/host-a/@blob/artifact",
                 "v1/host-a/@blob/artifact/A/manifest"
-            )
-            .as_deref(),
+            ),
             Some("A")
         );
         // A wildcard-origin probe must still resolve to this server's id: the
         // `*` stands in for the literal origin segment.
         assert_eq!(
-            parse_id("v1/host-a/@blob/artifact", "v1/*/@blob/artifact/A/manifest").as_deref(),
+            parse_id("v1/host-a/@blob/artifact", "v1/*/@blob/artifact/A/manifest"),
             Some("A")
         );
         // …but a `**` in the prefix region is ambiguous and refused.

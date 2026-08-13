@@ -65,6 +65,7 @@ pub struct TagRecord {
 
 /// Persistent, named snapshot references: one postcard-encoded [`TagRecord`]
 /// per tag, in a directory. A tagged snapshot's chunks are live.
+#[derive(Debug)]
 pub struct SnapshotTags {
     dir: PathBuf,
 }
@@ -169,6 +170,12 @@ impl TempTags {
     }
 
     /// Protect `hashes` until the returned tag is dropped.
+    ///
+    /// The protection *is* the returned value's lifetime, so `temps.protect(h);`
+    /// — which compiles and reads like it did something — drops the tag on the
+    /// same line and protects nothing. Hence `#[must_use]`.
+    #[must_use = "protection lasts only as long as the returned TempTag is held; \
+                  dropping it immediately protects nothing"]
     pub fn protect(&self, hashes: impl IntoIterator<Item = Hash>) -> TempTag {
         let set = Arc::new(hashes.into_iter().collect::<HashSet<_>>());
         let mut sets = self.sets.lock().unwrap_or_else(|e| e.into_inner());

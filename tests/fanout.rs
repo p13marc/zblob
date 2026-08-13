@@ -31,7 +31,7 @@ async fn fanout_reaches_live_and_late_subscribers() {
         let expected = zblob::Hash::of(&data);
         tokio::spawn(async move {
             receive_fanout(
-                session,
+                &session,
                 &common::query(prefix),
                 "rollout",
                 Some(expected),
@@ -53,7 +53,7 @@ async fn fanout_reaches_live_and_late_subscribers() {
     tokio::time::sleep(Duration::from_millis(200)).await;
 
     let (manifest, handle) = fanout_file(
-        session.clone(),
+        &session,
         &common::serve(prefix.clone()),
         BlobSpec::new("rollout").chunk_size(MIN_CHUNK_SIZE),
         &src_path,
@@ -78,7 +78,7 @@ async fn fanout_reaches_live_and_late_subscribers() {
     let late_stats = tokio::time::timeout(
         Duration::from_secs(20),
         receive_fanout(
-            session.clone(),
+            &session,
             &common::query(prefix.clone()),
             "rollout",
             Some(manifest.root),

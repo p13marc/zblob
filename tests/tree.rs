@@ -83,7 +83,7 @@ fn assert_dirs_equal(a: &std::path::Path, b: &std::path::Path) {
     }
 }
 
-fn test_client(session: Arc<zenoh::Session>, store_prefix: &str, tree_prefix: &str) -> TreeClient {
+fn test_client(session: &zenoh::Session, store_prefix: &str, tree_prefix: &str) -> TreeClient {
     TreeClient::builder(
         session,
         common::query(store_prefix),
@@ -119,7 +119,7 @@ async fn tree_roundtrip_with_modes_and_mtime() {
     let expected_root = index.root_hash;
 
     let server = TreeServer::new(
-        session.clone(),
+        &session,
         common::serve(store_prefix.clone()),
         common::serve(tree_prefix.clone()),
         server_store,
@@ -129,7 +129,7 @@ async fn tree_roundtrip_with_modes_and_mtime() {
 
     // Download (pinned) into an empty client store + fresh dest dir.
     let client_dir = tempfile::tempdir().unwrap();
-    let client = test_client(session.clone(), &store_prefix, &tree_prefix);
+    let client = test_client(&session, &store_prefix, &tree_prefix);
     let client_store: Arc<dyn ContentStore> = Arc::new(MemoryStore::new());
     tokio::time::timeout(
         Duration::from_secs(20),
@@ -184,7 +184,7 @@ async fn reedit_transfers_only_changed_chunks() {
     let server_store: Arc<dyn ContentStore> = server_store_mem.clone();
     let index1 = build_tree(src.path(), "snap1", &small_cdc(), &*server_store).unwrap();
     let server = TreeServer::new(
-        session.clone(),
+        &session,
         common::serve(store_prefix.clone()),
         common::serve(tree_prefix.clone()),
         server_store.clone(),
@@ -196,7 +196,7 @@ async fn reedit_transfers_only_changed_chunks() {
     // Persistent client store survives "across syncs" (DirStore on disk).
     let store_dir = tempfile::tempdir().unwrap();
     let client_store: Arc<dyn ContentStore> = Arc::new(DirStore::open(store_dir.path()).unwrap());
-    let client = test_client(session.clone(), &store_prefix, &tree_prefix);
+    let client = test_client(&session, &store_prefix, &tree_prefix);
     client
         .download_tree(
             &DownloadRequest::new("snap1"),
@@ -265,7 +265,7 @@ async fn resume_from_prepopulated_store() {
     let total = index.needed_chunks().len();
 
     let server = TreeServer::new(
-        session.clone(),
+        &session,
         common::serve(store_prefix.clone()),
         common::serve(tree_prefix.clone()),
         server_store.clone(),
@@ -286,7 +286,7 @@ async fn resume_from_prepopulated_store() {
 
     // Resume: download_tree fetches only the missing remainder.
     let client_dir = tempfile::tempdir().unwrap();
-    let client = test_client(session.clone(), &store_prefix, &tree_prefix);
+    let client = test_client(&session, &store_prefix, &tree_prefix);
     client
         .download_tree(
             &DownloadRequest::new("snap1"),
@@ -332,7 +332,7 @@ async fn cancellable_reports_progress_and_resumes() {
     );
 
     let server = TreeServer::new(
-        session.clone(),
+        &session,
         common::serve(store_prefix.clone()),
         common::serve(tree_prefix.clone()),
         server_store,
@@ -348,7 +348,7 @@ async fn cancellable_reports_progress_and_resumes() {
     // the per-chunk path, where a partial cancel is well-defined; the batched
     // path's cancellation is covered separately below.
     let client = TreeClient::builder(
-        session.clone(),
+        &session,
         common::query(store_prefix.clone()),
         common::query(tree_prefix.clone()),
     )
@@ -441,7 +441,7 @@ async fn cancellable_reports_progress_and_resumes() {
     //    again finishes the job.
     {
         let batched = TreeClient::builder(
-            session.clone(),
+            &session,
             common::query(store_prefix),
             common::query(tree_prefix),
         )
@@ -517,7 +517,7 @@ async fn hardlinks_roundtrip() {
     let server_store: Arc<dyn ContentStore> = Arc::new(MemoryStore::new());
     let index = build_tree(src.path(), "hl", &small_cdc(), &*server_store).unwrap();
     let server = TreeServer::new(
-        session.clone(),
+        &session,
         common::serve(store_prefix.clone()),
         common::serve(tree_prefix.clone()),
         server_store,
@@ -526,7 +526,7 @@ async fn hardlinks_roundtrip() {
     let handle = server.spawn().await.unwrap();
 
     let dest = tempfile::tempdir().unwrap();
-    let client = test_client(session.clone(), &store_prefix, &tree_prefix);
+    let client = test_client(&session, &store_prefix, &tree_prefix);
     let client_store: Arc<dyn ContentStore> = Arc::new(MemoryStore::new());
     client
         .download_tree(
@@ -567,7 +567,7 @@ async fn empty_file_dir_and_tree_roundtrip() {
     let server_store: Arc<dyn ContentStore> = Arc::new(MemoryStore::new());
     let index = build_tree(src.path(), "edges", &small_cdc(), &*server_store).unwrap();
     let server = TreeServer::new(
-        session.clone(),
+        &session,
         common::serve(store_prefix.clone()),
         common::serve(tree_prefix.clone()),
         server_store.clone(),
@@ -581,7 +581,7 @@ async fn empty_file_dir_and_tree_roundtrip() {
     server.register(empty_index).await.unwrap();
     let handle = server.spawn().await.unwrap();
 
-    let client = test_client(session.clone(), &store_prefix, &tree_prefix);
+    let client = test_client(&session, &store_prefix, &tree_prefix);
     let store: Arc<dyn ContentStore> = Arc::new(MemoryStore::new());
 
     let dest = tempfile::tempdir().unwrap();
@@ -640,7 +640,7 @@ async fn readonly_dir_roundtrips_with_mode_restored() {
     let server_store: Arc<dyn ContentStore> = Arc::new(MemoryStore::new());
     let index = build_tree(src.path(), "ro", &small_cdc(), &*server_store).unwrap();
     let server = TreeServer::new(
-        session.clone(),
+        &session,
         common::serve(store_prefix.clone()),
         common::serve(tree_prefix.clone()),
         server_store,
@@ -649,7 +649,7 @@ async fn readonly_dir_roundtrips_with_mode_restored() {
     let handle = server.spawn().await.unwrap();
 
     let dest = tempfile::tempdir().unwrap();
-    let client = test_client(session.clone(), &store_prefix, &tree_prefix);
+    let client = test_client(&session, &store_prefix, &tree_prefix);
     let store: Arc<dyn ContentStore> = Arc::new(MemoryStore::new());
     client
         .download_tree(
@@ -703,7 +703,7 @@ async fn concurrent_tree_downloads_share_one_dirstore() {
     let index = build_tree(src.path(), "shared", &small_cdc(), &*server_store).unwrap();
     let total = index.needed_chunks().len();
     let server = TreeServer::new(
-        session.clone(),
+        &session,
         common::serve(store_prefix.clone()),
         common::serve(tree_prefix.clone()),
         server_store,
@@ -713,7 +713,7 @@ async fn concurrent_tree_downloads_share_one_dirstore() {
 
     let store_dir = tempfile::tempdir().unwrap();
     let shared_store: Arc<dyn ContentStore> = Arc::new(DirStore::open(store_dir.path()).unwrap());
-    let client = Arc::new(test_client(session.clone(), &store_prefix, &tree_prefix));
+    let client = Arc::new(test_client(&session, &store_prefix, &tree_prefix));
 
     let mut joins = Vec::new();
     let dests: Vec<_> = (0..2).map(|_| tempfile::tempdir().unwrap()).collect();
@@ -795,7 +795,7 @@ async fn content_addressed_trees_pin_by_construction() {
     let root = index.root_hash;
 
     let server = TreeServer::new(
-        session.clone(),
+        &session,
         common::serve(store_prefix.clone()),
         common::serve(tree_prefix.clone()),
         server_store,
@@ -805,7 +805,7 @@ async fn content_addressed_trees_pin_by_construction() {
 
     // One value carries both the key and the pin.
     let dest = tempfile::tempdir().unwrap();
-    let client = test_client(session.clone(), &store_prefix, &tree_prefix);
+    let client = test_client(&session, &store_prefix, &tree_prefix);
     let store: Arc<dyn ContentStore> = Arc::new(MemoryStore::new());
     client
         .download_tree(
@@ -862,7 +862,7 @@ async fn a_sweep_cannot_collect_an_in_flight_download() {
     let server_store: Arc<dyn ContentStore> = Arc::new(MemoryStore::new());
     let index = build_tree(src.path(), "swept", &small_cdc(), &*server_store).unwrap();
     let server = TreeServer::new(
-        session.clone(),
+        &session,
         common::serve(store_prefix.clone()),
         common::serve(tree_prefix.clone()),
         server_store,
@@ -877,7 +877,7 @@ async fn a_sweep_cannot_collect_an_in_flight_download() {
     let tags = gc::SnapshotTags::open(tag_dir.path()).unwrap();
     let client_store: Arc<dyn ContentStore> = Arc::new(MemoryStore::new());
     let client = TreeClient::builder(
-        session.clone(),
+        &session,
         common::query(store_prefix),
         common::query(tree_prefix),
     )
@@ -959,7 +959,7 @@ async fn a_wildcard_origin_tier2_prefix_is_answerable() {
     let server_store: Arc<dyn ContentStore> = Arc::new(MemoryStore::new());
     let index = build_tree(src.path(), "anyorigin", &small_cdc(), &*server_store).unwrap();
     let server = TreeServer::new(
-        session.clone(),
+        &session,
         common::serve(store_prefix.clone()),
         common::serve(tree_prefix.clone()),
         server_store,
@@ -970,7 +970,7 @@ async fn a_wildcard_origin_tier2_prefix_is_answerable() {
     let dest = tempfile::tempdir().unwrap();
     let client_store: Arc<dyn ContentStore> = Arc::new(MemoryStore::new());
     TreeClient::builder(
-        session.clone(),
+        &session,
         common::query(store_query),
         common::query(tree_query),
     )

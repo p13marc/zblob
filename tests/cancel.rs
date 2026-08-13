@@ -12,7 +12,7 @@ use zblob::{
     MIN_CHUNK_SIZE, MemoryBlobSource, Progress, ProgressSink, RetryPolicy,
 };
 
-fn test_client(session: Arc<zenoh::Session>, prefix: &str) -> BlobClient {
+fn test_client(session: &zenoh::Session, prefix: &str) -> BlobClient {
     BlobClient::builder(session, common::query(prefix))
         .query_timeout(Duration::from_secs(5))
         .retry(RetryPolicy {
@@ -45,7 +45,7 @@ async fn cancel_persists_then_resumes() {
     let dest = dir.path().join("d.bin");
 
     let data = pseudo_random(MIN_CHUNK_SIZE as usize * 8, 0xC0FFEE);
-    let server = BlobServer::new(session.clone(), common::serve(prefix.clone()));
+    let server = BlobServer::new(&session, common::serve(prefix.clone()));
     server
         .register_source(
             BlobSpec::new("blob-x").chunk_size(MIN_CHUNK_SIZE),
@@ -55,7 +55,7 @@ async fn cancel_persists_then_resumes() {
         .unwrap();
     let handle = server.spawn().await.unwrap();
 
-    let client = test_client(session.clone(), &prefix);
+    let client = test_client(&session, &prefix);
 
     // Cancel mid-transfer → Cancelled, partial persisted.
     let token = CancelToken::new();
@@ -100,7 +100,7 @@ async fn delete_partial_clears_state() {
     let dest = dir.path().join("d.bin");
 
     let data = pseudo_random(MIN_CHUNK_SIZE as usize * 4, 0xBEEF);
-    let server = BlobServer::new(session.clone(), common::serve(prefix.clone()));
+    let server = BlobServer::new(&session, common::serve(prefix.clone()));
     server
         .register_source(
             BlobSpec::new("blob-y").chunk_size(MIN_CHUNK_SIZE),
@@ -110,7 +110,7 @@ async fn delete_partial_clears_state() {
         .unwrap();
     let handle = server.spawn().await.unwrap();
 
-    let client = test_client(session.clone(), &prefix);
+    let client = test_client(&session, &prefix);
     let token = CancelToken::new();
     let sink = CancelAfterFirst {
         token: token.clone(),
@@ -181,7 +181,7 @@ async fn cancel_is_observed_while_stalled_on_a_silent_peer() {
                         manifest_key(&srv_prefix, "stalled"),
                         wire::encode(&manifest).unwrap(),
                     )
-                    .encoding(ENC_MANIFEST)
+                    .encoding(&ENC_MANIFEST)
                     .await;
             } else {
                 held.push(query);
@@ -190,7 +190,7 @@ async fn cancel_is_observed_while_stalled_on_a_silent_peer() {
     });
 
     let timeout = Duration::from_secs(5);
-    let client = BlobClient::builder(session.clone(), common::query(&prefix))
+    let client = BlobClient::builder(&session, common::query(&prefix))
         .query_timeout(timeout)
         .build();
 

@@ -15,7 +15,6 @@
 //! re-hashed against the address before it is returned, an unusable reply is
 //! skipped rather than fatal, and the first good replier wins.
 
-use std::sync::Arc;
 use std::time::Duration;
 
 use zenoh::qos::Priority;
@@ -58,21 +57,24 @@ pub struct ChunkProbe {
 }
 
 /// Reads single chunks from a content-addressed store by their hash.
+#[derive(Debug)]
 pub struct StoreClient {
-    session: Arc<zenoh::Session>,
+    session: zenoh::Session,
     prefix: QueryPrefix,
     cfg: StoreClientConfig,
 }
 
 /// Builder for a [`StoreClient`].
+#[derive(Debug)]
 pub struct StoreClientBuilder {
-    session: Arc<zenoh::Session>,
+    session: zenoh::Session,
     prefix: QueryPrefix,
     cfg: StoreClientConfig,
 }
 
 impl StoreClientBuilder {
     /// Per-query timeout (default 30 s).
+    #[must_use]
     pub fn query_timeout(mut self, t: Duration) -> Self {
         self.cfg.query_timeout = t;
         self
@@ -80,6 +82,7 @@ impl StoreClientBuilder {
 
     /// Zenoh priority for the queries this client issues (default
     /// [`Priority::DataLow`]).
+    #[must_use]
     pub fn priority(mut self, priority: Priority) -> Self {
         self.cfg.priority = priority;
         self
@@ -90,6 +93,7 @@ impl StoreClientBuilder {
     ///
     /// Prefer [`StoreClient::fetch_chunk_sized`] where an index has already
     /// stated the length: a specific bound beats a generic one.
+    #[must_use]
     pub fn max_chunk_bytes(mut self, n: usize) -> Self {
         self.cfg.max_chunk_bytes = n.min(MAX_UNPACKED);
         self
@@ -107,16 +111,16 @@ impl StoreClientBuilder {
 
 impl StoreClient {
     /// Start building a client for the store under `store_prefix`.
-    pub fn builder(session: Arc<zenoh::Session>, store_prefix: QueryPrefix) -> StoreClientBuilder {
+    pub fn builder(session: &zenoh::Session, store_prefix: QueryPrefix) -> StoreClientBuilder {
         StoreClientBuilder {
-            session,
+            session: session.clone(),
             prefix: store_prefix,
             cfg: StoreClientConfig::default(),
         }
     }
 
     /// Build a client with default configuration.
-    pub fn new(session: Arc<zenoh::Session>, store_prefix: QueryPrefix) -> Self {
+    pub fn new(session: &zenoh::Session, store_prefix: QueryPrefix) -> Self {
         Self::builder(session, store_prefix).build()
     }
 
@@ -309,7 +313,7 @@ pub(crate) fn accept_batch_reply(
     sample: &zenoh::sample::Sample,
     expected: &std::collections::HashMap<Hash, u32>,
 ) -> Option<(Hash, Vec<u8>)> {
-    if sample.encoding().to_string() != ENC_CHUNK {
+    if !ENC_CHUNK.matches(sample.encoding()) {
         return None;
     }
     let tail = crate::parse_tier2_tail(store_prefix, sample.key_expr().as_str())?;
@@ -354,7 +358,7 @@ pub(crate) async fn probe_chunks(
     let mut out = Vec::new();
     while let Ok(reply) = replies.recv_async().await {
         let Ok(sample) = reply.result() else { continue };
-        if sample.encoding().to_string() != crate::wire::ENC_HAVEBITS {
+        if !crate::wire::ENC_HAVEBITS.matches(sample.encoding()) {
             continue;
         }
         let Ok(bits) = crate::wire::decode::<HaveBits>(&sample.payload().to_bytes()) else {
@@ -400,7 +404,7 @@ pub(crate) async fn fetch_one_chunk(
         .map_err(BlobError::zenoh)?;
     while let Ok(reply) = replies.recv_async().await {
         let Ok(sample) = reply.result() else { continue };
-        if sample.encoding().to_string() != ENC_CHUNK {
+        if !ENC_CHUNK.matches(sample.encoding()) {
             continue;
         }
         let payload = sample.payload().to_bytes();

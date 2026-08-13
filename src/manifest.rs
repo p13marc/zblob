@@ -171,18 +171,21 @@ impl BlobSpec {
     }
 
     /// Set the advisory filename clients may use to name the artifact.
+    #[must_use]
     pub fn filename(mut self, filename: impl Into<String>) -> Self {
         self.filename = Some(filename.into());
         self
     }
 
     /// Set the transfer chunk size (validated at registration).
+    #[must_use]
     pub fn chunk_size(mut self, bytes: u32) -> Self {
         self.chunk_size = bytes;
         self
     }
 
     /// Set the manifest's creation timestamp (Unix epoch milliseconds).
+    #[must_use]
     pub fn created_ms(mut self, ms: i64) -> Self {
         self.created_ms = ms;
         self

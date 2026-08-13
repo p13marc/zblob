@@ -24,7 +24,7 @@ use zblob::{
 /// A minimal stand-in for `zenoh-plugin-storage-manager`: retain PUTs on a key
 /// range and reply to GETs on that range. Content-addressed keys are immutable,
 /// so last-writer-wins storage is exact.
-async fn spawn_storage(session: Arc<zenoh::Session>, root: String) -> tokio::task::JoinHandle<()> {
+async fn spawn_storage(session: &zenoh::Session, root: String) -> tokio::task::JoinHandle<()> {
     let sub = session
         .declare_subscriber(format!("{root}/**"))
         .await
@@ -66,7 +66,7 @@ async fn publish_to_storage_then_download_without_server() {
 
     // Stand-in storage covers both the chunk and index key ranges; its
     // subscriber + queryable are declared before we publish.
-    let storage = spawn_storage(session.clone(), root.clone()).await;
+    let storage = spawn_storage(&session, root.clone()).await;
 
     // Producer builds a snapshot and publishes it into the storage.
     let src = tempfile::tempdir().unwrap();
@@ -106,7 +106,7 @@ async fn publish_to_storage_then_download_without_server() {
     // The producer is "gone": only the storage answers from here on.
     let client_dir = tempfile::tempdir().unwrap();
     let client = TreeClient::builder(
-        session.clone(),
+        &session,
         common::query(store_prefix),
         common::query(tree_prefix),
     )
@@ -150,7 +150,7 @@ async fn publish_snapshot_exports_only_the_snapshot() {
     let root = unique_prefix();
     let store_prefix = format!("{root}/store");
     let tree_prefix = format!("{root}/tree");
-    let storage = spawn_storage(session.clone(), root.clone()).await;
+    let storage = spawn_storage(&session, root.clone()).await;
 
     let cdc = CdcParams {
         min: 2048,

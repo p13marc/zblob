@@ -16,7 +16,7 @@ use zblob::{
     wire::{ENC_MANIFEST, ENC_SLICE, encode},
 };
 
-fn test_client(session: Arc<zenoh::Session>, prefix: &str) -> BlobClient {
+fn test_client(session: &zenoh::Session, prefix: &str) -> BlobClient {
     BlobClient::builder(session, common::query(prefix))
         .query_timeout(Duration::from_secs(3))
         .retry(RetryPolicy {
@@ -37,7 +37,7 @@ async fn pinned_root_rejects_substituted_content() {
     let expected = pseudo_random(MIN_CHUNK_SIZE as usize * 2, 1);
     let substituted = pseudo_random(MIN_CHUNK_SIZE as usize * 2, 2);
 
-    let server = BlobServer::new(session.clone(), common::serve(prefix.clone()));
+    let server = BlobServer::new(&session, common::serve(prefix.clone()));
     server
         .register_source(
             BlobSpec::new("blob-s").chunk_size(MIN_CHUNK_SIZE),
@@ -49,7 +49,7 @@ async fn pinned_root_rejects_substituted_content() {
 
     let dir = tempfile::tempdir().unwrap();
     let dest = dir.path().join("out.bin");
-    let client = test_client(session.clone(), &prefix);
+    let client = test_client(&session, &prefix);
     let err = client
         .download_to(
             &DownloadRequest::pinned("blob-s", Hash::of(&expected)),
@@ -98,7 +98,7 @@ async fn tampered_slice_dropped_alone_and_healed() {
     let honest = Arc::new(AtomicBool::new(false));
     let honest_flag = honest.clone();
     let (srv_session, srv_prefix, srv_data, srv_manifest) =
-        (session.clone(), prefix.clone(), data.clone(), manifest);
+        (&session, prefix.clone(), data.clone(), manifest);
     // Declare before spawning so the client can query immediately.
     let q = srv_session
         .declare_queryable(format!("{srv_prefix}/**"))
@@ -113,7 +113,7 @@ async fn tampered_slice_dropped_alone_and_healed() {
                         manifest_key(&srv_prefix, "blob-t"),
                         encode(&srv_manifest).unwrap(),
                     )
-                    .encoding(ENC_MANIFEST)
+                    .encoding(&ENC_MANIFEST)
                     .await;
                 continue;
             }
@@ -127,14 +127,14 @@ async fn tampered_slice_dropped_alone_and_healed() {
                     }
                     let _ = query
                         .reply(slice_key(&srv_prefix, "blob-t", index), payload)
-                        .encoding(ENC_SLICE)
+                        .encoding(&ENC_SLICE)
                         .await;
                 }
             }
         }
     });
 
-    let client = test_client(session.clone(), &prefix);
+    let client = test_client(&session, &prefix);
     let err = client
         .download_to(
             &DownloadRequest::pinned("blob-t", root),
@@ -193,7 +193,7 @@ async fn manifest_id_mismatch_rejected() {
         ext: zblob::wire::Ext::new(),
     };
 
-    let (srv_session, srv_prefix) = (session.clone(), prefix.clone());
+    let (srv_session, srv_prefix) = (&session, prefix.clone());
     // Declare before spawning so the client can query immediately.
     let q = srv_session
         .declare_queryable(format!("{srv_prefix}/**"))
@@ -204,12 +204,12 @@ async fn manifest_id_mismatch_rejected() {
         while let Ok(query) = q.recv_async().await {
             let _ = query
                 .reply(query.key_expr().clone(), encode(&manifest).unwrap())
-                .encoding(ENC_MANIFEST)
+                .encoding(&ENC_MANIFEST)
                 .await;
         }
     });
 
-    let client = test_client(session.clone(), &prefix);
+    let client = test_client(&session, &prefix);
     let err = client
         .fetch_manifest("wanted-blob")
         .await

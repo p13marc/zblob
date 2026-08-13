@@ -29,7 +29,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let src = dir.path().join("artifact.bin");
     std::fs::write(&src, vec![42u8; 3 * 1024 * 1024])?;
 
-    let server = BlobServer::new(session.clone(), serve_prefix);
+    let server = BlobServer::new(&session, serve_prefix);
     let manifest = server
         .register_file(BlobSpec::new("demo-blob").filename("artifact.bin"), &src)
         .await?;
@@ -38,7 +38,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // --- consumer: download with the root pinned ----------------------------
     let dest = dir.path().join("downloaded.bin");
-    let client = BlobClient::new(session.clone(), query_prefix);
+    let client = BlobClient::new(&session, query_prefix);
     let stats = client
         .download_to(
             &DownloadRequest::pinned("demo-blob", manifest.root),

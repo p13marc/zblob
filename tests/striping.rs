@@ -19,7 +19,7 @@ use zblob::{
     MemoryBlobSource, Overwrite, PushConfig, RetryPolicy,
 };
 
-fn client(session: Arc<zenoh::Session>, prefix: &str) -> BlobClient {
+fn client(session: &zenoh::Session, prefix: &str) -> BlobClient {
     BlobClient::builder(session, common::query(prefix))
         .query_timeout(Duration::from_secs(5))
         .retry(RetryPolicy {
@@ -46,10 +46,7 @@ async fn striping_sends_each_chunk_once_not_once_per_replica() {
 
     let mut handles = Vec::new();
     for host in ["host-a", "host-b"] {
-        let server = BlobServer::new(
-            session.clone(),
-            common::serve(format!("{base}/{host}/blob")),
-        );
+        let server = BlobServer::new(&session, common::serve(format!("{base}/{host}/blob")));
         server
             .register_source(
                 BlobSpec::new("shared").chunk_size(MIN_CHUNK_SIZE),
@@ -75,7 +72,7 @@ async fn striping_sends_each_chunk_once_not_once_per_replica() {
         })
     };
 
-    let prober = client(session.clone(), &format!("{base}/*/blob"));
+    let prober = client(&session, &format!("{base}/*/blob"));
     let holders = prober.probe("shared").await.expect("probe");
     assert_eq!(holders.len(), 2, "two holders");
     for h in &holders {
@@ -141,7 +138,7 @@ async fn tier1_availability_is_all_or_nothing_by_construction() {
             true
         }
     }
-    let handle = BlobServer::builder(session.clone(), common::serve(prefix.clone()))
+    let handle = BlobServer::builder(&session, common::serve(prefix.clone()))
         .accept_push(PushConfig::new(Arc::new(Yes), spool.path()))
         .build()
         .spawn()
@@ -153,7 +150,7 @@ async fn tier1_availability_is_all_or_nothing_by_construction() {
     let src = tempfile::tempdir().unwrap();
     let src_path = src.path().join("half.bin");
     std::fs::write(&src_path, &data).unwrap();
-    let up = client(session.clone(), &prefix);
+    let up = client(&session, &prefix);
     let cancel = CancelToken::new();
     struct StopEarly(CancelToken);
     impl zblob::ProgressSink for StopEarly {
@@ -177,7 +174,7 @@ async fn tier1_availability_is_all_or_nothing_by_construction() {
 
     // The server does not advertise the half it holds — it *cannot* serve any
     // of it, so claiming it would send clients after chunks they can never get.
-    let holders = client(session.clone(), &prefix)
+    let holders = client(&session, &prefix)
         .probe("halfway")
         .await
         .expect("probe");
@@ -188,7 +185,7 @@ async fn tier1_availability_is_all_or_nothing_by_construction() {
 
     // Discriminating power: once the same blob is registered whole, it does
     // advertise — and reports every chunk.
-    let server2 = BlobServer::new(session.clone(), common::serve(prefix.clone()));
+    let server2 = BlobServer::new(&session, common::serve(prefix.clone()));
     server2
         .register_source(
             BlobSpec::new("halfway").chunk_size(MIN_CHUNK_SIZE),
@@ -197,7 +194,7 @@ async fn tier1_availability_is_all_or_nothing_by_construction() {
         .await
         .unwrap();
     let h2 = server2.spawn().await.unwrap();
-    let holders = client(session.clone(), &prefix)
+    let holders = client(&session, &prefix)
         .probe("halfway")
         .await
         .expect("probe");
@@ -220,7 +217,7 @@ async fn a_single_holder_degrades_to_a_plain_download() {
     let session = open_session().await;
     let prefix = unique_prefix();
     let data = pseudo_random(MIN_CHUNK_SIZE as usize * 2, 53);
-    let server = BlobServer::new(session.clone(), common::serve(prefix.clone()));
+    let server = BlobServer::new(&session, common::serve(prefix.clone()));
     server
         .register_source(
             BlobSpec::new("solo").chunk_size(MIN_CHUNK_SIZE),
@@ -230,7 +227,7 @@ async fn a_single_holder_degrades_to_a_plain_download() {
         .unwrap();
     let handle = server.spawn().await.unwrap();
 
-    let c = client(session.clone(), &prefix);
+    let c = client(&session, &prefix);
     let holders = c.probe("solo").await.unwrap();
     assert_eq!(holders.len(), 1);
 

@@ -44,18 +44,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         index.root_hash
     );
 
-    let server = TreeServer::new(
-        session.clone(),
-        store_serve,
-        tree_serve,
-        server_store.clone(),
-    );
+    let server = TreeServer::new(&session, store_serve, tree_serve, server_store.clone());
     server.register(index.clone()).await.unwrap();
     let handle = server.clone().spawn().await?;
 
     // --- consumer: sync (pinned), then re-sync after an edit ----------------
     let dest = tempfile::tempdir()?;
-    let client = TreeClient::new(session.clone(), store_query, tree_query);
+    let client = TreeClient::new(&session, store_query, tree_query);
     let client_store: Arc<dyn ContentStore> = Arc::new(MemoryStore::new());
 
     let stats = client

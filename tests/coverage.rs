@@ -12,7 +12,7 @@ use zblob::{
     MemoryBlobSource, Progress, RetryPolicy,
 };
 
-fn test_client(session: Arc<zenoh::Session>, prefix: &str) -> BlobClient {
+fn test_client(session: &zenoh::Session, prefix: &str) -> BlobClient {
     BlobClient::builder(session, common::query(prefix))
         .query_timeout(Duration::from_secs(5))
         .retry(RetryPolicy {
@@ -33,7 +33,7 @@ async fn large_blob_spans_multiple_queries() {
     let prefix = unique_prefix();
 
     let data = pseudo_random(MIN_CHUNK_SIZE as usize * 12, 51);
-    let server = BlobServer::builder(session.clone(), common::serve(prefix.clone()))
+    let server = BlobServer::builder(&session, common::serve(prefix.clone()))
         .max_chunks_per_query(4)
         .build();
     server
@@ -47,7 +47,7 @@ async fn large_blob_spans_multiple_queries() {
 
     let dir = tempfile::tempdir().unwrap();
     let dest = dir.path().join("big.bin");
-    let client = BlobClient::builder(session.clone(), common::query(prefix))
+    let client = BlobClient::builder(&session, common::query(prefix))
         .query_timeout(Duration::from_secs(5))
         .max_chunks_per_query(4)
         .build();
@@ -81,7 +81,7 @@ async fn stray_or_mismatched_partial_restarts_clean() {
     let prefix = unique_prefix();
 
     let data = pseudo_random(MIN_CHUNK_SIZE as usize * 3, 52);
-    let server = BlobServer::new(session.clone(), common::serve(prefix.clone()));
+    let server = BlobServer::new(&session, common::serve(prefix.clone()));
     server
         .register_source(
             BlobSpec::new("clean").chunk_size(MIN_CHUNK_SIZE),
@@ -95,7 +95,7 @@ async fn stray_or_mismatched_partial_restarts_clean() {
     let dest = dir.path().join("out.bin");
     // Case 1: .part exists with garbage, no sidecar.
     std::fs::write(dir.path().join("out.bin.part"), b"stray garbage").unwrap();
-    let client = test_client(session.clone(), &prefix);
+    let client = test_client(&session, &prefix);
     let saw_started = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let flag = saw_started.clone();
     let sink = move |p: Progress| {
@@ -170,7 +170,7 @@ async fn concurrent_downloads_to_different_destinations() {
     let prefix = unique_prefix();
 
     let data = pseudo_random(MIN_CHUNK_SIZE as usize * 5, 53);
-    let server = BlobServer::new(session.clone(), common::serve(prefix.clone()));
+    let server = BlobServer::new(&session, common::serve(prefix.clone()));
     server
         .register_source(
             BlobSpec::new("shared").chunk_size(MIN_CHUNK_SIZE),
@@ -180,7 +180,7 @@ async fn concurrent_downloads_to_different_destinations() {
         .unwrap();
     let handle = server.spawn().await.unwrap();
 
-    let client = Arc::new(test_client(session.clone(), &prefix));
+    let client = Arc::new(test_client(&session, &prefix));
     let dir = tempfile::tempdir().unwrap();
     let mut joins = Vec::new();
     for i in 0..3 {
@@ -218,7 +218,7 @@ async fn download_to_writer_roundtrip() {
     let prefix = unique_prefix();
 
     let data = pseudo_random(MIN_CHUNK_SIZE as usize * 2 + 500, 54);
-    let server = BlobServer::new(session.clone(), common::serve(prefix.clone()));
+    let server = BlobServer::new(&session, common::serve(prefix.clone()));
     let manifest = server
         .register_source(
             BlobSpec::new("wr").chunk_size(MIN_CHUNK_SIZE),
@@ -228,7 +228,7 @@ async fn download_to_writer_roundtrip() {
         .unwrap();
     let handle = server.spawn().await.unwrap();
 
-    let client = test_client(session.clone(), &prefix);
+    let client = test_client(&session, &prefix);
     let mut cursor = std::io::Cursor::new(Vec::new());
     let stats = client
         .download_to_writer(
@@ -258,7 +258,7 @@ async fn file_outboard_spill_roundtrip() {
     let src_path = src.path().join("spill.bin");
     std::fs::write(&src_path, &data).unwrap();
 
-    let server = BlobServer::builder(session.clone(), common::serve(prefix.clone()))
+    let server = BlobServer::builder(&session, common::serve(prefix.clone()))
         .outboard_mem_limit(0) // force the file-backed outboard path
         .build();
     let manifest = server
@@ -273,7 +273,7 @@ async fn file_outboard_spill_roundtrip() {
 
     let dir = tempfile::tempdir().unwrap();
     let dest = dir.path().join("out.bin");
-    let client = test_client(session.clone(), &prefix);
+    let client = test_client(&session, &prefix);
     client
         .download_to(
             &DownloadRequest::pinned("spill", manifest.root),
@@ -317,7 +317,7 @@ async fn unusable_prefixes_and_ids_fail_loudly() {
 
     // A convention-style verbatim prefix must keep working.
     let good = format!("{}/@blob/artifact", unique_prefix());
-    let server = BlobServer::new(session.clone(), common::serve(good.clone()));
+    let server = BlobServer::new(&session, common::serve(good.clone()));
     let data = pseudo_random(MIN_CHUNK_SIZE as usize, 60);
     let manifest = server
         .register_source(
@@ -333,7 +333,7 @@ async fn unusable_prefixes_and_ids_fail_loudly() {
         .expect("verbatim prefix must work");
     let dir = tempfile::tempdir().unwrap();
     let dest = dir.path().join("out.bin");
-    let client = test_client(session.clone(), &good);
+    let client = test_client(&session, &good);
     client
         .download_to(
             &DownloadRequest::pinned("ok", manifest.root),
@@ -371,7 +371,7 @@ async fn wildcard_prefixes_are_queryable_but_not_servable() {
     let wildcard = format!("{base}/*/@blob/artifact");
 
     // A server on the concrete prefix.
-    let server = BlobServer::new(session.clone(), common::serve(concrete.clone()));
+    let server = BlobServer::new(&session, common::serve(concrete.clone()));
     let data = pseudo_random(MIN_CHUNK_SIZE as usize, 61);
     let manifest = server
         .register_source(
@@ -383,7 +383,7 @@ async fn wildcard_prefixes_are_queryable_but_not_servable() {
     let handle = server.spawn().await.unwrap();
 
     // Probing across origins with a wildcard prefix finds it…
-    let prober = test_client(session.clone(), &wildcard);
+    let prober = test_client(&session, &wildcard);
     let found = prober
         .fetch_manifest("probed")
         .await
@@ -393,7 +393,7 @@ async fn wildcard_prefixes_are_queryable_but_not_servable() {
     // …and then the bulk fetch happens from the chosen concrete origin.
     let dir = tempfile::tempdir().unwrap();
     let dest = dir.path().join("out.bin");
-    test_client(session.clone(), &concrete)
+    test_client(&session, &concrete)
         .download_to(
             &DownloadRequest::pinned("probed", manifest.root),
             &dest,
@@ -445,13 +445,13 @@ async fn a_mutated_source_is_diagnosed_not_served_forever() {
     let original = pseudo_random(MIN_CHUNK_SIZE as usize * 2, 31);
     std::fs::write(&path, &original).unwrap();
 
-    let server = BlobServer::new(session.clone(), common::serve(prefix.clone()));
+    let server = BlobServer::new(&session, common::serve(prefix.clone()));
     let manifest = server
         .register_file(BlobSpec::new("mut").chunk_size(MIN_CHUNK_SIZE), &path)
         .await
         .unwrap();
     let handle = server.spawn().await.unwrap();
-    let client = test_client(session.clone(), &prefix);
+    let client = test_client(&session, &prefix);
 
     // Discriminating power first: while the file is untouched, it downloads.
     let out = dir.path().join("before.bin");
@@ -497,7 +497,7 @@ async fn a_mutated_source_is_diagnosed_not_served_forever() {
 async fn re_registration_cannot_silently_swap_content() {
     let session = open_session().await;
     let prefix = unique_prefix();
-    let server = BlobServer::new(session.clone(), common::serve(prefix.clone()));
+    let server = BlobServer::new(&session, common::serve(prefix.clone()));
 
     let first = pseudo_random(4096, 41);
     let spec = || BlobSpec::new("stable").chunk_size(MIN_CHUNK_SIZE);
@@ -526,7 +526,7 @@ async fn re_registration_cannot_silently_swap_content() {
     let handle = server.spawn().await.unwrap();
     let dir = tempfile::tempdir().unwrap();
     let out = dir.path().join("still.bin");
-    test_client(session.clone(), &prefix)
+    test_client(&session, &prefix)
         .download_to(
             &DownloadRequest::pinned("stable", m1.root),
             &out,
@@ -563,7 +563,7 @@ async fn an_unknown_id_fails_fast_not_on_the_timeout() {
     let budget = Duration::from_secs(2);
 
     let served = unique_prefix();
-    let handle = BlobServer::new(session.clone(), common::serve(served.clone()))
+    let handle = BlobServer::new(&session, common::serve(served.clone()))
         .spawn()
         .await
         .unwrap();
@@ -572,7 +572,7 @@ async fn an_unknown_id_fails_fast_not_on_the_timeout() {
     let mut wide_handles = Vec::new();
     for host in ["host-a", "host-b"] {
         wide_handles.push(
-            BlobServer::new(session.clone(), common::serve(format!("{base}/{host}/x")))
+            BlobServer::new(&session, common::serve(format!("{base}/{host}/x")))
                 .spawn()
                 .await
                 .unwrap(),
@@ -588,7 +588,7 @@ async fn an_unknown_id_fails_fast_not_on_the_timeout() {
         ("a wildcard across two servers", format!("{base}/*/x")),
     ];
     for (what, prefix) in cases {
-        let client = BlobClient::builder(session.clone(), common::query(prefix))
+        let client = BlobClient::builder(&session, common::query(prefix))
             .query_timeout(timeout)
             .build();
         let started = std::time::Instant::now();
@@ -628,7 +628,7 @@ async fn a_client_clamps_to_the_server_s_advertised_cap() {
 
     // Six chunks, but the server will only serve two per query.
     let data = pseudo_random(MIN_CHUNK_SIZE as usize * 6, 71);
-    let server = BlobServer::builder(session.clone(), common::serve(prefix.clone()))
+    let server = BlobServer::builder(&session, common::serve(prefix.clone()))
         .max_chunks_per_query(2)
         .build();
     let manifest = server
@@ -646,7 +646,7 @@ async fn a_client_clamps_to_the_server_s_advertised_cap() {
     // A client with the stock 512 default downloads successfully anyway.
     let dir = tempfile::tempdir().unwrap();
     let dest = dir.path().join("out.bin");
-    let client = BlobClient::builder(session.clone(), common::query(prefix))
+    let client = BlobClient::builder(&session, common::query(prefix))
         .query_timeout(Duration::from_secs(5))
         .retry(RetryPolicy {
             max_attempts: 3,

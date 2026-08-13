@@ -42,7 +42,7 @@ async fn a_bare_content_address_can_be_fetched_and_verified() {
     let server_store: Arc<dyn ContentStore> = Arc::new(MemoryStore::new());
     let index = build_tree(src.path(), "chunks", &small_cdc(), &*server_store).unwrap();
     let server = TreeServer::new(
-        session.clone(),
+        &session,
         common::serve(store_prefix.clone()),
         common::serve(tree_prefix.clone()),
         server_store.clone(),
@@ -51,7 +51,7 @@ async fn a_bare_content_address_can_be_fetched_and_verified() {
     let handle = server.spawn().await.unwrap();
 
     // No TreeClient, no tree prefix, no ContentStore — just the store.
-    let store_client = StoreClient::builder(session.clone(), common::query(store_prefix))
+    let store_client = StoreClient::builder(&session, common::query(store_prefix))
         .query_timeout(Duration::from_secs(5))
         .build();
 
@@ -106,7 +106,7 @@ async fn a_snapshot_can_be_inspected_without_materializing_it() {
     let expected_size = index.total_size();
 
     let server = TreeServer::new(
-        session.clone(),
+        &session,
         common::serve(store_prefix.clone()),
         common::serve(tree_prefix.clone()),
         server_store,
@@ -115,7 +115,7 @@ async fn a_snapshot_can_be_inspected_without_materializing_it() {
     let handle = server.spawn().await.unwrap();
 
     let client = zblob::TreeClient::builder(
-        session.clone(),
+        &session,
         common::query(store_prefix),
         common::query(tree_prefix),
     )
@@ -156,7 +156,7 @@ async fn a_probe_attributes_each_answer_to_its_origin() {
     let mut handles = Vec::new();
     for host in ["host-a", "host-b"] {
         let server = BlobServer::new(
-            session.clone(),
+            &session,
             common::serve(format!("{base}/{host}/@blob/artifact")),
         );
         server
@@ -169,12 +169,9 @@ async fn a_probe_attributes_each_answer_to_its_origin() {
         handles.push(server.spawn().await.unwrap());
     }
 
-    let prober = BlobClient::builder(
-        session.clone(),
-        common::query(format!("{base}/*/@blob/artifact")),
-    )
-    .query_timeout(Duration::from_secs(5))
-    .build();
+    let prober = BlobClient::builder(&session, common::query(format!("{base}/*/@blob/artifact")))
+        .query_timeout(Duration::from_secs(5))
+        .build();
 
     let holders = prober.probe("shared").await.expect("probe");
     assert_eq!(holders.len(), 2, "one entry per holder, not per reply");
@@ -198,7 +195,7 @@ async fn a_probe_attributes_each_answer_to_its_origin() {
     // …and the probe result feeds a fetch from one chosen holder directly.
     let chosen = holders.into_iter().next().unwrap();
     let dir = tempfile::tempdir().unwrap();
-    let staged = BlobClient::builder(session.clone(), chosen.origin)
+    let staged = BlobClient::builder(&session, chosen.origin)
         .query_timeout(Duration::from_secs(5))
         .build()
         .download_staged(
@@ -223,7 +220,7 @@ async fn a_probe_attributes_each_answer_to_its_origin() {
 async fn staged_downloads_named_alike_do_not_collide() {
     let session = open_session().await;
     let prefix = unique_prefix();
-    let server = BlobServer::new(session.clone(), common::serve(prefix.clone()));
+    let server = BlobServer::new(&session, common::serve(prefix.clone()));
 
     let first = common::pseudo_random(9_000, 94);
     let second = common::pseudo_random(9_000, 95);
@@ -239,7 +236,7 @@ async fn staged_downloads_named_alike_do_not_collide() {
     }
     let handle = server.spawn().await.unwrap();
 
-    let client = BlobClient::builder(session.clone(), common::query(prefix))
+    let client = BlobClient::builder(&session, common::query(prefix))
         .query_timeout(Duration::from_secs(5))
         .build();
     let dir = tempfile::tempdir().unwrap();

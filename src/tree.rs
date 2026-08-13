@@ -291,6 +291,7 @@ impl TreeIndex {
     ///
     /// The id is not part of the root digest, so re-keying never invalidates
     /// the index.
+    #[must_use]
     pub fn keyed_by_root(mut self) -> Self {
         // A hex digest is always a legal id, so this cannot fail.
         self.id = BlobId::new(self.root_hash.to_string())
@@ -683,6 +684,7 @@ impl MaterializePolicy {
     /// real and ordinary change, so this exists; but with it off, an index
     /// entry named `Documents` cannot recursively delete `<dest>/Documents`
     /// on its way to writing a file there. Off, such an entry is an error.
+    #[must_use]
     pub fn replace_directories(mut self, allow: bool) -> Self {
         self.replace_directories = allow;
         self
@@ -695,6 +697,7 @@ impl MaterializePolicy {
     /// an index with attacker-chosen file content and `mode = 0o104755` would
     /// otherwise produce a setuid-root binary. tar and rsync gate this the
     /// same way. With it off, modes are masked to `0o0777`.
+    #[must_use]
     pub fn restore_setid(mut self, allow: bool) -> Self {
         self.restore_setid = allow;
         self
@@ -710,8 +713,19 @@ pub struct TreeServer {
     inner: Arc<TreeInner>,
 }
 
+impl std::fmt::Debug for TreeServer {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("TreeServer")
+            .field("store_prefix", &self.inner.store_prefix)
+            .field("tree_prefix", &self.inner.tree_prefix)
+            .field("compression", &self.inner.compression)
+            .field("max_want_list", &self.inner.max_want_list)
+            .finish_non_exhaustive()
+    }
+}
+
 struct TreeInner {
-    session: Arc<zenoh::Session>,
+    session: zenoh::Session,
     store_prefix: ServePrefix,
     tree_prefix: ServePrefix,
     store: Arc<dyn ContentStore>,
@@ -725,7 +739,7 @@ struct TreeInner {
 
 /// Builder for a [`TreeServer`] (see [`TreeServer::builder`]).
 pub struct TreeServerBuilder {
-    session: Arc<zenoh::Session>,
+    session: zenoh::Session,
     store_prefix: ServePrefix,
     tree_prefix: ServePrefix,
     store: Arc<dyn ContentStore>,
@@ -734,6 +748,19 @@ pub struct TreeServerBuilder {
     max_want_list: usize,
     index_shard_threshold: usize,
     on_error: Option<ErrorCallback>,
+}
+
+impl std::fmt::Debug for TreeServerBuilder {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("TreeServerBuilder")
+            .field("store_prefix", &self.store_prefix)
+            .field("tree_prefix", &self.tree_prefix)
+            .field("max_inflight", &self.max_inflight)
+            .field("compression", &self.compression)
+            .field("max_want_list", &self.max_want_list)
+            .field("index_shard_threshold", &self.index_shard_threshold)
+            .finish_non_exhaustive()
+    }
 }
 
 /// A registered snapshot, plus its sharded form when it is large enough to
@@ -781,6 +808,7 @@ fn shard_index(
 
 impl TreeServerBuilder {
     /// Max concurrent in-flight queries served at once (default 8).
+    #[must_use]
     pub fn max_inflight(mut self, n: usize) -> Self {
         self.max_inflight = n.max(1);
         self
@@ -788,6 +816,7 @@ impl TreeServerBuilder {
 
     /// Compression for chunk replies (default none; requires the `zstd`
     /// feature for [`ChunkCompression::Zstd`]).
+    #[must_use]
     pub fn compression(mut self, c: ChunkCompression) -> Self {
         self.compression = c;
         self
@@ -801,6 +830,7 @@ impl TreeServerBuilder {
     /// Below it, a single reply is strictly better: one round trip, no
     /// descriptor. Above it, Zenoh's 64 KiB fragmentation starts to bite —
     /// a dropped fragment discards the whole message — and chunks resume.
+    #[must_use]
     pub fn index_shard_threshold(mut self, bytes: usize) -> Self {
         self.index_shard_threshold = bytes;
         self
@@ -812,6 +842,7 @@ impl TreeServerBuilder {
     /// The bound on how much work one request can commit this server to —
     /// tier 2's counterpart of `max_chunks_per_query`. Checked before any
     /// store access.
+    #[must_use]
     pub fn max_want_list(mut self, n: usize) -> Self {
         self.max_want_list = n.max(1);
         self
@@ -819,6 +850,7 @@ impl TreeServerBuilder {
 
     /// Invoke `cb` with every serve error (default: a `tracing` warn event
     /// with the `tracing` feature, else stderr in debug builds only).
+    #[must_use]
     pub fn on_error(mut self, cb: ErrorCallback) -> Self {
         self.on_error = Some(cb);
         self
@@ -847,13 +879,13 @@ impl TreeServer {
     /// Start building a server. `store_prefix` serves `<prefix>/<algo>/<hash>`;
     /// `tree_prefix` serves `<prefix>/<id>`.
     pub fn builder(
-        session: Arc<zenoh::Session>,
+        session: &zenoh::Session,
         store_prefix: ServePrefix,
         tree_prefix: ServePrefix,
         store: Arc<dyn ContentStore>,
     ) -> TreeServerBuilder {
         TreeServerBuilder {
-            session,
+            session: session.clone(),
             store_prefix,
             tree_prefix,
             store,
@@ -871,7 +903,7 @@ impl TreeServer {
 
     /// Build a server with default configuration.
     pub fn new(
-        session: Arc<zenoh::Session>,
+        session: &zenoh::Session,
         store_prefix: ServePrefix,
         tree_prefix: ServePrefix,
         store: Arc<dyn ContentStore>,
@@ -1026,7 +1058,7 @@ async fn serve_chunk_query(inner: &TreeInner, query: zenoh::query::Query) -> Res
                         store_key(inner.store_prefix.as_str(), HashAlgo::Blake3, &hash),
                         packed,
                     )
-                    .encoding(ENC_CHUNK)
+                    .encoding(&ENC_CHUNK)
                     .await
                     .map_err(BlobError::zenoh)?;
             }
@@ -1116,7 +1148,7 @@ async fn serve_chunk_batch(inner: &TreeInner, query: zenoh::query::Query) -> Res
     for (key, bytes) in packed {
         if query
             .reply(key, bytes)
-            .encoding(ENC_CHUNK)
+            .encoding(&ENC_CHUNK)
             .await
             .map_err(BlobError::zenoh)
             .is_err()
@@ -1145,7 +1177,7 @@ async fn serve_chunk_probe(inner: &TreeInner, query: zenoh::query::Query) -> Res
             crate::store_have_key(inner.store_prefix.as_str(), HashAlgo::Blake3),
             encode(&bits)?,
         )
-        .encoding(crate::wire::ENC_HAVEBITS)
+        .encoding(&crate::wire::ENC_HAVEBITS)
         .await
         .map_err(BlobError::zenoh)?;
     Ok(())
@@ -1176,8 +1208,8 @@ async fn serve_index_query(inner: &TreeInner, query: zenoh::query::Query) -> Res
         // fetches like any other content — resumable, batched, unbounded. The
         // encoding tag is what tells the two apart, which is what tags are for.
         match &reg.sharded {
-            Some(desc) => (encode(desc)?, crate::wire::ENC_INDEX_DESC),
-            None => (encode(&reg.index)?, ENC_INDEX),
+            Some(desc) => (encode(desc)?, &crate::wire::ENC_INDEX_DESC),
+            None => (encode(&reg.index)?, &ENC_INDEX),
         }
     };
     query
@@ -1224,15 +1256,16 @@ async fn serve_tree_probe(inner: &TreeInner, query: &zenoh::query::Query, id: &s
             crate::tree_have_key(inner.tree_prefix.as_str(), id),
             encode(&probe)?,
         )
-        .encoding(crate::wire::ENC_TREEPROBE)
+        .encoding(&crate::wire::ENC_TREEPROBE)
         .await
         .map_err(BlobError::zenoh)?;
     Ok(())
 }
 
 /// Downloads a tree snapshot. Stateless server; persistent client (the store).
+#[derive(Debug)]
 pub struct TreeClient {
-    session: Arc<zenoh::Session>,
+    session: zenoh::Session,
     store_prefix: QueryPrefix,
     tree_prefix: QueryPrefix,
     cfg: TreeClientConfig,
@@ -1276,8 +1309,9 @@ impl Default for TreeClientConfig {
 }
 
 /// Builder for a [`TreeClient`] (see [`TreeClient::builder`]).
+#[derive(Debug)]
 pub struct TreeClientBuilder {
-    session: Arc<zenoh::Session>,
+    session: zenoh::Session,
     store_prefix: QueryPrefix,
     tree_prefix: QueryPrefix,
     cfg: TreeClientConfig,
@@ -1285,6 +1319,7 @@ pub struct TreeClientBuilder {
 
 impl TreeClientBuilder {
     /// Per-query timeout (default 30 s).
+    #[must_use]
     pub fn query_timeout(mut self, t: Duration) -> Self {
         self.cfg.query_timeout = t;
         self
@@ -1292,6 +1327,7 @@ impl TreeClientBuilder {
 
     /// Concurrent chunk fetches (default 16). A serial fetch pays one full
     /// round trip per chunk — tens of thousands of RTTs on a large tree.
+    #[must_use]
     pub fn fetch_concurrency(mut self, n: usize) -> Self {
         self.cfg.fetch_concurrency = n.max(1);
         self
@@ -1299,6 +1335,7 @@ impl TreeClientBuilder {
 
     /// Largest index payload accepted, in bytes (default 64 MiB) — the
     /// allocation bound against a hostile index reply.
+    #[must_use]
     pub fn max_index_bytes(mut self, n: usize) -> Self {
         self.cfg.max_index_bytes = n;
         self
@@ -1315,6 +1352,7 @@ impl TreeClientBuilder {
     /// a remote peer must not choose how much disk or memory we commit. The
     /// check runs against the validated index before the first chunk is
     /// requested.
+    #[must_use]
     pub fn max_tree_bytes(mut self, n: u64) -> Self {
         self.cfg.max_tree_bytes = n;
         self
@@ -1324,6 +1362,7 @@ impl TreeClientBuilder {
     /// (default 4,000,000) — the companion bound to
     /// [`max_tree_bytes`](Self::max_tree_bytes), since a great many *small*
     /// chunks cost queries and bookkeeping rather than bytes.
+    #[must_use]
     pub fn max_tree_chunks(mut self, n: u32) -> Self {
         self.cfg.max_tree_chunks = n;
         self
@@ -1339,6 +1378,7 @@ impl TreeClientBuilder {
     /// entirely by router storages will silently fall back. Watch
     /// [`TransferStats::queries`](crate::TransferStats::queries) to tell the
     /// difference.
+    #[must_use]
     pub fn batch_size(mut self, n: usize) -> Self {
         self.cfg.batch_size = n.min(crate::wire::MAX_WANT_LIST);
         self
@@ -1347,6 +1387,7 @@ impl TreeClientBuilder {
     /// What a snapshot may do to the destination directory
     /// (see [`MaterializePolicy`]; the default refuses both destructive
     /// operations).
+    #[must_use]
     pub fn materialize_policy(mut self, policy: MaterializePolicy) -> Self {
         self.cfg.policy = policy;
         self
@@ -1362,6 +1403,7 @@ impl TreeClientBuilder {
     /// mechanism for this has always existed in `gc`; this is what connects
     /// it. Without a registry, downloads are unprotected (the previous, and
     /// only, behaviour).
+    #[must_use]
     pub fn temp_tags(mut self, temps: Arc<crate::gc::TempTags>) -> Self {
         self.cfg.temps = Some(temps);
         self
@@ -1371,6 +1413,7 @@ impl TreeClientBuilder {
     /// (default [`Priority::DataLow`]); see
     /// [`BlobClientBuilder::priority`](crate::BlobClientBuilder::priority) for
     /// why bulk transfers must yield.
+    #[must_use]
     pub fn priority(mut self, priority: Priority) -> Self {
         self.cfg.priority = priority;
         self
@@ -1390,12 +1433,12 @@ impl TreeClientBuilder {
 impl TreeClient {
     /// Start building a client matching a [`TreeServer`]'s prefixes.
     pub fn builder(
-        session: Arc<zenoh::Session>,
+        session: &zenoh::Session,
         store_prefix: QueryPrefix,
         tree_prefix: QueryPrefix,
     ) -> TreeClientBuilder {
         TreeClientBuilder {
-            session,
+            session: session.clone(),
             store_prefix,
             tree_prefix,
             cfg: TreeClientConfig::default(),
@@ -1404,7 +1447,7 @@ impl TreeClient {
 
     /// Build a client with default configuration.
     pub fn new(
-        session: Arc<zenoh::Session>,
+        session: &zenoh::Session,
         store_prefix: QueryPrefix,
         tree_prefix: QueryPrefix,
     ) -> Self {
@@ -1511,7 +1554,7 @@ impl TreeClient {
         let mut out = Vec::new();
         while let Ok(reply) = replies.recv_async().await {
             let Ok(sample) = reply.result() else { continue };
-            if sample.encoding().to_string() != crate::wire::ENC_TREEPROBE {
+            if !crate::wire::ENC_TREEPROBE.matches(sample.encoding()) {
                 continue;
             }
             let Ok(probe) = decode::<crate::wire::TreeProbe>(&sample.payload().to_bytes()) else {
@@ -1581,12 +1624,12 @@ impl TreeClient {
         let mut rejected: Option<BlobError> = None;
         while let Ok(reply) = replies.recv_async().await {
             let Ok(sample) = reply.result() else { continue };
-            let enc = sample.encoding().to_string();
+            let enc = sample.encoding();
             // A large index arrives as a descriptor pointing at chunks; a
             // small one arrives whole. Assemble the former into the latter and
             // then run the identical validation — the extra hop must not buy
             // an index any weaker guarantees.
-            let payload: Vec<u8> = if enc == crate::wire::ENC_INDEX_DESC {
+            let payload: Vec<u8> = if crate::wire::ENC_INDEX_DESC.matches(enc) {
                 match self.assemble_sharded_index(sample).await {
                     Ok(bytes) => bytes,
                     Err(e) => {
@@ -1594,7 +1637,7 @@ impl TreeClient {
                         continue;
                     }
                 }
-            } else if enc == ENC_INDEX {
+            } else if ENC_INDEX.matches(enc) {
                 sample.payload().to_bytes().into_owned()
             } else {
                 continue;

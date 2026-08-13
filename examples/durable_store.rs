@@ -109,7 +109,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // --- serve both at once -------------------------------------------------
     let server = TreeServer::new(
-        session.clone(),
+        &session,
         store_serve.clone(),
         tree_serve.clone(),
         store.clone(),
@@ -121,7 +121,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // --- a consumer, protected from the sweep below --------------------------
     let dest = tempfile::tempdir()?;
     let client = TreeClient::builder(
-        session.clone(),
+        &session,
         QueryPrefix::from(&store_serve),
         QueryPrefix::from(&tree_serve),
     )

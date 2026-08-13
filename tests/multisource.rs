@@ -22,7 +22,7 @@ async fn two_replicas_serve_one_download_and_report_availability() {
     // Two independent servers, same prefix, same content (replicas).
     let mut handles = Vec::new();
     for _ in 0..2 {
-        let server = BlobServer::new(session.clone(), common::serve(prefix.clone()));
+        let server = BlobServer::new(&session, common::serve(prefix.clone()));
         server
             .register_source(
                 BlobSpec::new("replicated").chunk_size(MIN_CHUNK_SIZE),
@@ -33,7 +33,7 @@ async fn two_replicas_serve_one_download_and_report_availability() {
         handles.push(server.spawn().await.unwrap());
     }
 
-    let client = BlobClient::builder(session.clone(), common::query(prefix))
+    let client = BlobClient::builder(&session, common::query(prefix))
         .query_timeout(Duration::from_secs(5))
         .retry(RetryPolicy {
             max_attempts: 2,
@@ -85,7 +85,7 @@ async fn concurrent_same_destination_single_flights() {
     let prefix = unique_prefix();
     let data = pseudo_random(MIN_CHUNK_SIZE as usize * 6, 32);
 
-    let server = BlobServer::new(session.clone(), common::serve(prefix.clone()));
+    let server = BlobServer::new(&session, common::serve(prefix.clone()));
     server
         .register_source(
             BlobSpec::new("sf").chunk_size(MIN_CHUNK_SIZE),
@@ -96,7 +96,7 @@ async fn concurrent_same_destination_single_flights() {
     let handle = server.spawn().await.unwrap();
 
     let client = Arc::new(
-        BlobClient::builder(session.clone(), common::query(prefix))
+        BlobClient::builder(&session, common::query(prefix))
             .query_timeout(Duration::from_secs(5))
             .build(),
     );

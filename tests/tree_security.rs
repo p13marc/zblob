@@ -23,7 +23,7 @@ fn small_cdc() -> CdcParams {
     }
 }
 
-fn test_client(session: Arc<zenoh::Session>, store_prefix: &str, tree_prefix: &str) -> TreeClient {
+fn test_client(session: &zenoh::Session, store_prefix: &str, tree_prefix: &str) -> TreeClient {
     TreeClient::builder(
         session,
         common::query(store_prefix),
@@ -35,7 +35,7 @@ fn test_client(session: Arc<zenoh::Session>, store_prefix: &str, tree_prefix: &s
 
 /// Serve a hand-crafted (possibly malicious) index + chunk set.
 async fn fake_tree_server(
-    session: Arc<zenoh::Session>,
+    session: &zenoh::Session,
     tree_prefix: String,
     id: &str,
     index_payload: Vec<u8>,
@@ -53,7 +53,7 @@ async fn fake_tree_server(
             if key == index_key {
                 let _ = query
                     .reply(key.clone(), index_payload.clone())
-                    .encoding(wire::ENC_INDEX)
+                    .encoding(&wire::ENC_INDEX)
                     .await;
                 continue;
             }
@@ -65,7 +65,7 @@ async fn fake_tree_server(
                 framed.extend_from_slice(bytes);
                 let _ = query
                     .reply(key.clone(), framed)
-                    .encoding(wire::ENC_CHUNK)
+                    .encoding(&wire::ENC_CHUNK)
                     .await;
             }
         }
@@ -121,7 +121,7 @@ async fn zip_slip_index_rejected_nothing_written() {
             }],
         );
         let srv = fake_tree_server(
-            session.clone(),
+            &session,
             tree_prefix.clone(),
             &id,
             wire::encode(&index).unwrap(),
@@ -132,7 +132,7 @@ async fn zip_slip_index_rejected_nothing_written() {
         // The parent of dest_root must stay untouched.
         let outer = tempfile::tempdir().unwrap();
         let dest = outer.path().join("dest");
-        let client = test_client(session.clone(), &store_prefix, &tree_prefix);
+        let client = test_client(&session, &store_prefix, &tree_prefix);
         let store: Arc<dyn ContentStore> = Arc::new(MemoryStore::new());
         let err = client
             .download_tree(
@@ -174,7 +174,7 @@ async fn escaping_symlink_target_rejected() {
         }],
     );
     let srv = fake_tree_server(
-        session.clone(),
+        &session,
         tree_prefix.clone(),
         "sym",
         wire::encode(&index).unwrap(),
@@ -183,7 +183,7 @@ async fn escaping_symlink_target_rejected() {
     .await;
 
     let dest = tempfile::tempdir().unwrap();
-    let client = test_client(session.clone(), &store_prefix, &tree_prefix);
+    let client = test_client(&session, &store_prefix, &tree_prefix);
     let store: Arc<dyn ContentStore> = Arc::new(MemoryStore::new());
     let err = client
         .download_tree(
@@ -357,7 +357,7 @@ async fn forged_root_hash_rejected() {
     );
     index.root_hash = Hash::of(b"forged root"); // break entries↔root binding
     let srv = fake_tree_server(
-        session.clone(),
+        &session,
         tree_prefix.clone(),
         "forged",
         wire::encode(&index).unwrap(),
@@ -366,7 +366,7 @@ async fn forged_root_hash_rejected() {
     .await;
 
     let dest = tempfile::tempdir().unwrap();
-    let client = test_client(session.clone(), &store_prefix, &tree_prefix);
+    let client = test_client(&session, &store_prefix, &tree_prefix);
     let store: Arc<dyn ContentStore> = Arc::new(MemoryStore::new());
     let err = client
         .download_tree(
@@ -398,7 +398,7 @@ async fn pinned_tree_root_rejects_substitution() {
     let server_store: Arc<dyn ContentStore> = Arc::new(MemoryStore::new());
     let index = build_tree(src.path(), "pinned", &small_cdc(), &*server_store).unwrap();
     let server = TreeServer::new(
-        session.clone(),
+        &session,
         common::serve(store_prefix.clone()),
         common::serve(tree_prefix.clone()),
         server_store,
@@ -407,7 +407,7 @@ async fn pinned_tree_root_rejects_substitution() {
     let handle = server.spawn().await.unwrap();
 
     let dest = tempfile::tempdir().unwrap();
-    let client = test_client(session.clone(), &store_prefix, &tree_prefix);
+    let client = test_client(&session, &store_prefix, &tree_prefix);
     let store: Arc<dyn ContentStore> = Arc::new(MemoryStore::new());
     let err = client
         .download_tree(
@@ -454,7 +454,7 @@ async fn wrong_content_chunk_ignored() {
     // Serve *corrupted* bytes under the good hash's key.
     let chunk_key = zblob::store_key(&store_prefix, HashAlgo::Blake3, &good_hash);
     let srv = fake_tree_server(
-        session.clone(),
+        &session,
         tree_prefix.clone(),
         "wrongchunk",
         wire::encode(&index).unwrap(),
@@ -464,7 +464,7 @@ async fn wrong_content_chunk_ignored() {
 
     let dest = tempfile::tempdir().unwrap();
     let client = TreeClient::builder(
-        session.clone(),
+        &session,
         common::query(store_prefix),
         common::query(tree_prefix),
     )
@@ -518,7 +518,7 @@ async fn existing_directory_is_not_silently_destroyed() {
         }],
     );
     let srv = fake_tree_server(
-        session.clone(),
+        &session,
         tree_prefix.clone(),
         "clobber",
         wire::encode(&index).unwrap(),
@@ -532,7 +532,7 @@ async fn existing_directory_is_not_silently_destroyed() {
     std::fs::write(dest.path().join("Documents/thesis.txt"), b"years of work").unwrap();
 
     let store: Arc<dyn ContentStore> = Arc::new(MemoryStore::new());
-    let err = test_client(session.clone(), &store_prefix, &tree_prefix)
+    let err = test_client(&session, &store_prefix, &tree_prefix)
         .download_tree(
             &DownloadRequest::new("clobber"),
             dest.path(),
@@ -556,7 +556,7 @@ async fn existing_directory_is_not_silently_destroyed() {
     std::fs::create_dir(dest2.path().join("Documents")).unwrap();
     std::fs::write(dest2.path().join("Documents/thesis.txt"), b"years of work").unwrap();
     let permissive = TreeClient::builder(
-        session.clone(),
+        &session,
         common::query(store_prefix),
         common::query(tree_prefix),
     )
@@ -614,7 +614,7 @@ async fn setid_bits_are_masked_unless_requested() {
         }],
     );
     let srv = fake_tree_server(
-        session.clone(),
+        &session,
         tree_prefix.clone(),
         "setuid",
         wire::encode(&index).unwrap(),
@@ -624,7 +624,7 @@ async fn setid_bits_are_masked_unless_requested() {
 
     let dest = tempfile::tempdir().unwrap();
     let store: Arc<dyn ContentStore> = Arc::new(MemoryStore::new());
-    test_client(session.clone(), &store_prefix, &tree_prefix)
+    test_client(&session, &store_prefix, &tree_prefix)
         .download_tree(
             &DownloadRequest::new("setuid"),
             dest.path(),
@@ -646,7 +646,7 @@ async fn setid_bits_are_masked_unless_requested() {
     let dest2 = tempfile::tempdir().unwrap();
     let store2: Arc<dyn ContentStore> = Arc::new(MemoryStore::new());
     TreeClient::builder(
-        session.clone(),
+        &session,
         common::query(store_prefix),
         common::query(tree_prefix),
     )
@@ -724,7 +724,7 @@ async fn preexisting_symlink_cannot_be_traversed() {
         ],
     );
     let srv_a = fake_tree_server(
-        session.clone(),
+        &session,
         tree_prefix.clone(),
         "hl-escape",
         wire::encode(&hardlink_index).unwrap(),
@@ -732,7 +732,7 @@ async fn preexisting_symlink_cannot_be_traversed() {
     )
     .await;
 
-    let client = test_client(session.clone(), &store_prefix, &tree_prefix);
+    let client = test_client(&session, &store_prefix, &tree_prefix);
     let store: Arc<dyn ContentStore> = Arc::new(MemoryStore::new());
 
     for (id, srv) in [("hl-escape", Some(srv_a)), ("dir-escape", None)] {
@@ -740,7 +740,7 @@ async fn preexisting_symlink_cannot_be_traversed() {
             Some(s) => s,
             None => {
                 fake_tree_server(
-                    session.clone(),
+                    &session,
                     tree_prefix.clone(),
                     "dir-escape",
                     wire::encode(&dir_index).unwrap(),
@@ -805,7 +805,7 @@ async fn an_over_long_chunk_reply_is_skipped_not_fatal() {
     // The hostile holder serves the index and a megabytes-long body under the
     // five-byte chunk's key…
     let hostile = fake_tree_server(
-        session.clone(),
+        &session,
         tree_prefix.clone(),
         "bloat",
         wire::encode(&index).unwrap(),
@@ -814,7 +814,7 @@ async fn an_over_long_chunk_reply_is_skipped_not_fatal() {
     .await;
     // …while an honest one serves the real bytes.
     let honest = fake_tree_server(
-        session.clone(),
+        &session,
         tree_prefix.clone(),
         "bloat",
         wire::encode(&index).unwrap(),
@@ -824,7 +824,7 @@ async fn an_over_long_chunk_reply_is_skipped_not_fatal() {
 
     let dest = tempfile::tempdir().unwrap();
     let store: Arc<dyn ContentStore> = Arc::new(MemoryStore::new());
-    test_client(session.clone(), &store_prefix, &tree_prefix)
+    test_client(&session, &store_prefix, &tree_prefix)
         .download_tree(
             &DownloadRequest::new("bloat"),
             dest.path(),
@@ -925,7 +925,7 @@ async fn a_corrupt_store_cannot_materialize_wrong_bytes() {
     let index = build_tree(src.path(), "rot", &small_cdc(), &*server_store).unwrap();
     let victim = index.needed_chunks()[0];
     let server = TreeServer::new(
-        session.clone(),
+        &session,
         common::serve(store_prefix.clone()),
         common::serve(tree_prefix.clone()),
         server_store,
@@ -933,7 +933,7 @@ async fn a_corrupt_store_cannot_materialize_wrong_bytes() {
     server.register(index.clone()).await.unwrap();
     let handle = server.spawn().await.unwrap();
 
-    let client = test_client(session.clone(), &store_prefix, &tree_prefix);
+    let client = test_client(&session, &store_prefix, &tree_prefix);
     let dest = tempfile::tempdir().unwrap();
     let lying: Arc<dyn ContentStore> = Arc::new(LyingStore {
         inner: MemoryStore::new(),

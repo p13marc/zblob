@@ -51,7 +51,7 @@ pub async fn publish_chunk(
             store_key(store_prefix.as_str(), HashAlgo::Blake3, hash),
             pack(bytes, compression)?,
         )
-        .encoding(ENC_CHUNK)
+        .encoding(&ENC_CHUNK)
         // Publications default to `Drop` (unlike queries, which default to
         // `Block` and lend it to their replies — see the crate docs, fact 1).
         // A dropped chunk here is invisible: the settle phase samples, so the
@@ -153,7 +153,7 @@ pub async fn publish_index(
     let payload = encode(index)?;
     session
         .put(tree_key(tree_prefix.as_str(), &index.id), payload)
-        .encoding(ENC_INDEX)
+        .encoding(&ENC_INDEX)
         // See publish_chunk: publications default to Drop, and losing the
         // index loses the snapshot.
         .congestion_control(CongestionControl::Block)

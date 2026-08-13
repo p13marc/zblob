@@ -202,8 +202,9 @@ fn origin_of(reply_key: &str, id: &str, endpoint: &str) -> Option<String> {
 }
 
 /// Downloads blobs served by a [`crate::BlobServer`] under the same key prefix.
+#[derive(Debug)]
 pub struct BlobClient {
-    session: Arc<zenoh::Session>,
+    session: zenoh::Session,
     prefix: QueryPrefix,
     cfg: ClientConfig,
     // Single-flight guard: destinations with a download in progress *through
@@ -213,8 +214,9 @@ pub struct BlobClient {
 }
 
 /// Builder for a [`BlobClient`] (see [`BlobClient::builder`]).
+#[derive(Debug)]
 pub struct BlobClientBuilder {
-    session: Arc<zenoh::Session>,
+    session: zenoh::Session,
     prefix: QueryPrefix,
     cfg: ClientConfig,
 }
@@ -223,12 +225,14 @@ impl BlobClientBuilder {
     /// Per-query timeout (default 30 s). Transfers larger than one query's
     /// chunk budget span multiple queries, so this bounds *stall* time, not
     /// total transfer time.
+    #[must_use]
     pub fn query_timeout(mut self, t: Duration) -> Self {
         self.cfg.query_timeout = t;
         self
     }
 
     /// Retry/backoff policy (default: 5 attempts, 250 ms base, 10 s cap).
+    #[must_use]
     pub fn retry(mut self, retry: RetryPolicy) -> Self {
         self.cfg.retry = retry;
         self
@@ -236,6 +240,7 @@ impl BlobClientBuilder {
 
     /// Max chunks requested per query (default 512; must not exceed the
     /// server's own cap or queries are rejected).
+    #[must_use]
     pub fn max_chunks_per_query(mut self, n: u32) -> Self {
         self.cfg.max_chunks_per_query = n.max(1);
         self
@@ -243,12 +248,14 @@ impl BlobClientBuilder {
 
     /// Upper bound on `total_len` this client will accept from a manifest
     /// (default 1 TiB) — the allocation/preallocation defense.
+    #[must_use]
     pub fn max_blob_size(mut self, bytes: u64) -> Self {
         self.cfg.max_blob_size = bytes;
         self
     }
 
     /// Overwrite policy for the destination (default [`Overwrite::Refuse`]).
+    #[must_use]
     pub fn overwrite(mut self, ow: Overwrite) -> Self {
         self.cfg.overwrite = ow;
         self
@@ -263,6 +270,7 @@ impl BlobClientBuilder {
     /// default deliberately sits below `Priority::Data` so a large transfer
     /// cannot starve an alert on a constrained link. Raise it only if you
     /// know the link is not shared.
+    #[must_use]
     pub fn priority(mut self, priority: Priority) -> Self {
         self.cfg.priority = priority;
         self
@@ -281,16 +289,16 @@ impl BlobClientBuilder {
 
 impl BlobClient {
     /// Start building a client for blobs under `key_prefix`.
-    pub fn builder(session: Arc<zenoh::Session>, key_prefix: QueryPrefix) -> BlobClientBuilder {
+    pub fn builder(session: &zenoh::Session, key_prefix: QueryPrefix) -> BlobClientBuilder {
         BlobClientBuilder {
-            session,
+            session: session.clone(),
             prefix: key_prefix,
             cfg: ClientConfig::default(),
         }
     }
 
     /// Build a client with default configuration (see [`BlobClient::builder`]).
-    pub fn new(session: Arc<zenoh::Session>, key_prefix: QueryPrefix) -> Self {
+    pub fn new(session: &zenoh::Session, key_prefix: QueryPrefix) -> Self {
         Self::builder(session, key_prefix).build()
     }
 
@@ -333,7 +341,7 @@ impl BlobClient {
                 break;
             }
             let Ok(sample) = reply.result() else { continue };
-            if sample.encoding().to_string() != ENC_MANIFEST {
+            if !ENC_MANIFEST.matches(sample.encoding()) {
                 continue;
             }
             // The reply key names the origin: it is the prefix the *server*
@@ -376,7 +384,7 @@ impl BlobClient {
             .map_err(BlobError::zenoh)?;
         while let Ok(reply) = replies.recv_async().await {
             let Ok(sample) = reply.result() else { continue };
-            if sample.encoding().to_string() != ENC_AVAIL {
+            if !ENC_AVAIL.matches(sample.encoding()) {
                 continue;
             }
             let Some(origin) = origin_of(sample.key_expr().as_str(), id, "have") else {
@@ -422,7 +430,7 @@ impl BlobClient {
         let mut rejected: Option<BlobError> = None;
         while let Ok(reply) = replies.recv_async().await {
             let Ok(sample) = reply.result() else { continue };
-            if sample.encoding().to_string() != ENC_MANIFEST {
+            if !ENC_MANIFEST.matches(sample.encoding()) {
                 continue; // stale/foreign responder; keep listening.
             }
             let verdict = decode::<Manifest>(&sample.payload().to_bytes())
@@ -683,7 +691,7 @@ impl BlobClient {
                 break;
             }
             let Ok(sample) = reply.result() else { continue };
-            if sample.encoding().to_string() != ENC_AVAIL {
+            if !ENC_AVAIL.matches(sample.encoding()) {
                 continue;
             }
             // A malformed reply from one responder must not hide the others.
@@ -786,7 +794,7 @@ impl BlobClient {
         let mut refusal: Option<String> = None;
         while let Ok(reply) = replies.recv_async().await {
             match reply.result() {
-                Ok(sample) if sample.encoding().to_string() == ENC_PUSH => {
+                Ok(sample) if ENC_PUSH.matches(sample.encoding()) => {
                     match decode::<Vec<(u32, u32)>>(&sample.payload().to_bytes()) {
                         Ok(ranges) => {
                             wanted = Some(ranges);
@@ -903,7 +911,7 @@ impl BlobClient {
                     };
                     let Ok(reply) = recv else { break };
                     match reply.result() {
-                        Ok(sample) if sample.encoding().to_string() == ENC_PUSH => {
+                        Ok(sample) if ENC_PUSH.matches(sample.encoding()) => {
                             match decode::<u32>(&sample.payload().to_bytes()) {
                                 Ok(_remaining) => {
                                     acked = true;
@@ -1186,7 +1194,7 @@ impl BlobClient {
                 };
                 let Ok(reply) = recv else { break };
                 let Ok(sample) = reply.result() else { continue };
-                if sample.encoding().to_string() != ENC_SLICE {
+                if !ENC_SLICE.matches(sample.encoding()) {
                     continue;
                 }
                 let Some(index) = parse_slice_index(sample.key_expr().as_str()) else {
@@ -1380,7 +1388,7 @@ impl BlobClient {
                     };
                     while let Ok(reply) = replies.recv_async().await {
                         let Ok(sample) = reply.result() else { continue };
-                        if sample.encoding().to_string() != ENC_SLICE {
+                        if !ENC_SLICE.matches(sample.encoding()) {
                             continue;
                         }
                         let Some(index) = parse_slice_index(sample.key_expr().as_str()) else {
