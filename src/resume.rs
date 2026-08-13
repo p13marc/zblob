@@ -24,7 +24,7 @@ use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
-use crate::error::{BlobError, Result};
+use crate::error::Result;
 use crate::hash::Hash;
 use crate::manifest::Manifest;
 use crate::paths::fsync_dir;
@@ -169,8 +169,7 @@ impl ResumeState {
             tmp.persist(&dst).map_err(|e| e.error)?;
             fsync_dir(dir)
         })
-        .await
-        .map_err(|e| BlobError::Protocol(format!("sidecar save task: {e}")))??;
+        .await??;
         Ok(())
     }
 

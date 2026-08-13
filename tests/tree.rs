@@ -278,7 +278,9 @@ async fn resume_from_prepopulated_store() {
     let client_store: Arc<dyn ContentStore> = Arc::new(DirStore::open(store_dir.path()).unwrap());
     let needed = index.needed_chunks();
     for h in needed.iter().take(needed.len() / 2) {
-        client_store.put(h, &server_store.get(h).unwrap()).unwrap();
+        client_store
+            .put(h, &server_store.get(h).unwrap().unwrap())
+            .unwrap();
     }
     assert!(client_store.hashes().unwrap().len() < total);
 

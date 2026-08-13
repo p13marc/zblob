@@ -91,8 +91,11 @@ fn every_store_satisfies_the_contract() {
             let label = format!("{name}/{}B", payload.len());
 
             // 1. Absent before put.
-            assert!(!store.has(&h), "{label}: has() true before put");
-            assert!(store.get(&h).is_none(), "{label}: get() Some before put");
+            assert!(!store.has(&h).unwrap(), "{label}: has() true before put");
+            assert!(
+                store.get(&h).unwrap().is_none(),
+                "{label}: get() Some before put"
+            );
             assert!(
                 !store.remove(&h).unwrap(),
                 "{label}: remove() reported an absent chunk as removed"
@@ -100,16 +103,17 @@ fn every_store_satisfies_the_contract() {
 
             // 2. put → has ⇒ get, and get returns exactly what was put.
             store.put(&h, &payload).unwrap();
-            assert!(store.has(&h), "{label}: has() false after put");
+            assert!(store.has(&h).unwrap(), "{label}: has() false after put");
             let got = store
                 .get(&h)
+                .unwrap()
                 .unwrap_or_else(|| panic!("{label}: has()=true but get()=None"));
             assert_eq!(got, payload, "{label}: get() returned different bytes");
 
             // 3. put is idempotent (re-publishing a chunk must be a no-op).
             store.put(&h, &payload).unwrap();
             assert_eq!(
-                store.get(&h).unwrap(),
+                store.get(&h).unwrap().unwrap(),
                 payload,
                 "{label}: re-put changed it"
             );
@@ -124,9 +128,12 @@ fn every_store_satisfies_the_contract() {
 
             // 5. remove → absent again, and reports what it did.
             assert!(store.remove(&h).unwrap(), "{label}: remove() said absent");
-            assert!(!store.has(&h), "{label}: still present after remove");
             assert!(
-                store.get(&h).is_none(),
+                !store.has(&h).unwrap(),
+                "{label}: still present after remove"
+            );
+            assert!(
+                store.get(&h).unwrap().is_none(),
                 "{label}: still gettable after remove"
             );
             assert!(
@@ -176,21 +183,24 @@ fn concurrent_puts_are_safe() {
         });
 
         assert_eq!(
-            store.get(&shared_hash).unwrap(),
+            store.get(&shared_hash).unwrap().unwrap(),
             shared,
             "{name}: concurrent puts of one chunk corrupted it"
         );
         for t in 0..8u64 {
             let unique = common::pseudo_random(50_000, 100 + t);
             assert_eq!(
-                store.get(&Hash::of(&unique)).unwrap(),
+                store.get(&Hash::of(&unique)).unwrap().unwrap(),
                 unique,
                 "{name}: concurrent distinct puts lost data"
             );
         }
         // No temp-file debris counted as content.
         for h in store.hashes().unwrap() {
-            assert!(store.get(&h).is_some(), "{name}: hashes() listed a phantom");
+            assert!(
+                store.get(&h).unwrap().is_some(),
+                "{name}: hashes() listed a phantom"
+            );
         }
     }
 }
@@ -210,7 +220,7 @@ fn a_store_never_claims_what_it_cannot_decode() {
         .unwrap()
         .with_encryption(zblob::StoreKey::new([1u8; 32]));
     sealed.put(&h, &payload).unwrap();
-    assert!(sealed.has(&h) && sealed.get(&h).unwrap() == payload);
+    assert!(sealed.has(&h).unwrap() && sealed.get(&h).unwrap().unwrap() == payload);
 
     // …reopened without the key, or with the wrong one: `has` must agree with
     // `get`, and the data must survive untouched for the rightful key.
@@ -221,17 +231,17 @@ fn a_store_never_claims_what_it_cannot_decode() {
             .with_encryption(zblob::StoreKey::new([2u8; 32])),
     ] {
         assert_eq!(
-            other.has(&h),
-            other.get(&h).is_some(),
+            other.has(&h).unwrap(),
+            other.get(&h).unwrap().is_some(),
             "has()/get() disagree for an undecodable chunk"
         );
-        assert!(!other.has(&h), "claimed a chunk it cannot decode");
+        assert!(!other.has(&h).unwrap(), "claimed a chunk it cannot decode");
     }
     let reopened = DirStore::open(dir.path())
         .unwrap()
         .with_encryption(zblob::StoreKey::new([1u8; 32]));
     assert_eq!(
-        reopened.get(&h).unwrap(),
+        reopened.get(&h).unwrap().unwrap(),
         payload,
         "a keyless reader destroyed sealed data"
     );
@@ -318,7 +328,7 @@ fn returned_bytes_always_match_their_address() {
             store.put(&h, &payload).unwrap();
         }
         for h in store.hashes().unwrap() {
-            if let Some(bytes) = store.get(&h) {
+            if let Some(bytes) = store.get(&h).unwrap() {
                 assert_eq!(
                     Hash::of(&bytes),
                     h,

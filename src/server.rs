@@ -418,8 +418,7 @@ impl BlobServer {
                 };
                 Ok((store, total_len))
             })
-            .await
-            .map_err(|e| BlobError::Protocol(format!("register task: {e}")))??;
+            .await??;
         self.finish_register(
             spec,
             Arc::new(FileBlobSource::new(path)),
@@ -451,8 +450,7 @@ impl BlobServer {
                 )?;
                 Ok((OutboardStore::Mem(ob), total_len))
             })
-            .await
-            .map_err(|e| BlobError::Protocol(format!("register task: {e}")))??;
+            .await??;
         self.finish_register(spec, source, outboard, total_len)
             .await
     }
@@ -733,9 +731,7 @@ async fn serve_one(inner: &Inner, query: zenoh::query::Query) -> Result<()> {
     // streamed reply-by-reply.
     let mut reader = {
         let source = source.clone();
-        tokio::task::spawn_blocking(move || source.open())
-            .await
-            .map_err(|e| BlobError::Protocol(format!("open task: {e}")))??
+        tokio::task::spawn_blocking(move || source.open()).await??
     };
     for range in ranges {
         for index in range {
@@ -748,8 +744,7 @@ async fn serve_one(inner: &Inner, query: zenoh::query::Query) -> Result<()> {
                     (reader, slice)
                 },
             )
-            .await
-            .map_err(|e| BlobError::Protocol(format!("encode task: {e}")))?;
+            .await?;
             reader = r;
             let slice = slice?;
             // A reply error means the client dropped the GET (query finalized):
@@ -1092,8 +1087,7 @@ async fn push_slice_inner(
             }
             f.sync_data()
         })
-        .await
-        .map_err(|e| BlobError::Protocol(format!("push write task: {e}")))??;
+        .await??;
     }
 
     // Mark + batched sidecar persistence (every 16 slices or at completion;
@@ -1172,8 +1166,7 @@ async fn finalize_push(inner: &Inner, push: &PushConfig, id: &str) -> Result<()>
             };
             Ok((store, total_len))
         })
-        .await
-        .map_err(|e| BlobError::Protocol(format!("finalize task: {e}")))??;
+        .await??;
 
     // Every slice was verified against the offered root, so this cannot fail
     // unless the spool was tampered with on disk between write and finalize.

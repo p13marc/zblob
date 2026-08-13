@@ -95,7 +95,7 @@ async fn compressed_wire_and_store_roundtrip() {
             .metadata()
             .unwrap()
             .len();
-        let raw = client_store.get(&h).unwrap().len() as u64;
+        let raw = client_store.get(&h).unwrap().unwrap().len() as u64;
         if on_disk < raw {
             framed_smaller = true;
         }

@@ -151,7 +151,7 @@ async fn a_partial_holder_shortens_the_round_instead_of_failing_it() {
         let part: Arc<dyn ContentStore> = Arc::new(MemoryStore::new());
         for (i, h) in all.iter().enumerate() {
             if i % 2 == half {
-                part.put(h, &full.get(h).unwrap()).unwrap();
+                part.put(h, &full.get(h).unwrap().unwrap()).unwrap();
             }
         }
         let srv = TreeServer::new(
@@ -214,7 +214,7 @@ async fn a_tier2_probe_answers_possession_without_shipping_anything() {
     // host-a holds the first half; host-b holds nothing at all.
     let a_store: Arc<dyn ContentStore> = Arc::new(MemoryStore::new());
     for h in all.iter().take(all.len() / 2) {
-        a_store.put(h, &full.get(h).unwrap()).unwrap();
+        a_store.put(h, &full.get(h).unwrap().unwrap()).unwrap();
     }
     let mut handles = Vec::new();
     for (host, store) in [
@@ -292,7 +292,7 @@ async fn a_snapshot_probe_reports_partial_possession() {
     // a third of its chunks.
     let partial: Arc<dyn ContentStore> = Arc::new(MemoryStore::new());
     for h in all.iter().take(all.len() / 3) {
-        partial.put(h, &full.get(h).unwrap()).unwrap();
+        partial.put(h, &full.get(h).unwrap().unwrap()).unwrap();
     }
     let mut handles = Vec::new();
     for (host, store) in [("host-a", full.clone()), ("host-b", partial)] {

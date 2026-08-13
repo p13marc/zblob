@@ -18,6 +18,7 @@
 //! a sample of chunk keys until they answer (or `settle` expires), so "publish
 //! returned Ok" means "a client can fetch this now".
 
+use std::sync::Arc;
 use std::time::Duration;
 
 use zenoh::qos::{CongestionControl, Priority};
@@ -73,7 +74,7 @@ pub async fn publish_snapshot_chunks(
     session: &zenoh::Session,
     store_prefix: &ServePrefix,
     index: &TreeIndex,
-    store: &dyn ContentStore,
+    store: &Arc<dyn ContentStore>,
     compression: ChunkCompression,
 ) -> Result<u32> {
     publish_hashes(
@@ -96,26 +97,47 @@ pub async fn publish_snapshot_chunks(
 pub async fn publish_store(
     session: &zenoh::Session,
     store_prefix: &ServePrefix,
-    store: &dyn ContentStore,
+    store: &Arc<dyn ContentStore>,
     compression: ChunkCompression,
 ) -> Result<u32> {
-    publish_hashes(session, store_prefix, &store.hashes()?, store, compression).await
+    // Enumerating a DirStore is a recursive `read_dir`; it does not belong on
+    // an async thread any more than the reads that follow it do.
+    let enumerate = store.clone();
+    let hashes = tokio::task::spawn_blocking(move || enumerate.hashes())
+        .await
+        .map_err(BlobError::from)??;
+    publish_hashes(session, store_prefix, &hashes, store, compression).await
 }
+
+/// How many chunks are read out of the store per blocking dispatch.
+///
+/// The store is synchronous, so reading it from an `async fn` blocks the
+/// reactor — which is what this used to do, once per chunk, for a whole
+/// snapshot. Reading in batches keeps that off the async threads while
+/// bounding how much sits in memory at once.
+const PUBLISH_READ_BATCH: usize = 32;
 
 async fn publish_hashes(
     session: &zenoh::Session,
     store_prefix: &ServePrefix,
     hashes: &[Hash],
-    store: &dyn ContentStore,
+    store: &Arc<dyn ContentStore>,
     compression: ChunkCompression,
 ) -> Result<u32> {
     let mut published = 0u32;
-    for hash in hashes {
-        let bytes = store
-            .get(hash)
-            .ok_or_else(|| BlobError::NotFound(hash.to_string()))?;
-        publish_chunk(session, store_prefix, hash, &bytes, compression).await?;
-        published += 1;
+    for group in hashes.chunks(PUBLISH_READ_BATCH) {
+        let store = store.clone();
+        let wanted = group.to_vec();
+        // One dispatch per batch, and `get_many` so a transactional store
+        // sees one visit rather than `PUBLISH_READ_BATCH` of them.
+        let bytes = tokio::task::spawn_blocking(move || store.get_many(&wanted))
+            .await
+            .map_err(BlobError::from)??;
+        for (hash, maybe) in group.iter().zip(bytes) {
+            let bytes = maybe.ok_or_else(|| BlobError::NotFound(hash.to_string()))?;
+            publish_chunk(session, store_prefix, hash, &bytes, compression).await?;
+            published += 1;
+        }
     }
     Ok(published)
 }
@@ -182,7 +204,7 @@ pub async fn publish_snapshot(
     store_prefix: &ServePrefix,
     tree_prefix: &ServePrefix,
     index: &TreeIndex,
-    store: &dyn ContentStore,
+    store: &Arc<dyn ContentStore>,
     compression: ChunkCompression,
     coverage: SettleCoverage,
     settle: Duration,

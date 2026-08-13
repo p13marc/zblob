@@ -15,20 +15,126 @@ use crate::hash::Hash;
 use crate::paths::fsync_dir;
 
 /// A local store of content-addressed chunks.
+///
+/// # Absence and failure are different answers
+///
+/// `has` and `get` return `io::Result`, and the distinction is load-bearing.
+/// "This chunk is not here" is a normal answer that makes the caller fetch it
+/// over the network; "I could not tell you" is a failure that must stop the
+/// transfer. Conflating them — returning `bool`/`Option` and mapping an
+/// `EIO` to "absent", as this trait used to — produces a download that
+/// re-fetches a chunk, stores it into the same broken store, finds it missing
+/// again, and loops forever with nothing in any log to explain it.
+///
+/// Reporting *corruption* as absence is still correct and still expected: a
+/// chunk that fails its own integrity check should be removed and reported
+/// `Ok(None)`, so the caller re-fetches and the store heals. That is a policy
+/// choice, and it is now spelled differently from an accident.
+///
+/// # Blocking is expected
+///
+/// Every method is synchronous, because a store is a local disk or database
+/// call. The crate always invokes them from `spawn_blocking`, and prefers the
+/// `*_many` methods so that one dispatch covers a whole round rather than one
+/// chunk — which is also the shape a transactional store wants.
 pub trait ContentStore: Send + Sync {
-    /// Whether chunk `hash` is present.
-    fn has(&self, hash: &Hash) -> bool;
-    /// Fetch chunk `hash`, if present.
-    fn get(&self, hash: &Hash) -> Option<Vec<u8>>;
+    /// Whether chunk `hash` is present and readable.
+    fn has(&self, hash: &Hash) -> std::io::Result<bool>;
+    /// Fetch chunk `hash`; `Ok(None)` if it is absent (or was removed as
+    /// corrupt), `Err` if the store could not answer.
+    fn get(&self, hash: &Hash) -> std::io::Result<Option<Vec<u8>>>;
     /// Store chunk `hash` → `bytes` (idempotent).
     fn put(&self, hash: &Hash, bytes: &[u8]) -> std::io::Result<()>;
-    /// Every chunk hash currently in the store (a snapshot; used to publish a
-    /// store into a Zenoh storage and by garbage collection).
-    fn hashes(&self) -> std::io::Result<Vec<Hash>>;
     /// Remove chunk `hash`; returns whether it was present. Content-addressed
     /// removal is only safe from [`crate::gc::sweep`] or an equivalent
     /// liveness analysis — a chunk may be shared by many files and snapshots.
     fn remove(&self, hash: &Hash) -> std::io::Result<bool>;
+
+    /// Visit every chunk hash currently in the store.
+    ///
+    /// The streaming form is the one to implement: [`hashes`](Self::hashes)
+    /// materializes the entire keyspace, which for a fleet-scale store is
+    /// 32 bytes times every chunk it holds, held in memory at once.
+    fn for_each_hash(&self, f: &mut dyn FnMut(Hash) -> std::io::Result<()>) -> std::io::Result<()>;
+
+    /// Presence of many chunks in one call.
+    ///
+    /// The default loops, which is right for a store where a lookup is a
+    /// syscall. Override it wherever a lookup is a *transaction* — one visit
+    /// for a whole round instead of one per chunk is the difference that
+    /// motivated this method.
+    fn has_many(&self, hashes: &[Hash]) -> std::io::Result<Vec<bool>> {
+        hashes.iter().map(|h| self.has(h)).collect()
+    }
+
+    /// Fetch many chunks in one call; `None` per absent entry, positionally.
+    fn get_many(&self, hashes: &[Hash]) -> std::io::Result<Vec<Option<Vec<u8>>>> {
+        hashes.iter().map(|h| self.get(h)).collect()
+    }
+
+    /// Store many chunks in one call.
+    ///
+    /// Not atomic unless an implementation makes it so: on error, some may
+    /// have landed. That is safe here because chunks are content-addressed —
+    /// a partial write is a smaller store, never a wrong one.
+    fn put_many(&self, chunks: &[(Hash, &[u8])]) -> std::io::Result<()> {
+        for (hash, bytes) in chunks {
+            self.put(hash, bytes)?;
+        }
+        Ok(())
+    }
+
+    /// Every chunk hash currently in the store, collected.
+    ///
+    /// Prefer [`for_each_hash`](Self::for_each_hash) — this exists for callers
+    /// that genuinely need the whole set at once (a sweep's mark phase).
+    fn hashes(&self) -> std::io::Result<Vec<Hash>> {
+        let mut out = Vec::new();
+        self.for_each_hash(&mut |h| {
+            out.push(h);
+            Ok(())
+        })?;
+        Ok(out)
+    }
+}
+
+/// Sharing a store is transparent: `Arc<S>` is a `ContentStore` wherever `S`
+/// is, so a caller holding an `Arc<dyn ContentStore>` can pass it to anything
+/// taking `&dyn ContentStore` without reaching through it.
+///
+/// The crate's own signatures are split between the two shapes — a server
+/// keeps an `Arc`, a builder borrows — and without this, callers pay for that
+/// distinction with `&*` at the boundary.
+impl<T: ContentStore + ?Sized> ContentStore for std::sync::Arc<T> {
+    fn has(&self, hash: &Hash) -> std::io::Result<bool> {
+        (**self).has(hash)
+    }
+    fn get(&self, hash: &Hash) -> std::io::Result<Option<Vec<u8>>> {
+        (**self).get(hash)
+    }
+    fn put(&self, hash: &Hash, bytes: &[u8]) -> std::io::Result<()> {
+        (**self).put(hash, bytes)
+    }
+    fn remove(&self, hash: &Hash) -> std::io::Result<bool> {
+        (**self).remove(hash)
+    }
+    fn for_each_hash(&self, f: &mut dyn FnMut(Hash) -> std::io::Result<()>) -> std::io::Result<()> {
+        (**self).for_each_hash(f)
+    }
+    // Forward the batch methods too, or an `Arc` would silently fall back to
+    // the looping defaults and undo the batching the inner store implements.
+    fn has_many(&self, hashes: &[Hash]) -> std::io::Result<Vec<bool>> {
+        (**self).has_many(hashes)
+    }
+    fn get_many(&self, hashes: &[Hash]) -> std::io::Result<Vec<Option<Vec<u8>>>> {
+        (**self).get_many(hashes)
+    }
+    fn put_many(&self, chunks: &[(Hash, &[u8])]) -> std::io::Result<()> {
+        (**self).put_many(chunks)
+    }
+    fn hashes(&self) -> std::io::Result<Vec<Hash>> {
+        (**self).hashes()
+    }
 }
 
 /// An in-memory [`ContentStore`] (tests, ephemeral caches).
@@ -66,21 +172,31 @@ impl MemoryStore {
 }
 
 impl ContentStore for MemoryStore {
-    fn has(&self, hash: &Hash) -> bool {
-        self.map().contains_key(hash)
+    fn has(&self, hash: &Hash) -> std::io::Result<bool> {
+        Ok(self.map().contains_key(hash))
     }
-    fn get(&self, hash: &Hash) -> Option<Vec<u8>> {
-        self.map().get(hash).cloned()
+    fn get(&self, hash: &Hash) -> std::io::Result<Option<Vec<u8>>> {
+        Ok(self.map().get(hash).cloned())
     }
     fn put(&self, hash: &Hash, bytes: &[u8]) -> std::io::Result<()> {
         self.map().insert(*hash, bytes.to_vec());
         Ok(())
     }
-    fn hashes(&self) -> std::io::Result<Vec<Hash>> {
-        Ok(self.map().keys().copied().collect())
-    }
     fn remove(&self, hash: &Hash) -> std::io::Result<bool> {
         Ok(self.map().remove(hash).is_some())
+    }
+    fn for_each_hash(&self, f: &mut dyn FnMut(Hash) -> std::io::Result<()>) -> std::io::Result<()> {
+        // Collect under the lock, then visit: `f` is caller code and must not
+        // run while the map is held, or a store operation inside it deadlocks.
+        let keys: Vec<Hash> = self.map().keys().copied().collect();
+        keys.into_iter().try_for_each(f)
+    }
+    fn put_many(&self, chunks: &[(Hash, &[u8])]) -> std::io::Result<()> {
+        let mut map = self.map();
+        for (hash, bytes) in chunks {
+            map.insert(*hash, bytes.to_vec());
+        }
+        Ok(())
     }
 }
 
@@ -202,7 +318,7 @@ impl DirStore {
 }
 
 impl ContentStore for DirStore {
-    fn has(&self, hash: &Hash) -> bool {
+    fn has(&self, hash: &Hash) -> std::io::Result<bool> {
         // Presence must mean "get() will hand these bytes back". The download
         // path calls `has` to decide *not* to fetch, so a chunk this store
         // cannot decode — missing cargo feature, missing key, *wrong* key —
@@ -212,45 +328,60 @@ impl ContentStore for DirStore {
         // (a wrong AEAD key is indistinguishable from tampering without it).
         // Content-level rot remains verify_on_read/scrub territory; `has`
         // never deletes.
+        //
+        // A *missing file* is `Ok(false)`. Any other I/O failure is `Err`:
+        // reporting `EIO` or `EACCES` as "absent" makes the caller re-fetch
+        // into a store that will never accept the bytes, forever.
         use std::io::Read;
         let path = self.path(hash);
-        let Ok(mut f) = std::fs::File::open(&path) else {
-            return false;
+        let mut f = match std::fs::File::open(&path) {
+            Ok(f) => f,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+            Err(e) => return Err(e),
         };
         let mut tag = [0u8; 1];
-        if f.read_exact(&mut tag).is_err() {
+        match f.read_exact(&mut tag) {
+            Ok(()) => {}
             // Zero-length file: not even a raw frame; re-fetch it.
-            return false;
+            Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => return Ok(false),
+            Err(e) => return Err(e),
         }
         if tag[0] == TAG_RAW {
-            return true;
+            return Ok(true);
         }
         drop(f);
-        let Ok(packed) = std::fs::read(&path) else {
-            return false;
+        let packed = match std::fs::read(&path) {
+            Ok(p) => p,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+            Err(e) => return Err(e),
         };
-        self.decode_at_rest(&packed, hash, false).is_ok()
+        Ok(self.decode_at_rest(&packed, hash, false).is_ok())
     }
 
-    fn get(&self, hash: &Hash) -> Option<Vec<u8>> {
+    fn get(&self, hash: &Hash) -> std::io::Result<Option<Vec<u8>>> {
         let path = self.path(hash);
-        let packed = std::fs::read(&path).ok()?;
+        let packed = match std::fs::read(&path) {
+            Ok(p) => p,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(e) => return Err(e),
+        };
         let bytes = match self.decode_at_rest(&packed, hash, false) {
             Ok(bytes) => bytes,
             // A format this build can't read (missing feature / no key) must
             // be left alone; corruption is reported missing so the caller
-            // re-fetches instead of materializing garbage.
-            Err(ContainerError::Unsupported) => return None,
+            // re-fetches instead of materializing garbage. Both are `Ok(None)`
+            // — deliberate policy, distinct from the I/O failures above.
+            Err(ContainerError::Unsupported) => return Ok(None),
             Err(ContainerError::Corrupt) => {
                 let _ = std::fs::remove_file(&path);
-                return None;
+                return Ok(None);
             }
         };
         if self.verify_on_read && Hash::of(&bytes) != *hash {
             let _ = std::fs::remove_file(&path);
-            return None;
+            return Ok(None);
         }
-        Some(bytes)
+        Ok(Some(bytes))
     }
 
     fn put(&self, hash: &Hash, bytes: &[u8]) -> std::io::Result<()> {
@@ -292,8 +423,7 @@ impl ContentStore for DirStore {
         }
     }
 
-    fn hashes(&self) -> std::io::Result<Vec<Hash>> {
-        let mut out = Vec::new();
+    fn for_each_hash(&self, f: &mut dyn FnMut(Hash) -> std::io::Result<()>) -> std::io::Result<()> {
         let algo_dir = self.algo_dir();
         for fan in std::fs::read_dir(&algo_dir)? {
             let fan = fan?;
@@ -305,11 +435,11 @@ impl ContentStore for DirStore {
                 if let Some(name) = entry.file_name().to_str()
                     && let Ok(hash) = name.parse::<Hash>()
                 {
-                    out.push(hash);
+                    f(hash)?;
                 }
             }
         }
-        Ok(out)
+        Ok(())
     }
 }
 
@@ -325,10 +455,10 @@ mod tests {
     fn memory_store_roundtrip() {
         let s = MemoryStore::new();
         let hash = h(b"hello");
-        assert!(!s.has(&hash));
+        assert!(!s.has(&hash).unwrap());
         s.put(&hash, b"hello").unwrap();
-        assert!(s.has(&hash));
-        assert_eq!(s.get(&hash).unwrap(), b"hello");
+        assert!(s.has(&hash).unwrap());
+        assert_eq!(s.get(&hash).unwrap().unwrap(), b"hello");
         assert_eq!(s.hashes().unwrap(), vec![hash]);
     }
 
@@ -337,10 +467,10 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let s = DirStore::open(dir.path()).unwrap();
         let hash = h(b"world");
-        assert!(!s.has(&hash));
+        assert!(!s.has(&hash).unwrap());
         s.put(&hash, b"world").unwrap();
-        assert!(s.has(&hash));
-        assert_eq!(s.get(&hash).unwrap(), b"world");
+        assert!(s.has(&hash).unwrap());
+        assert_eq!(s.get(&hash).unwrap().unwrap(), b"world");
         // Fanout layout: <root>/blake3/<xx>/<hex>.
         let hex = hash.to_string();
         assert!(
@@ -352,7 +482,7 @@ mod tests {
         );
         // Reopening sees the persisted chunk (restart-proof).
         let s2 = DirStore::open(dir.path()).unwrap();
-        assert!(s2.has(&hash));
+        assert!(s2.has(&hash).unwrap());
         assert_eq!(s2.hashes().unwrap(), vec![hash]);
     }
 
@@ -369,7 +499,7 @@ mod tests {
         let path = dir.path().join("blake3").join(&hex[..2]).join(&hex);
         std::fs::write(&path, b"garbage").unwrap();
         // Verified read reports it missing and removes it → refetch heals.
-        assert!(s.get(&hash).is_none());
+        assert!(s.get(&hash).unwrap().is_none());
         assert!(!path.exists());
     }
 
@@ -384,7 +514,7 @@ mod tests {
         let plaintext = b"very secret chunk contents".to_vec();
         let hash = h(&plaintext);
         s.put(&hash, &plaintext).unwrap();
-        assert_eq!(s.get(&hash).unwrap(), plaintext);
+        assert_eq!(s.get(&hash).unwrap().unwrap(), plaintext);
 
         // The on-disk file is sealed: no plaintext, sealed tag first.
         let hex = hash.to_string();
@@ -396,7 +526,7 @@ mod tests {
         // Opening the store without the key: chunk reads as missing but the
         // sealed file is never deleted or mistaken for corruption.
         let no_key = DirStore::open(dir.path()).unwrap();
-        assert!(no_key.get(&hash).is_none());
+        assert!(no_key.get(&hash).unwrap().is_none());
         assert!(path.exists(), "sealed chunk must not be deleted");
         assert!(no_key.scrub().unwrap().is_empty(), "scrub must skip sealed");
 
@@ -404,7 +534,7 @@ mod tests {
         let wrong = DirStore::open(dir.path())
             .unwrap()
             .with_encryption(StoreKey::new([8u8; 32]));
-        assert!(wrong.get(&hash).is_none());
+        assert!(wrong.get(&hash).unwrap().is_none());
 
         // Tampered ciphertext: detected as corruption by a keyed scrub.
         let mut bytes = std::fs::read(&path).unwrap();
@@ -432,6 +562,6 @@ mod tests {
 
         let corrupted = s.scrub().unwrap();
         assert_eq!(corrupted, vec![bad]);
-        assert!(s.has(&good) && !s.has(&bad));
+        assert!(s.has(&good).unwrap() && !s.has(&bad).unwrap());
     }
 }

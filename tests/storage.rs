@@ -82,7 +82,7 @@ async fn publish_to_storage_then_download_without_server() {
         normalization: 2,
         gear_seed: 0,
     };
-    let producer_store = MemoryStore::new();
+    let producer_store: Arc<dyn ContentStore> = Arc::new(MemoryStore::new());
     let index = build_tree(src.path(), "snap1", &cdc, &producer_store).unwrap();
     let expected_root = index.root_hash;
 
@@ -162,7 +162,7 @@ async fn publish_snapshot_exports_only_the_snapshot() {
 
     // One store, two snapshots — the ordinary shape for a producer that keeps
     // a warm store to dedup against.
-    let producer_store = MemoryStore::new();
+    let producer_store: Arc<dyn ContentStore> = Arc::new(MemoryStore::new());
     let published_src = tempfile::tempdir().unwrap();
     std::fs::write(published_src.path().join("shipped.bin"), b"this one ships").unwrap();
     let published = build_tree(published_src.path(), "shipped", &cdc, &producer_store).unwrap();

@@ -298,9 +298,9 @@ mod tests {
         assert_eq!(stats.kept as usize, index.needed_chunks().len());
         assert_eq!(stats.removed, 3);
         for h in index.needed_chunks() {
-            assert!(store.has(&h), "tagged chunk must survive");
+            assert!(store.has(&h).unwrap(), "tagged chunk must survive");
         }
-        assert!(!store.has(&Hash::of(b"orphan 1")));
+        assert!(!store.has(&Hash::of(b"orphan 1")).unwrap());
     }
 
     #[test]
@@ -316,12 +316,12 @@ mod tests {
         let guard = temps.protect([h]);
         let stats = sweep(&store, &tags, &temps, []).unwrap();
         assert_eq!((stats.kept, stats.removed), (1, 0));
-        assert!(store.has(&h));
+        assert!(store.has(&h).unwrap());
 
         drop(guard);
         let stats = sweep(&store, &tags, &temps, []).unwrap();
         assert_eq!((stats.kept, stats.removed), (0, 1));
-        assert!(!store.has(&h));
+        assert!(!store.has(&h).unwrap());
     }
 
     #[test]

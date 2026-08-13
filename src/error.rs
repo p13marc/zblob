@@ -21,6 +21,16 @@ pub enum BlobError {
     #[error("encode: {0}")]
     Encode(String),
 
+    /// A blocking task panicked or was cancelled.
+    ///
+    /// **Not a protocol failure.** These used to be stringified into
+    /// [`Protocol`](Self::Protocol) — 24 sites of it — which made a local
+    /// panic indistinguishable from a peer sending something malformed. They
+    /// call for opposite responses: one is a bug here, the other is a bad
+    /// peer to skip.
+    #[error("background task failed: {0}")]
+    Task(#[from] tokio::task::JoinError),
+
     /// A control message declared a schema version this crate does not speak
     /// (this crate speaks [`crate::wire::WIRE_VERSION`]).
     #[error("unsupported wire version {0}")]

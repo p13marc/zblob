@@ -44,10 +44,12 @@ pub fn seed_store(
     store: &dyn ContentStore,
     seed_roots: &[&Path],
 ) -> Result<SeedStats> {
-    let mut missing: HashSet<Hash> = index
-        .needed_chunks()
+    let needed = index.needed_chunks();
+    let present = store.has_many(&needed)?;
+    let mut missing: HashSet<Hash> = needed
         .into_iter()
-        .filter(|h| !store.has(h))
+        .zip(present)
+        .filter_map(|(h, p)| (!p).then_some(h))
         .collect();
     let mut stats = SeedStats::default();
 
@@ -195,7 +197,7 @@ mod tests {
         );
         // Everything seeded is really in the store and hash-correct.
         for h in local.hashes().unwrap() {
-            assert_eq!(Hash::of(&local.get(&h).unwrap()), h);
+            assert_eq!(Hash::of(&local.get(&h).unwrap().unwrap()), h);
         }
     }
 

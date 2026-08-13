@@ -590,7 +590,9 @@ fn walk(
             }) = reusable.get(rel.as_str()).copied()
                 && *prev_size == meta.len()
                 && *prev_mtime == mtime
-                && prev_chunks.iter().all(|c| store.has(&c.hash))
+                && prev_chunks
+                    .iter()
+                    .try_fold(true, |acc, c| store.has(&c.hash).map(|p| acc && p))?
             {
                 entries.push(Entry::File {
                     path: rel,
@@ -612,7 +614,7 @@ fn walk(
                     hash,
                     len: bytes.len() as u32,
                 });
-                if !store.has(&hash) {
+                if !store.has(&hash)? {
                     store.put(&hash, &bytes)?;
                 }
             }
@@ -761,7 +763,7 @@ fn shard_index(
     let mut chunks = Vec::new();
     for piece in encoded.chunks(INDEX_SHARD) {
         let hash = Hash::of(piece);
-        if !store.has(&hash) {
+        if !store.has(&hash)? {
             store.put(&hash, piece)?;
         }
         chunks.push(ChunkRef {
@@ -890,7 +892,12 @@ impl TreeServer {
     pub async fn register(&self, index: TreeIndex) -> Result<()> {
         let encoded = encode(&index)?;
         let sharded = if encoded.len() > self.inner.index_shard_threshold {
-            Some(shard_index(&encoded, &*self.inner.store, index.root_hash)?)
+            // Sharding is `has` + `put` per 64 KiB piece, and every `put` is an
+            // fsynced atomic rename. A few megabytes of index is dozens of
+            // fsyncs, which must not run on an async thread.
+            let store = self.inner.store.clone();
+            let root = index.root_hash;
+            Some(tokio::task::spawn_blocking(move || shard_index(&encoded, &*store, root)).await??)
         } else {
             None
         };
@@ -1003,11 +1010,13 @@ async fn serve_chunk_query(inner: &TreeInner, query: zenoh::query::Query) -> Res
             };
             let store = inner.store.clone();
             let compression = inner.compression;
-            let packed = tokio::task::spawn_blocking(move || {
-                store.get(&hash).map(|bytes| pack(&bytes, compression))
+            let packed = tokio::task::spawn_blocking(move || -> Result<Option<Vec<u8>>> {
+                match store.get(&hash)? {
+                    Some(bytes) => Ok(Some(pack(&bytes, compression)?)),
+                    None => Ok(None),
+                }
             })
-            .await
-            .map_err(|e| BlobError::Protocol(format!("store get task: {e}")))?;
+            .await??;
             if let Some(packed) = packed {
                 query
                     // This server's own key, not `query.key_expr()`. For a
@@ -1017,7 +1026,7 @@ async fn serve_chunk_query(inner: &TreeInner, query: zenoh::query::Query) -> Res
                     // uncacheable. A reply must say who is answering.
                     .reply(
                         store_key(inner.store_prefix.as_str(), Hash::ALGO, &hash),
-                        packed?,
+                        packed,
                     )
                     .encoding(ENC_CHUNK)
                     .await
@@ -1085,18 +1094,24 @@ async fn serve_chunk_batch(inner: &TreeInner, query: zenoh::query::Query) -> Res
     // One blocking pass for the whole batch: a store `get` is a syscall (or a
     // transaction), and hundreds of them do not belong on an async worker
     // one at a time.
-    let packed: Vec<(String, Vec<u8>)> = tokio::task::spawn_blocking(move || {
-        want.hashes
-            .iter()
-            .filter_map(|h| {
-                let bytes = store.get(h)?;
-                let framed = pack(&bytes, compression).ok()?;
-                Some((store_key(&prefix, Hash::ALGO, h), framed))
-            })
-            .collect()
-    })
-    .await
-    .map_err(|e| BlobError::Protocol(format!("batch get task: {e}")))?;
+    let packed: Vec<(String, Vec<u8>)> =
+        tokio::task::spawn_blocking(move || -> Result<Vec<(String, Vec<u8>)>> {
+            want.hashes
+                .iter()
+                .filter_map(|h| match store.get(h) {
+                    Ok(Some(bytes)) => match pack(&bytes, compression) {
+                        Ok(framed) => Some(Ok((store_key(&prefix, Hash::ALGO, h), framed))),
+                        // Framing failed for a chunk we hold. Silently dropping it
+                        // would leave the client re-asking forever with nothing on
+                        // either side to explain it.
+                        Err(e) => Some(Err(e)),
+                    },
+                    Ok(None) => None,
+                    Err(e) => Some(Err(BlobError::from(e))),
+                })
+                .collect::<Result<Vec<_>>>()
+        })
+        .await??;
 
     // Silence for what we do not hold: the client re-asks elsewhere, and a
     // per-chunk "no" would defeat the point of batching.
@@ -1120,11 +1135,12 @@ async fn serve_chunk_probe(inner: &TreeInner, query: zenoh::query::Query) -> Res
         return Ok(());
     };
     let store = inner.store.clone();
-    let bits = tokio::task::spawn_blocking(move || {
-        crate::wire::HaveBits::from_presence(want.hashes.iter().map(|h| store.has(h)))
+    let bits = tokio::task::spawn_blocking(move || -> std::io::Result<crate::wire::HaveBits> {
+        Ok(crate::wire::HaveBits::from_presence(
+            store.has_many(&want.hashes)?,
+        ))
     })
-    .await
-    .map_err(|e| BlobError::Protocol(format!("probe task: {e}")))?;
+    .await??;
     query
         // Our own key: a probe exists to be attributed (see the chunk reply).
         .reply(
@@ -1194,10 +1210,10 @@ async fn serve_tree_probe(inner: &TreeInner, query: &zenoh::query::Query, id: &s
     let store = inner.store.clone();
     let needed = index.needed_chunks();
     let total = needed.len() as u32;
-    let present =
-        tokio::task::spawn_blocking(move || needed.iter().filter(|h| store.has(h)).count() as u32)
-            .await
-            .map_err(|e| BlobError::Protocol(format!("tree probe task: {e}")))?;
+    let present = tokio::task::spawn_blocking(move || -> std::io::Result<u32> {
+        Ok(store.has_many(&needed)?.iter().filter(|p| **p).count() as u32)
+    })
+    .await??;
     let probe = crate::wire::TreeProbe {
         version: WIRE_VERSION,
         have_index: true,
@@ -1696,8 +1712,7 @@ impl TreeClient {
         let store2 = store.clone();
         let policy = self.cfg.policy;
         tokio::task::spawn_blocking(move || reconstruct_tree(&dest, &entries, &*store2, policy))
-            .await
-            .map_err(|e| BlobError::Protocol(format!("reconstruct task: {e}")))??;
+            .await??;
 
         sink.emit(Progress::Completed {
             path: dest_root.to_path_buf(),
@@ -1727,14 +1742,12 @@ impl TreeClient {
         let presence: Vec<bool> = {
             let store = store.clone();
             let needed = needed.to_vec();
-            tokio::task::spawn_blocking(move || {
-                needed
-                    .iter()
-                    .map(|c| store.has(&c.hash))
-                    .collect::<Vec<_>>()
+            tokio::task::spawn_blocking(move || -> std::io::Result<Vec<bool>> {
+                // `has_many` so a transactional store sees one visit for the
+                // whole snapshot instead of one per chunk.
+                store.has_many(&needed.iter().map(|c| c.hash).collect::<Vec<_>>())
             })
-            .await
-            .map_err(|e| BlobError::Protocol(format!("presence task: {e}")))?
+            .await??
         };
         // Split into what we already have and what we must fetch, reporting
         // the former immediately so a resume shows its true position at once.
@@ -1824,8 +1837,7 @@ impl TreeClient {
                             }
                             Ok(())
                         })
-                        .await
-                        .map_err(|e| BlobError::Protocol(format!("batch put task: {e}")))??;
+                        .await??;
                         for (hash, len) in sizes {
                             received += 1;
                             bytes_received += len;
@@ -1901,9 +1913,7 @@ impl TreeClient {
                     .await?;
                     let len = bytes.len() as u64;
                     let put_store = store.clone();
-                    tokio::task::spawn_blocking(move || put_store.put(&hash, &bytes))
-                        .await
-                        .map_err(|e| BlobError::Protocol(format!("store put task: {e}")))??;
+                    tokio::task::spawn_blocking(move || put_store.put(&hash, &bytes)).await??;
                     Ok((i, len, rejected))
                 });
             }
@@ -1920,8 +1930,7 @@ impl TreeClient {
                 Err(_) => continue, // timeout tick → re-check cancel
                 Ok(None) => break,
                 Ok(Some(res)) => {
-                    let (i, len, rejected) =
-                        res.map_err(|e| BlobError::Protocol(format!("fetch task: {e}")))??;
+                    let (i, len, rejected) = res??;
                     received += 1;
                     bytes_received += len;
                     stats.chunks_fetched += 1;
@@ -1984,7 +1993,7 @@ fn reconstruct_tree(
                 let mut written: u64 = 0;
                 for c in chunks {
                     let bytes = store
-                        .get(&c.hash)
+                        .get(&c.hash)?
                         .ok_or_else(|| BlobError::NotFound(c.hash.to_string()))?;
                     if bytes.len() as u32 != c.len {
                         return Err(BlobError::ChunkLengthMismatch {

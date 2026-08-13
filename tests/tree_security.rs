@@ -886,22 +886,27 @@ async fn a_corrupt_store_cannot_materialize_wrong_bytes() {
         corrupt: Hash,
     }
     impl ContentStore for LyingStore {
-        fn has(&self, hash: &Hash) -> bool {
+        fn has(&self, hash: &Hash) -> std::io::Result<bool> {
             self.inner.has(hash)
         }
-        fn get(&self, hash: &Hash) -> Option<Vec<u8>> {
-            let bytes = self.inner.get(hash)?;
+        fn get(&self, hash: &Hash) -> std::io::Result<Option<Vec<u8>>> {
+            let Some(bytes) = self.inner.get(hash)? else {
+                return Ok(None);
+            };
             if *hash == self.corrupt {
                 // Same length, different content — so only a hash check finds it.
-                return Some(vec![0xFFu8; bytes.len()]);
+                return Ok(Some(vec![0xFFu8; bytes.len()]));
             }
-            Some(bytes)
+            Ok(Some(bytes))
         }
         fn put(&self, hash: &Hash, bytes: &[u8]) -> std::io::Result<()> {
             self.inner.put(hash, bytes)
         }
-        fn hashes(&self) -> std::io::Result<Vec<Hash>> {
-            self.inner.hashes()
+        fn for_each_hash(
+            &self,
+            f: &mut dyn FnMut(Hash) -> std::io::Result<()>,
+        ) -> std::io::Result<()> {
+            self.inner.for_each_hash(f)
         }
         fn remove(&self, hash: &Hash) -> std::io::Result<bool> {
             self.inner.remove(hash)

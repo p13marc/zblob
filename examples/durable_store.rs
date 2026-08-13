@@ -157,7 +157,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         swept.kept, swept.removed
     );
     assert!(
-        v2.needed_chunks().iter().all(|h| store.has(h)),
+        v2.needed_chunks().iter().all(|h| store.has(h).unwrap()),
         "v2 must still be fully servable after the sweep"
     );
 

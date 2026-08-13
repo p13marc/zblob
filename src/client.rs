@@ -744,8 +744,7 @@ impl BlobClient {
                 let total_len = file.metadata()?.len();
                 Ok((verify::compute_outboard(file)?, total_len))
             })
-            .await
-            .map_err(|e| BlobError::Protocol(format!("hash task: {e}")))??;
+            .await??;
         let outboard = Arc::new(outboard);
         let chunks = TransferChunks::new(spec.chunk_size, total_len)?;
         let manifest = Manifest {
@@ -846,8 +845,7 @@ impl BlobClient {
             let path = path.clone();
             move || std::fs::File::open(path)
         })
-        .await
-        .map_err(|e| BlobError::Protocol(format!("open task: {e}")))??;
+        .await??;
         for (start, end) in wanted {
             for index in start..end {
                 if cancel.is_cancelled() {
@@ -868,8 +866,7 @@ impl BlobClient {
                         (reader, slice)
                     },
                 )
-                .await
-                .map_err(|e| BlobError::Protocol(format!("encode task: {e}")))?;
+                .await?;
                 reader = r;
                 let slice = slice?;
 
