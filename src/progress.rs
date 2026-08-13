@@ -123,3 +123,74 @@ pub fn progress_channel(buffer: usize) -> (ChannelSink, tokio::sync::mpsc::Recei
     let (tx, rx) = tokio::sync::mpsc::channel(buffer.max(1));
     (ChannelSink(tx), rx)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_closure_and_the_unit_sink_both_work() {
+        let seen = std::sync::Mutex::new(Vec::new());
+        let sink = |p: Progress| seen.lock().unwrap().push(format!("{p:?}"));
+        sink.emit(Progress::Verifying);
+        sink.emit(Progress::Failed {
+            error: "nope".into(),
+        });
+        assert_eq!(seen.lock().unwrap().len(), 2);
+
+        // `()` discards, and must not panic doing so.
+        ().emit(Progress::Verifying);
+    }
+
+    #[tokio::test]
+    async fn the_channel_sink_forwards_in_order() {
+        let (sink, mut rx) = progress_channel(8);
+        sink.emit(Progress::Started {
+            total_len: 10,
+            chunk_count: 2,
+        });
+        sink.emit(Progress::Chunk {
+            index: 0,
+            received: 1,
+            total: 2,
+            bytes_received: 5,
+        });
+        drop(sink);
+
+        let mut got = Vec::new();
+        while let Some(p) = rx.recv().await {
+            got.push(p);
+        }
+        assert_eq!(got.len(), 2);
+        assert!(matches!(got[0], Progress::Started { chunk_count: 2, .. }));
+        assert!(matches!(got[1], Progress::Chunk { index: 0, .. }));
+    }
+
+    /// The property the type exists for: a slow or vanished reader must not be
+    /// able to stall or panic the transfer. The obvious hand-written closure
+    /// does one or the other.
+    #[tokio::test]
+    async fn a_full_or_dropped_channel_drops_events_instead_of_blocking() {
+        let (sink, rx) = progress_channel(2);
+        // Well past the buffer: if this blocked, the test would hang; if it
+        // panicked on a full channel, it would fail here.
+        for i in 0..1000 {
+            sink.emit(Progress::Chunk {
+                index: i,
+                received: i,
+                total: 1000,
+                bytes_received: 0,
+            });
+        }
+        drop(rx);
+        sink.emit(Progress::Verifying); // receiver gone: also fine.
+    }
+
+    /// A zero buffer would make `mpsc::channel` panic, so it is clamped.
+    #[tokio::test]
+    async fn a_zero_buffer_is_clamped_rather_than_a_panic() {
+        let (sink, mut rx) = progress_channel(0);
+        sink.emit(Progress::Verifying);
+        assert!(matches!(rx.recv().await, Some(Progress::Verifying)));
+    }
+}

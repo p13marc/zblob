@@ -215,6 +215,60 @@ mod tests {
         }
     }
 
+    /// The conversions are the API's whole ergonomic surface — a caller
+    /// reaches an id through one of them, so a wrong one is a wrong id.
+    #[test]
+    fn every_conversion_agrees_on_the_same_id() {
+        use std::str::FromStr;
+
+        let id = BlobId::new("report-01").unwrap();
+        assert_eq!(id.as_str(), "report-01");
+        assert_eq!(&*id, "report-01"); // Deref
+        assert_eq!(id.as_ref() as &str, "report-01"); // AsRef
+        assert_eq!(id.to_string(), "report-01"); // Display
+        assert_eq!(format!("{id:?}"), "BlobId(\"report-01\")");
+        assert_eq!(String::from(id.clone()), "report-01");
+        assert_eq!(id.clone().into_string(), "report-01");
+
+        assert_eq!(BlobId::try_from("report-01").unwrap(), id);
+        assert_eq!(BlobId::try_from(String::from("report-01")).unwrap(), id);
+        assert_eq!(BlobId::from_str("report-01").unwrap(), id);
+        assert_eq!("report-01".parse::<BlobId>().unwrap(), id);
+
+        // …and the fallible ones fail, rather than being infallible in
+        // disguise.
+        assert!(BlobId::try_from("bad/id").is_err());
+        assert!("bad/id".parse::<BlobId>().is_err());
+
+        // Comparison against bare strings, in both directions — the shape
+        // every `manifest.id == requested` site uses.
+        assert!(id == "report-01");
+        assert!(id == *"report-01");
+        assert!("report-01" == id);
+        assert!(*"report-01" == id);
+        assert!(id != "other");
+
+        // `Borrow<str>` is what lets the server registry be keyed by id and
+        // looked up by a key segment; if it disagreed with `Eq`/`Hash` the
+        // lookup would silently miss.
+        let mut map = std::collections::HashMap::new();
+        map.insert(id.clone(), 7);
+        assert_eq!(map.get("report-01"), Some(&7));
+        assert_eq!(map.get("nope"), None);
+
+        // Ord, for anything sorting ids.
+        let mut v = [
+            BlobId::new("c").unwrap(),
+            BlobId::new("a").unwrap(),
+            BlobId::new("b").unwrap(),
+        ];
+        v.sort();
+        assert_eq!(
+            v.iter().map(BlobId::as_str).collect::<Vec<_>>(),
+            ["a", "b", "c"]
+        );
+    }
+
     /// The whole point: an id off the wire is checked by *decoding*, not by
     /// remembering to call a validator afterwards.
     #[test]

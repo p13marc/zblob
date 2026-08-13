@@ -162,6 +162,38 @@ async fn publish_index(
         .map_err(BlobError::zenoh)
 }
 
+/// Which of `n` chunk indices the read-back phase probes.
+///
+/// Extracted from `publish_snapshot` because it was unreachable from a test
+/// there: the whole `Sample` arm — the default — was dead code as far as the
+/// suite was concerned, and it is arithmetic with an off-by-one in every
+/// direction (empty input, `k` larger than `n`, `k` of zero).
+///
+/// The result is ascending, duplicate-free, always contains the first and last
+/// index, and never exceeds `k` entries.
+fn sample_indices(n: usize, coverage: SettleCoverage) -> Vec<usize> {
+    debug_assert!(n > 0);
+    match coverage {
+        SettleCoverage::All => (0..n).collect(),
+        SettleCoverage::Sample(k) => {
+            let k = k.max(1);
+            let step = (n / k).max(1);
+            let mut picked: Vec<usize> = (0..n).step_by(step).take(k).collect();
+            // The last chunk matters most — it is the one a truncated publish
+            // loses — so it is always probed. Swapping it in for the final
+            // stride pick rather than appending keeps the promised bound of
+            // `k` keys, which appending quietly broke.
+            if picked.last() != Some(&(n - 1)) {
+                if picked.len() >= k {
+                    picked.pop();
+                }
+                picked.push(n - 1);
+            }
+            picked
+        }
+    }
+}
+
 /// How much of a published snapshot the read-back phase actually checks.
 ///
 /// The distinction matters because the phase's whole job is to let a producer
@@ -219,19 +251,8 @@ async fn publish_snapshot(
     let mut probes: Vec<String> = vec![tree_key(tree_prefix.as_str(), &index.id)];
     let n = needed.len();
     if n > 0 {
-        let picked: Vec<usize> = match coverage {
-            SettleCoverage::All => (0..n).collect(),
-            SettleCoverage::Sample(k) => {
-                let k = k.max(1);
-                let step = (n / k).max(1);
-                let mut picked: Vec<usize> = (0..n).step_by(step).take(k).collect();
-                picked.push(n - 1);
-                picked.dedup();
-                picked
-            }
-        };
         probes.extend(
-            picked
+            sample_indices(n, coverage)
                 .into_iter()
                 .map(|i| store_key(store_prefix.as_str(), HashAlgo::Blake3, &needed[i])),
         );
@@ -454,5 +475,63 @@ impl SnapshotPublisher {
             self.settle,
         )
         .await
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The read-back's sample is what decides whether a producer may exit, so
+    /// its arithmetic is load-bearing — and it was reachable only through a
+    /// live Zenoh session, which is why none of it was covered.
+    #[test]
+    fn sampling_always_covers_the_ends_and_respects_its_bound() {
+        for n in 1..=200usize {
+            // `All` is the whole snapshot, in order.
+            let all = sample_indices(n, SettleCoverage::All);
+            assert_eq!(all, (0..n).collect::<Vec<_>>(), "All at n={n}");
+
+            for k in [1usize, 2, 3, 8, 64, 1000] {
+                let picked = sample_indices(n, SettleCoverage::Sample(k));
+                let label = format!("n={n} k={k}");
+
+                assert!(!picked.is_empty(), "{label}: sampled nothing");
+                assert!(picked.len() <= k, "{label}: {} entries", picked.len());
+                assert!(picked.len() <= n, "{label}: more picks than chunks");
+                assert!(
+                    picked.windows(2).all(|w| w[0] < w[1]),
+                    "{label}: not strictly ascending: {picked:?}"
+                );
+                assert!(picked.iter().all(|i| *i < n), "{label}: index out of range");
+                assert_eq!(
+                    *picked.last().unwrap(),
+                    n - 1,
+                    "{label}: the last chunk — the one a truncated publish \
+                     loses — must always be probed"
+                );
+                if k > 1 || n == 1 {
+                    assert_eq!(picked[0], 0, "{label}: the first chunk must be probed");
+                }
+            }
+        }
+    }
+
+    /// `Sample(0)` would otherwise mean "probe nothing", i.e. a settle phase
+    /// that establishes nothing while reporting success.
+    #[test]
+    fn a_zero_sample_still_probes() {
+        let picked = sample_indices(10, SettleCoverage::Sample(0));
+        assert_eq!(picked, vec![9]);
+    }
+
+    /// The default is a sample, not the whole snapshot — the distinction the
+    /// type exists to make, and one a caller must be able to rely on when
+    /// reasoning about publish cost.
+    #[test]
+    fn the_default_coverage_samples() {
+        assert_eq!(SettleCoverage::default(), SettleCoverage::Sample(8));
+        assert_eq!(sample_indices(1000, SettleCoverage::default()).len(), 8);
+        assert_eq!(sample_indices(1000, SettleCoverage::All).len(), 1000);
     }
 }

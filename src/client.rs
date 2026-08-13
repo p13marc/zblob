@@ -1285,6 +1285,12 @@ impl BlobClient {
 
             let selector = slice_selector(self.prefix.as_str(), &manifest.id, &holes);
             let before = state.received();
+            // Counted here as well as on the striped and tier-2 paths: this
+            // one was omitted, so `queries` — documented as "Zenoh queries
+            // this call issued", and the number a caller uses to tell whether
+            // range batching is working — reported 0 for every ordinary
+            // single-origin download.
+            stats.queries += 1;
             let replies = self
                 .session
                 .get(&selector)
