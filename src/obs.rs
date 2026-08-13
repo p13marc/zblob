@@ -7,22 +7,62 @@
 
 use std::time::Duration;
 
+/// Borrow every field value of a `zdebug!`/`zwarn!` invocation and discard it.
+///
+/// Without this, a binding whose only reader is a log line is *unused* in a
+/// build without the `tracing` feature — so the crate compiles with
+/// `--all-features` and fails with `-D warnings` on the default set. That is
+/// the exact local-versus-CI divergence `CLAUDE.md` warns about, and it is
+/// better fixed once here than worked around at each call site.
+///
+/// It accepts the subset of `tracing`'s field syntax this crate uses:
+/// `name = ?expr`, `name = %expr`, `name = expr`, a bare `ident`, and a
+/// trailing message literal. Values are only *borrowed*, never formatted, so
+/// enabling the feature cannot change what the code does.
+#[cfg(not(feature = "tracing"))]
+macro_rules! zignore {
+    () => {};
+    ($msg:literal $(,)?) => {};
+    ($name:ident = ?$val:expr $(, $($rest:tt)*)?) => {{
+        let _ = &$val;
+        $crate::obs::zignore!($($($rest)*)?);
+    }};
+    ($name:ident = %$val:expr $(, $($rest:tt)*)?) => {{
+        let _ = &$val;
+        $crate::obs::zignore!($($($rest)*)?);
+    }};
+    ($name:ident = $val:expr $(, $($rest:tt)*)?) => {{
+        let _ = &$val;
+        $crate::obs::zignore!($($($rest)*)?);
+    }};
+    ($name:ident $(, $($rest:tt)*)?) => {{
+        let _ = &$name;
+        $crate::obs::zignore!($($($rest)*)?);
+    }};
+}
+
 /// `tracing::debug!` when the `tracing` feature is on; nothing otherwise.
 macro_rules! zdebug {
-    ($($t:tt)*) => {
+    ($($t:tt)*) => {{
         #[cfg(feature = "tracing")]
         tracing::debug!($($t)*);
-    };
+        #[cfg(not(feature = "tracing"))]
+        $crate::obs::zignore!($($t)*);
+    }};
 }
 
 /// `tracing::warn!` when the `tracing` feature is on; nothing otherwise.
 macro_rules! zwarn {
-    ($($t:tt)*) => {
+    ($($t:tt)*) => {{
         #[cfg(feature = "tracing")]
         tracing::warn!($($t)*);
-    };
+        #[cfg(not(feature = "tracing"))]
+        $crate::obs::zignore!($($t)*);
+    }};
 }
 
+#[cfg(not(feature = "tracing"))]
+pub(crate) use zignore;
 pub(crate) use {zdebug, zwarn};
 
 /// Statistics for one completed (or resumed-to-completion) transfer, returned

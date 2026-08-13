@@ -83,7 +83,7 @@ pub(crate) fn pack(bytes: &[u8], compression: ChunkCompression) -> Result<Vec<u8
             Ok(out)
         }
         #[cfg(not(feature = "zstd"))]
-        ChunkCompression::Zstd { .. } => Err(BlobError::Protocol(
+        ChunkCompression::Zstd { .. } => Err(BlobError::MalformedMessage(
             "zstd compression requested but zblob was built without the `zstd` feature".into(),
         )),
     }
@@ -130,11 +130,11 @@ pub(crate) fn try_unpack(packed: &[u8]) -> std::result::Result<Vec<u8>, Containe
 /// Unframe for the wire path, mapping both failure kinds to a protocol error.
 pub(crate) fn unpack(packed: &[u8]) -> Result<Vec<u8>> {
     try_unpack(packed).map_err(|e| match e {
-        ContainerError::Unsupported => BlobError::Protocol(
+        ContainerError::Unsupported => BlobError::MalformedMessage(
             "chunk container uses a format this build does not support (missing cargo feature?)"
                 .into(),
         ),
-        ContainerError::Corrupt => BlobError::Protocol("malformed chunk container".into()),
+        ContainerError::Corrupt => BlobError::MalformedMessage("malformed chunk container".into()),
     })
 }
 

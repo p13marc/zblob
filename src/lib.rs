@@ -97,7 +97,7 @@ pub use client::{
 pub use compress::ChunkCompression;
 #[cfg(feature = "encryption")]
 pub use crypt::StoreKey;
-pub use error::{BlobError, Result};
+pub use error::{BlobError, ErrorKind, Result};
 pub use hash::{Hash, HashParseError};
 pub use manifest::{BlobSpec, Manifest};
 pub use obs::TransferStats;

@@ -15,7 +15,7 @@ use crate::error::{BlobError, Result};
 /// components (no `..`, no root, no prefix, no `.`).
 pub(crate) fn sanitize_rel_path(path: &str) -> Result<PathBuf> {
     if path.is_empty() {
-        return Err(BlobError::Protocol("empty entry path".into()));
+        return Err(BlobError::UnsafePath("empty entry path".into()));
     }
     let p = Path::new(path);
     let mut out = PathBuf::new();
@@ -23,14 +23,14 @@ pub(crate) fn sanitize_rel_path(path: &str) -> Result<PathBuf> {
         match comp {
             Component::Normal(c) => out.push(c),
             other => {
-                return Err(BlobError::Protocol(format!(
+                return Err(BlobError::UnsafePath(format!(
                     "unsafe path component {other:?} in entry path {path:?}"
                 )));
             }
         }
     }
     if out.as_os_str().is_empty() {
-        return Err(BlobError::Protocol(format!("empty entry path {path:?}")));
+        return Err(BlobError::UnsafePath(format!("empty entry path {path:?}")));
     }
     Ok(out)
 }
@@ -50,7 +50,7 @@ pub(crate) fn sanitize_rel_path(path: &str) -> Result<PathBuf> {
 pub(crate) fn sanitize_symlink_target(link_rel: &Path, target: &str) -> Result<()> {
     let t = Path::new(target);
     if t.is_absolute() || t.components().any(|c| matches!(c, Component::Prefix(_))) {
-        return Err(BlobError::Protocol(format!(
+        return Err(BlobError::UnsafePath(format!(
             "absolute symlink target {target:?}"
         )));
     }
@@ -62,14 +62,14 @@ pub(crate) fn sanitize_symlink_target(link_rel: &Path, target: &str) -> Result<(
             Component::ParentDir => {
                 depth -= 1;
                 if depth < 0 {
-                    return Err(BlobError::Protocol(format!(
+                    return Err(BlobError::UnsafePath(format!(
                         "symlink target {target:?} escapes the tree root"
                     )));
                 }
             }
             Component::CurDir => {}
             other => {
-                return Err(BlobError::Protocol(format!(
+                return Err(BlobError::UnsafePath(format!(
                     "unsafe symlink target component {other:?}"
                 )));
             }
@@ -124,7 +124,7 @@ fn resolve_confined(
     origin: &[String],
 ) -> Result<Vec<String>> {
     if *budget == 0 {
-        return Err(BlobError::Protocol(format!(
+        return Err(BlobError::UnsafePath(format!(
             "symlink {:?} exceeds {MAX_SYMLINK_HOPS} resolution hops (cycle?)",
             origin.join("/")
         )));
@@ -137,7 +137,7 @@ fn resolve_confined(
             Component::CurDir => {}
             Component::ParentDir => {
                 if cur.pop().is_none() {
-                    return Err(BlobError::Protocol(format!(
+                    return Err(BlobError::UnsafePath(format!(
                         "symlink {:?} resolves outside the tree root via {target:?}",
                         origin.join("/")
                     )));
@@ -145,7 +145,7 @@ fn resolve_confined(
             }
             Component::Normal(c) => {
                 let name = c.to_str().ok_or_else(|| {
-                    BlobError::Protocol(format!("non-UTF-8 symlink component in {target:?}"))
+                    BlobError::UnsafePath(format!("non-UTF-8 symlink component in {target:?}"))
                 })?;
                 cur.push(name.to_string());
                 // A component that is itself a declared link is followed, just
@@ -156,7 +156,7 @@ fn resolve_confined(
                 }
             }
             other => {
-                return Err(BlobError::Protocol(format!(
+                return Err(BlobError::UnsafePath(format!(
                     "unsafe symlink target component {other:?} in {target:?}"
                 )));
             }
@@ -172,7 +172,7 @@ pub(crate) fn assert_parent_within(canonical_root: &Path, path: &Path) -> Result
     let parent = path.parent().unwrap_or(canonical_root);
     let canon = parent.canonicalize()?;
     if !canon.starts_with(canonical_root) {
-        return Err(BlobError::Protocol(format!(
+        return Err(BlobError::UnsafePath(format!(
             "entry path {path:?} resolves outside the destination root"
         )));
     }
@@ -189,13 +189,13 @@ pub(crate) fn create_dir_confined(root: &Path, rel: &Path) -> Result<std::path::
         cur.push(comp);
         match std::fs::symlink_metadata(&cur) {
             Ok(meta) if meta.file_type().is_symlink() => {
-                return Err(BlobError::Protocol(format!(
+                return Err(BlobError::UnsafePath(format!(
                     "refusing to traverse symlink at {cur:?} while materializing {rel:?}"
                 )));
             }
             Ok(meta) if meta.is_dir() => {}
             Ok(_) => {
-                return Err(BlobError::Protocol(format!(
+                return Err(BlobError::UnsafePath(format!(
                     "non-directory in the way at {cur:?} while materializing {rel:?}"
                 )));
             }

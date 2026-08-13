@@ -579,6 +579,7 @@ async fn hostile_push_offer_replies_are_survivable() {
                 matches!(
                     e,
                     BlobError::Protocol(_)
+                        | BlobError::MalformedMessage(_)
                         | BlobError::PushDenied(_)
                         | BlobError::Incomplete { .. }
                 ),

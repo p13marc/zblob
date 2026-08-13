@@ -27,6 +27,7 @@ use serde::{Deserialize, Serialize};
 use crate::error::Result;
 use crate::hash::Hash;
 use crate::manifest::Manifest;
+use crate::obs::zwarn;
 use crate::paths::fsync_dir;
 use crate::wire::WIRE_VERSION;
 
@@ -147,10 +148,34 @@ impl ResumeState {
     }
 
     /// Load the sidecar for `part`, if it exists, has the magic, and parses.
+    ///
+    /// `None` covers three different situations and the caller responds to all
+    /// three the same way — start over — which is correct: there is nothing to
+    /// resume from either way. What was wrong was doing it *silently*. An
+    /// absent sidecar is routine, but a present-and-unreadable one means a
+    /// completed transfer's worth of work is about to be repeated for a reason
+    /// nobody can see, so it says so.
     pub async fn load(part: &Path) -> Option<ResumeState> {
-        let bytes = tokio::fs::read(Self::sidecar_path(part)).await.ok()?;
-        let body = bytes.strip_prefix(MAGIC.as_slice())?;
-        crate::wire::decode(body).ok()
+        let path = Self::sidecar_path(part);
+        let bytes = match tokio::fs::read(&path).await {
+            Ok(bytes) => bytes,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return None,
+            Err(e) => {
+                zwarn!(path = ?path, error = %e, "resume sidecar unreadable; restarting");
+                return None;
+            }
+        };
+        let Some(body) = bytes.strip_prefix(MAGIC.as_slice()) else {
+            zwarn!(path = ?path, "resume sidecar has a foreign magic; restarting");
+            return None;
+        };
+        match crate::wire::decode(body) {
+            Ok(state) => Some(state),
+            Err(e) => {
+                zwarn!(path = ?path, error = %e, "resume sidecar undecodable; restarting");
+                None
+            }
+        }
     }
 
     /// Persist the sidecar atomically: unique temp → `sync_all` → rename →

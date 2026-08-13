@@ -407,9 +407,7 @@ impl ServerHandle {
     /// already in flight complete on their own.
     pub async fn shutdown(self) -> Result<()> {
         self.stop.notify_one();
-        self.join
-            .await
-            .map_err(|e| BlobError::Protocol(format!("server task join: {e}")))?
+        self.join.await.map_err(BlobError::Task)?
     }
 }
 
@@ -538,7 +536,7 @@ impl BlobServer {
             if existing.manifest.root == manifest.root {
                 return Ok(manifest);
             }
-            return Err(BlobError::Protocol(format!(
+            return Err(BlobError::Usage(format!(
                 "id {:?} is already registered with different content (root {}, offered {}); \
                  unregister it first",
                 spec.id, existing.manifest.root, manifest.root

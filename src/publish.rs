@@ -243,7 +243,7 @@ pub async fn publish_snapshot(
                 break;
             }
             if tokio::time::Instant::now() >= deadline {
-                return Err(BlobError::Protocol(format!(
+                return Err(BlobError::NotSettled(format!(
                     "storage did not settle within {settle:?}: {key} still unanswered"
                 )));
             }

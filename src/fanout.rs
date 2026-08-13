@@ -144,9 +144,7 @@ impl FanoutHandle {
     /// Stop serving the cache and release its memory.
     pub async fn shutdown(self) -> Result<()> {
         self.stop.notify_one();
-        self.join
-            .await
-            .map_err(|e| BlobError::Protocol(format!("fanout task join: {e}")))?
+        self.join.await.map_err(BlobError::Task)?
     }
 }
 
@@ -362,7 +360,7 @@ pub async fn receive_fanout(
                     .validate(cfg.max_blob_size)
                     .and_then(|()| {
                         if m.id != id {
-                            return Err(BlobError::Protocol(format!(
+                            return Err(BlobError::MalformedMessage(format!(
                                 "fanout manifest id {:?} does not match {id:?}",
                                 m.id
                             )));

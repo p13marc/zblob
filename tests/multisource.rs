@@ -125,7 +125,7 @@ async fn concurrent_same_destination_single_flights() {
         .download_to(&DownloadRequest::new("sf"), &dest, &(), &CancelToken::new())
         .await;
     assert!(
-        matches!(&second, Err(BlobError::Protocol(msg)) if msg.contains("already in progress")),
+        matches!(&second, Err(BlobError::Usage(msg)) if msg.contains("already in progress")),
         "second concurrent download must be refused: {second:?}"
     );
     first.await.unwrap().expect("first download completes");

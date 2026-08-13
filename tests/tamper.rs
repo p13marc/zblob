@@ -214,7 +214,7 @@ async fn manifest_id_mismatch_rejected() {
         .fetch_manifest("wanted-blob")
         .await
         .expect_err("id mismatch must be rejected");
-    assert!(matches!(err, BlobError::Protocol(_)), "{err}");
+    assert!(matches!(err, BlobError::MalformedMessage(_)), "{err}");
 
     server.abort();
     session.close().await.unwrap();

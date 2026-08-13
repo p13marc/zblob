@@ -310,7 +310,7 @@ impl TreeIndex {
             return Err(BlobError::UnsupportedVersion(self.version));
         }
         if self.algo != Hash::ALGO {
-            return Err(BlobError::Protocol(format!(
+            return Err(BlobError::MalformedMessage(format!(
                 "unsupported algo: {}",
                 self.algo
             )));
@@ -459,7 +459,7 @@ pub fn build_tree_from(
     let mut reusable: HashMap<&str, &Entry> = HashMap::new();
     if let Some(parent) = parent {
         if parent.cdc != *cdc {
-            return Err(BlobError::Protocol(format!(
+            return Err(BlobError::Usage(format!(
                 "parent snapshot was cut with different CDC parameters ({:?} vs {:?}); \
                  its chunk references would not tile under these",
                 parent.cdc, cdc
@@ -503,7 +503,7 @@ fn rel_path_of(root: &Path, path: &Path) -> Result<String> {
         let s = comp
             .as_os_str()
             .to_str()
-            .ok_or_else(|| BlobError::Protocol(format!("non-UTF-8 file name in tree: {rel:?}")))?;
+            .ok_or_else(|| BlobError::Usage(format!("non-UTF-8 file name in tree: {rel:?}")))?;
         if !out.is_empty() {
             out.push('/');
         }
@@ -561,7 +561,7 @@ fn walk(
             let target_os = std::fs::read_link(&path)?;
             let target = target_os
                 .to_str()
-                .ok_or_else(|| BlobError::Protocol(format!("non-UTF-8 symlink target at {rel:?}")))?
+                .ok_or_else(|| BlobError::Usage(format!("non-UTF-8 symlink target at {rel:?}")))?
                 .to_string();
             entries.push(Entry::Symlink { path: rel, target });
         } else if ftype.is_dir() {
@@ -628,7 +628,7 @@ fn walk(
         } else {
             // FIFO / socket / device: refusing loudly beats silently producing
             // a snapshot that claims to be the tree but isn't.
-            return Err(BlobError::Protocol(format!(
+            return Err(BlobError::Usage(format!(
                 "unsupported file type at {rel:?} (fifo/socket/device)"
             )));
         }
@@ -1613,7 +1613,7 @@ impl TreeClient {
                     .and_then(|index| index.validate().map(|()| index))
                     .and_then(|index| {
                         if index.id != id {
-                            return Err(BlobError::Protocol(format!(
+                            return Err(BlobError::MalformedMessage(format!(
                                 "index id {:?} does not match requested {id:?}",
                                 index.id
                             )));
@@ -2018,7 +2018,7 @@ fn reconstruct_tree(
                     written += bytes.len() as u64;
                 }
                 if written != *size {
-                    return Err(BlobError::Protocol(format!(
+                    return Err(BlobError::MalformedMessage(format!(
                         "file {path:?}: wrote {written} of declared {size} bytes"
                     )));
                 }
@@ -2038,12 +2038,12 @@ fn reconstruct_tree(
                 // pre-existing outward-pointing symlink inside the dest could
                 // otherwise be laundered into a hard link to outside data.
                 let canon_t = t.canonicalize().map_err(|e| {
-                    BlobError::Protocol(format!(
+                    BlobError::UnsafePath(format!(
                         "hardlink target {target:?} is not materialized: {e}"
                     ))
                 })?;
                 if !canon_t.starts_with(&root) || !canon_t.is_file() {
-                    return Err(BlobError::Protocol(format!(
+                    return Err(BlobError::UnsafePath(format!(
                         "hardlink target {target:?} resolves outside the destination root"
                     )));
                 }
@@ -2102,7 +2102,7 @@ fn remove_existing(p: &Path, policy: MaterializePolicy) -> Result<()> {
     };
     if meta.is_dir() {
         if !policy.replace_directories {
-            return Err(BlobError::Protocol(format!(
+            return Err(BlobError::UnsafePath(format!(
                 "refusing to replace the existing directory {p:?} (and everything under it) \
                  with a non-directory entry; enable MaterializePolicy::replace_directories \
                  if that is intended"

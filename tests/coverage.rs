@@ -521,7 +521,7 @@ async fn re_registration_cannot_silently_swap_content() {
         )
         .await
         .expect_err("replacing an id's content must be refused");
-    assert!(matches!(err, zblob::BlobError::Protocol(_)), "{err}");
+    assert!(matches!(err, zblob::BlobError::Usage(_)), "{err}");
 
     let handle = server.spawn().await.unwrap();
     let dir = tempfile::tempdir().unwrap();

@@ -428,7 +428,7 @@ impl BlobClient {
                 .and_then(|m| m.validate(self.cfg.max_blob_size).map(|()| m))
                 .and_then(|m| {
                     if m.id != id {
-                        return Err(BlobError::Protocol(format!(
+                        return Err(BlobError::MalformedMessage(format!(
                             "manifest id {:?} does not match requested {id:?}",
                             m.id
                         )));
@@ -564,7 +564,7 @@ impl BlobClient {
             .await;
         drop(guard);
         if let Err(e) = &result
-            && !matches!(e, BlobError::Cancelled { .. })
+            && !e.is_cancelled()
         {
             sink.emit(Progress::Failed {
                 error: e.to_string(),
@@ -597,7 +597,7 @@ impl BlobClient {
             });
         }
         if holders.iter().any(|h| h.manifest.root != manifest.root) {
-            return Err(BlobError::Protocol(
+            return Err(BlobError::MalformedMessage(
                 "holders disagree about this blob's root; probe again and pick one set".into(),
             ));
         }
@@ -728,7 +728,7 @@ impl BlobClient {
         // keyed by the id, and its acknowledgements echo the query key
         // verbatim — which for a wildcard query is a key *expression*.
         if !self.prefix.is_concrete() {
-            return Err(BlobError::Protocol(format!(
+            return Err(BlobError::Usage(format!(
                 "cannot upload to the wildcard prefix {} — an upload has exactly one destination",
                 self.prefix
             )));
@@ -818,7 +818,7 @@ impl BlobClient {
         let mut prev_end = 0u32;
         for &(a, b) in &wanted {
             if a < prev_end || a >= b || b > count {
-                return Err(BlobError::Protocol(format!(
+                return Err(BlobError::MalformedMessage(format!(
                     "push offer replied malformed wanted ranges ({a}, {b}) for {count} chunks"
                 )));
             }
@@ -1558,7 +1558,7 @@ impl ActiveGuard {
     ) -> Result<Self> {
         let mut set = active.lock().unwrap_or_else(|e| e.into_inner());
         if !set.insert(dest.to_path_buf()) {
-            return Err(BlobError::Protocol(format!(
+            return Err(BlobError::Usage(format!(
                 "a download to {dest:?} is already in progress on this client"
             )));
         }

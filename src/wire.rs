@@ -117,17 +117,19 @@ impl WantList {
             return Err(BlobError::UnsupportedVersion(self.version));
         }
         if self.hashes.is_empty() {
-            return Err(BlobError::Protocol("empty want list".into()));
+            return Err(BlobError::MalformedMessage("empty want list".into()));
         }
         if self.hashes.len() > max {
-            return Err(BlobError::Protocol(format!(
+            return Err(BlobError::MalformedMessage(format!(
                 "want list of {} exceeds the limit of {max}",
                 self.hashes.len()
             )));
         }
         let mut seen = std::collections::HashSet::with_capacity(self.hashes.len());
         if let Some(dup) = self.hashes.iter().find(|h| !seen.insert(**h)) {
-            return Err(BlobError::Protocol(format!("want list repeats {dup}")));
+            return Err(BlobError::MalformedMessage(format!(
+                "want list repeats {dup}"
+            )));
         }
         Ok(())
     }
@@ -194,14 +196,14 @@ impl HaveBits {
             return Err(BlobError::UnsupportedVersion(self.version));
         }
         if self.count as usize != asked {
-            return Err(BlobError::Protocol(format!(
+            return Err(BlobError::MalformedMessage(format!(
                 "probe answered {} entries for a want-list of {asked}",
                 self.count
             )));
         }
         let want = self.count.div_ceil(8) as usize;
         if self.bits.len() != want {
-            return Err(BlobError::Protocol(format!(
+            return Err(BlobError::MalformedMessage(format!(
                 "probe bitfield is {} bytes, expected {want}",
                 self.bits.len()
             )));
@@ -259,13 +261,15 @@ impl IndexDescriptor {
             return Err(BlobError::UnsupportedVersion(self.version));
         }
         if self.algo != Hash::ALGO {
-            return Err(BlobError::Protocol(format!(
+            return Err(BlobError::MalformedMessage(format!(
                 "index descriptor uses unsupported algo {}",
                 self.algo
             )));
         }
         if self.index_chunks.is_empty() {
-            return Err(BlobError::Protocol("index descriptor has no chunks".into()));
+            return Err(BlobError::MalformedMessage(
+                "index descriptor has no chunks".into(),
+            ));
         }
         if self.index_len > max_index_bytes as u64 {
             return Err(BlobError::InvalidManifest(format!(
@@ -276,7 +280,7 @@ impl IndexDescriptor {
         // The parts must add up to the whole, or assembly is not defined.
         let summed: u64 = self.index_chunks.iter().map(|c| c.len as u64).sum();
         if summed != self.index_len {
-            return Err(BlobError::Protocol(format!(
+            return Err(BlobError::MalformedMessage(format!(
                 "index chunks total {summed} bytes, declared {}",
                 self.index_len
             )));
@@ -310,7 +314,7 @@ impl TreeProbe {
             return Err(BlobError::UnsupportedVersion(self.version));
         }
         if self.chunks_present > self.chunks_total {
-            return Err(BlobError::Protocol(format!(
+            return Err(BlobError::MalformedMessage(format!(
                 "probe claims {} of {} chunks",
                 self.chunks_present, self.chunks_total
             )));
@@ -387,14 +391,14 @@ impl Availability {
             return Err(BlobError::UnsupportedVersion(self.version));
         }
         if self.chunk_count > max_chunks {
-            return Err(BlobError::Protocol(format!(
+            return Err(BlobError::MalformedMessage(format!(
                 "availability claims {} chunks, over the limit of {max_chunks}",
                 self.chunk_count
             )));
         }
         let want = self.chunk_count.div_ceil(8) as usize;
         if self.bits.len() != want {
-            return Err(BlobError::Protocol(format!(
+            return Err(BlobError::MalformedMessage(format!(
                 "availability bitfield is {} bytes, expected {want} for {} chunks",
                 self.bits.len(),
                 self.chunk_count
@@ -423,12 +427,12 @@ fn count_bits(bits: &[u8], limit: u32) -> u32 {
 
 /// Encode a control message to postcard bytes.
 pub fn encode<T: Serialize>(value: &T) -> Result<Vec<u8>> {
-    postcard::to_stdvec(value).map_err(BlobError::encode)
+    Ok(postcard::to_stdvec(value)?)
 }
 
 /// Decode a control message from postcard bytes.
 pub fn decode<T: DeserializeOwned>(data: &[u8]) -> Result<T> {
-    postcard::from_bytes(data).map_err(BlobError::encode)
+    Ok(postcard::from_bytes(data)?)
 }
 
 #[cfg(test)]

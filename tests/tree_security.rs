@@ -145,7 +145,7 @@ async fn zip_slip_index_rejected_nothing_written() {
             .await
             .expect_err("zip-slip must be rejected");
         assert!(
-            matches!(err, BlobError::Protocol(_)),
+            matches!(err, BlobError::UnsafePath(_)),
             "path {path:?}: {err}"
         );
         assert!(
@@ -195,7 +195,7 @@ async fn escaping_symlink_target_rejected() {
         )
         .await
         .expect_err("escaping symlink must be rejected");
-    assert!(matches!(err, BlobError::Protocol(_)), "{err}");
+    assert!(matches!(err, BlobError::UnsafePath(_)), "{err}");
 
     srv.abort();
     session.close().await.unwrap();
@@ -542,7 +542,7 @@ async fn existing_directory_is_not_silently_destroyed() {
         )
         .await
         .expect_err("replacing a directory must be refused by default");
-    assert!(matches!(err, BlobError::Protocol(_)), "{err}");
+    assert!(matches!(err, BlobError::UnsafePath(_)), "{err}");
     assert_eq!(
         std::fs::read(dest.path().join("Documents/thesis.txt")).unwrap(),
         b"years of work",
@@ -763,7 +763,7 @@ async fn preexisting_symlink_cannot_be_traversed() {
             )
             .await
             .expect_err("symlink traversal must be refused");
-        assert!(matches!(err, BlobError::Protocol(_)), "{id}: {err}");
+        assert!(matches!(err, BlobError::UnsafePath(_)), "{id}: {err}");
         // Nothing landed outside; nothing was created through the link.
         assert!(!outside.path().join("spill").exists());
         assert!(!outside.path().join("owned.txt").exists());

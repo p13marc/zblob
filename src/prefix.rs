@@ -47,15 +47,15 @@ pub struct QueryPrefix(String);
 /// as a key expression in the forms this crate builds from it.
 fn validate_shape(prefix: &str) -> Result<()> {
     if prefix.is_empty() {
-        return Err(BlobError::Protocol("empty key prefix".into()));
+        return Err(BlobError::InvalidPrefix("empty key prefix".into()));
     }
     if prefix.starts_with('/') || prefix.ends_with('/') {
-        return Err(BlobError::Protocol(format!(
+        return Err(BlobError::InvalidPrefix(format!(
             "key prefix {prefix:?} must not start or end with '/'"
         )));
     }
     if prefix.split('/').any(|seg| seg == "**") {
-        return Err(BlobError::Protocol(format!(
+        return Err(BlobError::InvalidPrefix(format!(
             "key prefix {prefix:?} must not contain '**' — ids are resolved \
              positionally, so no server can answer past an unbounded span"
         )));
@@ -63,9 +63,9 @@ fn validate_shape(prefix: &str) -> Result<()> {
     // Must be a key expression Zenoh accepts, and must still be one in the
     // forms this crate actually builds from it.
     zenoh::key_expr::KeyExpr::try_from(prefix)
-        .map_err(|e| BlobError::Protocol(format!("invalid key prefix {prefix:?}: {e}")))?;
+        .map_err(|e| BlobError::InvalidPrefix(format!("invalid key prefix {prefix:?}: {e}")))?;
     zenoh::key_expr::KeyExpr::try_from(format!("{prefix}/id/**"))
-        .map_err(|e| BlobError::Protocol(format!("unusable key prefix {prefix:?}: {e}")))?;
+        .map_err(|e| BlobError::InvalidPrefix(format!("unusable key prefix {prefix:?}: {e}")))?;
     Ok(())
 }
 
@@ -79,13 +79,14 @@ impl ServePrefix {
         let prefix = prefix.into();
         validate_shape(&prefix)?;
         if has_wildcard(&prefix) {
-            return Err(BlobError::Protocol(format!(
+            return Err(BlobError::InvalidPrefix(format!(
                 "key prefix {prefix:?} must not contain wildcards when serving or publishing"
             )));
         }
         // The declaration form must be canonical too.
-        zenoh::key_expr::KeyExpr::try_from(format!("{prefix}/**"))
-            .map_err(|e| BlobError::Protocol(format!("undeclarable key prefix {prefix:?}: {e}")))?;
+        zenoh::key_expr::KeyExpr::try_from(format!("{prefix}/**")).map_err(|e| {
+            BlobError::InvalidPrefix(format!("undeclarable key prefix {prefix:?}: {e}"))
+        })?;
         Ok(ServePrefix(prefix))
     }
 

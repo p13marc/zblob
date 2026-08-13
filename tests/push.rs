@@ -401,7 +401,7 @@ async fn hostile_offer_reply_is_rejected_cleanly() {
         )
         .await
         .expect_err("garbage ranges must be rejected");
-    assert!(matches!(err, BlobError::Protocol(_)), "{err}");
+    assert!(matches!(err, BlobError::MalformedMessage(_)), "{err}");
 
     evil.abort();
     session.close().await.unwrap();
@@ -576,7 +576,7 @@ async fn upload_refuses_a_wildcard_prefix() {
         )
         .await
         .expect_err("a wildcard upload prefix must be refused");
-    assert!(matches!(err, BlobError::Protocol(_)), "{err}");
+    assert!(matches!(err, BlobError::Usage(_)), "{err}");
 
     // Discriminating power: the same call against a concrete prefix gets past
     // prefix validation (it then fails because nothing is serving, which is a

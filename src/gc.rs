@@ -80,7 +80,7 @@ impl SnapshotTags {
     fn path(&self, name: &str) -> Result<PathBuf> {
         // Tag names are user-chosen file names: same shape rules as blob ids.
         crate::manifest::validate_id(name)
-            .map_err(|_| BlobError::Protocol(format!("invalid tag name {name:?}")))?;
+            .map_err(|_| BlobError::Usage(format!("invalid tag name {name:?}")))?;
         Ok(self.dir.join(format!("{name}.tag")))
     }
 
