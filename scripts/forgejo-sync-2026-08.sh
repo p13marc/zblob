@@ -1,12 +1,19 @@
 #!/usr/bin/env bash
 #
-# Sync the zblob Forgejo backlog with the 2026-08-12 review of
-# docs/analysis-2026-08.md.
+# Sync the zblob Forgejo backlog with the state of `main` after the 0.3.0
+# work and its pre-release review (2026-08-12 .. 2026-08-13).
 #
 #   * retitles the two epics into the merged 0.3.0 = wire v3 line
 #   * corrects #41 (RFC v1.9 -> v1.17), #42 (fetch_index is already public)
 #     and #48 (the batch reply-key shape does not work as filed)
-#   * creates twelve issues for the twenty defects the report missed
+#   * files the twenty defects the report missed — **created closed**, because
+#     they were found and fixed in the same cycle. They are filed anyway so the
+#     tracker records that they existed and how they were resolved; three are
+#     security defects, which is exactly what someone audits a tracker for.
+#   * closes #39-#55, each with what shipped and where
+#   * opens the work that is genuinely still outstanding
+#
+# Run it once, after the 0.3.0 branch is pushed. It is idempotent.
 #
 # Reads need no auth; writes need a token with scope `write:issue` from
 # https://git.marcpardo.eu/user/settings/applications
@@ -41,8 +48,11 @@ fi
 
 command -v jq >/dev/null || { echo "jq is required" >&2; exit 1; }
 
-existing_titles=$(curl -sf --max-time 30 \
-  "${API}/repos/${REPO}/issues?state=all&type=issues&limit=200" | jq -r '.[].title')
+all_issues=$(curl -sf --max-time 30 \
+  "${API}/repos/${REPO}/issues?state=all&type=issues&limit=200")
+existing_titles=$(jq -r '.[].title' <<<"$all_issues")
+# Numbers already closed, so a re-run does not re-comment on them.
+closed_numbers=$(jq -r '.[] | select(.state == "closed") | .number' <<<"$all_issues")
 
 api() { # api METHOD PATH JSON
   local method=$1 path=$2 body=$3
@@ -88,6 +98,48 @@ create() { # create TITLE LABEL_ID...  (body on stdin)
   api POST "/repos/${REPO}/issues" \
     "$(jq -n --arg t "$title" --arg b "$body" --argjson l "$labels" \
         '{title:$t, body:$b, labels:$l}')"
+}
+
+# A defect found *and fixed* in the same cycle. Filing it open would be false
+# work; not filing it at all loses the record that it ever existed — which for
+# a security defect is the thing a tracker is for. So: file it, then close it.
+create_closed() { # create_closed TITLE LABEL_ID...  (body on stdin)
+  local title=$1; shift
+  local body labels num
+  body=$(cat)
+  labels=$(printf '%s\n' "$@" | jq -sc 'map(tonumber)')
+  if grep -qxF "$title" <<<"$existing_titles"; then
+    echo "skip (already exists): ${title}"
+    return
+  fi
+  echo "create+close: ${title}"
+  if (( APPLY )); then
+    num=$(curl -sf --max-time 30 -X POST "${AUTH[@]}" \
+      -H 'Content-Type: application/json' \
+      -d "$(jq -n --arg t "$title" --arg b "$body" --argjson l "$labels" \
+             '{title:$t, body:$b, labels:$l}')" \
+      "${API}/repos/${REPO}/issues" | jq -r '.number')
+    echo "  -> #${num}"
+    curl -sf --max-time 30 -X PATCH "${AUTH[@]}" \
+      -H 'Content-Type: application/json' \
+      -d '{"state":"closed"}' \
+      "${API}/repos/${REPO}/issues/${num}" >/dev/null
+    echo "  -> closed #${num}"
+  else
+    echo "  POST /repos/${REPO}/issues (then PATCH state=closed)"
+  fi
+}
+
+close() { # close NUMBER  (closing note on stdin)
+  local n=$1 body
+  body=$(cat)
+  if grep -qx "$n" <<<"$closed_numbers"; then
+    echo "skip (already closed): #$n"
+    return
+  fi
+  echo "close #$n"
+  api POST "/repos/${REPO}/issues/${n}/comments" "$(jq -n --arg b "$body" '{body:$b}')"
+  api PATCH "/repos/${REPO}/issues/${n}" '{"state":"closed"}'
 }
 
 # ---------------------------------------------------------------- epics ----
@@ -255,7 +307,7 @@ EOF
 
 # ----------------------------------------------------------- new issues ----
 
-create 'Materialization is destructive and mode-unsafe: a hostile index can delete subtrees and set setuid' \
+create_closed 'Materialization is destructive and mode-unsafe: a hostile index can delete subtrees and set setuid' \
   "$L_BUG" "$L_SECURITY" <<'EOF'
 Found by the 2026-08-12 review of 0.2 (`docs/analysis-2026-08.md` §7, S1+S2).
 Both are on the tier-2 materialization path zensight uses today.
@@ -331,7 +383,7 @@ the mask where the mtime-restoration promise is documented.
       and mode-restoration semantics.
 EOF
 
-create 'Symlink confinement is lexical and a symlink chain within one index defeats it' \
+create_closed 'Symlink confinement is lexical and a symlink chain within one index defeats it' \
   "$L_BUG" "$L_SECURITY" <<'EOF'
 Found by the 2026-08-12 review of 0.2 (`docs/analysis-2026-08.md` §7, S3).
 
@@ -386,7 +438,7 @@ a dangling link has nothing to canonicalize.
       it generalizes.
 EOF
 
-create 'Encrypted DirStore: XChaCha20-Poly1305 nonce reuse when a chunk is re-packed' \
+create_closed 'Encrypted DirStore: XChaCha20-Poly1305 nonce reuse when a chunk is re-packed' \
   "$L_BUG" "$L_SECURITY" <<'EOF'
 Found by the 2026-08-12 review of 0.2 (`docs/analysis-2026-08.md` §7, S4).
 Requires the `encryption` feature, which **no consumer compiles** — so the
@@ -459,7 +511,7 @@ While in this file:
 - [ ] `StoreKey` no longer implements `Clone` and zeroizes on drop.
 EOF
 
-create 'publish_* can silently drop what it publishes, and publishes the wrong set' \
+create_closed 'publish_* can silently drop what it publishes, and publishes the wrong set' \
   "$L_BUG" <<'EOF'
 Found by the 2026-08-12 review of 0.2 (`docs/analysis-2026-08.md` §7, S5+S6).
 Both defeat the one promise the serverless tier makes: *PUT, confirm, exit*.
@@ -525,7 +577,7 @@ typically a *shared* router storage. It should iterate
       store but not in the index.
 EOF
 
-create 'Unbounded remote-driven allocation: chunk replies, tree totals, query queue, availability bits' \
+create_closed 'Unbounded remote-driven allocation: chunk replies, tree totals, query queue, availability bits' \
   "$L_BUG" "$L_SECURITY" <<'EOF'
 Found by the 2026-08-12 review of 0.2 (`docs/analysis-2026-08.md` §7,
 S7+S8+S14+S15). Four places where a remote peer picks how much memory or work
@@ -607,7 +659,7 @@ unbounded `Vec`.
       generated bitfield.
 EOF
 
-create 'Tier 2 has no end-to-end content verification, and verify_on_read defaults off' \
+create_closed 'Tier 2 has no end-to-end content verification, and verify_on_read defaults off' \
   "$L_BUG" <<'EOF'
 Found by the 2026-08-12 review of 0.2 (`docs/analysis-2026-08.md` §7, S10).
 
@@ -666,7 +718,7 @@ get subtle things wrong.
 - [ ] Benchmark of the added verification pass on a realistic tree.
 EOF
 
-create 'A foreign reply_err aborts an upload the real server already accepted' \
+create_closed 'A foreign reply_err aborts an upload the real server already accepted' \
   "$L_BUG" <<'EOF'
 Found by the 2026-08-12 review of 0.2 (`docs/analysis-2026-08.md` §7, S9).
 
@@ -716,7 +768,7 @@ Related, from the same read:
 - [ ] A wildcard push prefix does not typecheck.
 EOF
 
-create 'build_tree can produce snapshots that no client will ever accept' \
+create_closed 'build_tree can produce snapshots that no client will ever accept' \
   "$L_BUG" <<'EOF'
 Found by the 2026-08-12 review of 0.2 (`docs/analysis-2026-08.md` §7, S11).
 
@@ -765,7 +817,7 @@ snapshot is not.
       property test over generated directory shapes, not a single example.
 EOF
 
-create 'Assorted correctness: truncating chunk count, missing TempTag, late Overwrite::Refuse, orphaned outboards' \
+create_closed 'Assorted correctness: truncating chunk count, missing TempTag, late Overwrite::Refuse, orphaned outboards' \
   "$L_BUG" <<'EOF'
 Found by the 2026-08-12 review of 0.2 (`docs/analysis-2026-08.md` §7,
 S12+S13+S16+S17). Independent, each small.
@@ -839,7 +891,7 @@ source's), remove it on `unregister`, and give the spool a quota.
 - [ ] `unregister` reclaims the outboard it created.
 EOF
 
-create 'fanout: unbounded publisher cache and a 256 MiB unverified receive buffer' \
+create_closed 'fanout: unbounded publisher cache and a 256 MiB unverified receive buffer' \
   "$L_BUG" <<'EOF'
 Found by the 2026-08-12 review of 0.2 (`docs/analysis-2026-08.md` §7, S18).
 Complements #54 (fanout's normative status) — that issue decides whether the
@@ -889,7 +941,7 @@ mode v2 removed everywhere else. A wire bump is the moment to fix it.
 - [ ] Samples carry an `ENC_FANOUT` tag and version-first structs.
 EOF
 
-create 'Pin fastcdc to 4.0.1 — 4.0.0 silently changes chunk boundaries' \
+create_closed 'Pin fastcdc to 4.0.1 — 4.0.0 silently changes chunk boundaries' \
   "$L_BUG" <<'EOF'
 Found by the 2026-08-12 review of 0.2 (`docs/analysis-2026-08.md` §7, S19).
 One line, but it is a content-addressing hazard.
@@ -929,7 +981,7 @@ Worth tracking upstream: unreleased `master` adds `v2020::FastCDC::rechunk`
 build loop) and a 7–14 % throughput win from array-typed GEAR lookups.
 EOF
 
-create 'Incremental build_tree: reuse a parent snapshot instead of re-chunking every file' \
+create_closed 'Incremental build_tree: reuse a parent snapshot instead of re-chunking every file' \
   "$L_ENHANCEMENT" "$L_PERFORMANCE" <<'EOF'
 Found by the 2026-08-12 review of 0.2 (`docs/analysis-2026-08.md` §7, S20).
 The largest producer-side win available, and the mirror of a consumer-side
@@ -1108,6 +1160,382 @@ folklore. The test asserts the *shape* of the result — overhead falls with
 size, loss cost rises with size, the default is few enough fragments and near
 enough the clean-link optimum — so it stays meaningful if the measurement moves
 rather than pinning numbers that would just need updating.
+EOF
+
+# --------------------------------------------------- pre-release review ----
+
+comment 41 <<'EOF'
+## Pre-release review (2026-08-13)
+
+0.3.0 was built, then reviewed before tagging — while every breaking change
+was still free. The review was not a polish pass: it found **seven
+behavioural defects** and **five tests that could not fail**, none of which
+the existing suite could have caught.
+
+### Defects found and fixed
+
+| | What | How it was established |
+|---|---|---|
+| B1/B2 | Store I/O ran on the reactor in three public async paths — `publish_hashes` and `publish_store` read the store inline (a file read per chunk, and a full recursive `read_dir`), and `TreeServer::register` sharded an index on the async thread: ~64 fsynced atomic renames for a 4 MB index | read |
+| B3 | `ContentStore::has -> bool` / `get -> Option<Vec<u8>>` spelled `EIO`, `EACCES` and "absent" identically. The client's response to absence is to re-fetch and `put` back into the same broken store, so a read-only disk became an undiagnosable loop | read |
+| B4 | `cancel()` was *polled* after a blocking receive, so its observed latency was the query timeout, not "after the current chunk" as documented | **measured: 5.00 s of a 5 s budget, versus 0.17 s after** |
+| B5 | Three `BlobServerBuilder` push knobs silently did nothing unless called after `accept_push` — their doc comments said "call after `accept_push`", which is documentation compensating for a type error | read |
+| — | A hostile `fanout` publisher could hold a receiver open **forever** by streaming junk: `stall_timeout` bounded the wait for a *sample*, not for progress, and this is the one tier with no second responder to fall back on | **found by a test that hung instead of failing** |
+| — | `TransferStats::queries` reported 0 for every ordinary single-origin download — it was incremented on the striped and tier-2 paths only | found by asserting a capped transfer took several rounds |
+| — | `SettleCoverage::Sample(k)` could probe `k + 1` keys, one over its own documented bound | found by extracting the arithmetic so it could be tested at all |
+
+### Tests that could not fail
+
+`tests/striping.rs` asserted `stats.bytes_fetched <= data.len()` against a
+counter that only increments on a newly marked chunk — true under *every*
+implementation, including the one striping replaced. The counting subscriber
+beside it was never read, and could not have worked: a Zenoh subscriber does
+not observe query replies. **The headline claim of the feature was untested.**
+It now uses counting fake servers per origin and fails against an unstriped
+fetch with `16 requests for 8 chunks`.
+
+Also: an `A || B` whose second arm held for every generated input; two index
+entries sharing a `path`, so `validate` returned "duplicate entry path" before
+ever reaching the symlink arm the test existed for; a discarded upload result
+that let an *empty* spool satisfy "a partial spool does not advertise"; an
+assertion about Zenoh's enum rather than about this crate; and a test that
+reported green on any machine without `mkfifo`.
+
+### API changes (all source-breaking, all free before tagging)
+
+Transfers became `IntoFuture` call builders (`download_to(&req, &dest)
+.progress(&sink).cancel(&tok).await`); `BlobId`/`HashAlgo`/`Ext` validate at
+*decode* rather than relying on someone calling a validator;
+`BlobError::Protocol(String)` — 56 of the crate's error sites — split into
+five variants plus `kind()`/`is_retriable()`/`is_cancelled()`; `Publisher`
+replaced the five `publish_*` functions (the widest took eight arguments);
+the seventeen key builders moved to `zblob::keys`; sessions are
+`&zenoh::Session` rather than `Arc<Arc<..>>`.
+
+New capabilities, each added because a consumer was working around its
+absence: `TreeClient::fetch_file` (one path out of a snapshot without
+materializing the tree), server introspection, `TreeIndex` navigation, and
+`progress_channel`.
+
+### Numbers
+
+- **241 tests**, up from 190.
+- **89% line coverage**, up from 77%. `cargo-llvm-cov` had only ever run on
+  the CI runner, so nobody had seen the number.
+- All five fuzz targets re-run at 100 s each: **120M executions, no crashes,
+  no slow units** (the DoS found in the previous cycle showed up as 3,177
+  runs against millions).
+- Every gate green on both feature sets: fmt, clippy, tests, docs,
+  `publish --dry-run`, benches, MSRV 1.97, `cargo audit`.
+
+Full detail in `CHANGELOG.md`; `docs/MIGRATION-v3.md` is now compiled by
+`tests/migration_guide.rs`, so it cannot drift again.
+EOF
+
+# ------------------------------------------------------------- close-out ----
+
+close 39 <<'EOF'
+Shipped in 0.3.0 as **`StoreClient::fetch_chunk`** (plus `fetch_chunk_sized`,
+`fetch_many` and `probe`). A caller holding a bare `<store>/<algo>/<hash>`
+address can fetch and verify it with no tree and no `TreeClient`.
+
+`tests/read_surface.rs::a_bare_content_address_can_be_fetched_and_verified`.
+EOF
+
+close 42 <<'EOF'
+Shipped in 0.3.0. `TreeClient::fetch_index_by_root` inspects a snapshot with
+no store, and `StoreClient` is the store-side reader.
+
+Note the correction above: `fetch_index` was already public when this was
+filed. What was actually missing was the *by-root* form and the store client.
+
+The pre-release review added **`TreeClient::fetch_file`** on top — one path
+out of a snapshot without materializing the tree, which is the capability a
+snapshot most obviously implies and did not have.
+EOF
+
+close 43 <<'EOF'
+Shipped in 0.3.0: `BlobClient::probe` returns one entry per holder, each
+naming the origin that answered, and `Manifest::chunk_count` replaces the
+`div_ceil` two consumers were rewriting.
+
+The pre-release review went further in the same direction: server
+introspection (`registered`/`manifest`/`index`/`serves`) and `TreeIndex`
+navigation (`entry`/`entries`/`files`/`file_chunks`), so a consumer never
+needs to match `Entry`'s five variants or keep a shadow copy of a registry.
+EOF
+
+close 44 <<'EOF'
+Shipped in 0.3.0. `ServePrefix` (concrete) and `QueryPrefix` (single-segment
+wildcards allowed, `**` refused); serving implies querying, so the conversion
+is free one way and fallible the other. A server cannot be built on a
+wildcard because there is no value to build one from.
+EOF
+
+close 45 <<'EOF'
+Shipped in 0.3.0. `DirStore` is atomic, fsynced, fanned out
+(`blake3/<xx>/<hex>`), with optional verify-on-read, `scrub()`, zstd at rest
+and (feature) XChaCha20-Poly1305 sealing; `gc::sweep` does tag-based
+mark-and-sweep with persistent snapshot tags and in-flight temp tags.
+`examples/durable_store.rs` is the shape for a sensor to copy.
+EOF
+
+close 46 <<'EOF'
+All ten shipped in 0.3.0 — see the `### Fixed` section of `CHANGELOG.md`.
+
+The pre-release review then found **seven more** of the same kind (see the
+review comment on #41), which is the honest lesson here: a hardening list
+assembled by reading code finds what reading code finds. The three that
+mattered most were only found by *measuring* (`cancel()`'s real latency),
+by *writing an adversarial test* (the fanout hang), and by *extracting
+untestable arithmetic* (`SettleCoverage::Sample`).
+EOF
+
+close 47 <<'EOF'
+Shipped in 0.3.0 as `BlobClient::download_staged`, returning `Staged { path,
+suggested, stats }` — staged under the **id**, with the server's advisory
+filename kept aside rather than joined to any path.
+
+Since the pre-release review it is a call builder like every other transfer:
+`download_staged(&req, &dir).progress(&sink).await`.
+EOF
+
+close 48 <<'EOF'
+Shipped in 0.3.0, with the reply-key correction above: replies land on each
+chunk's own key, so the query sets `accept_replies(ReplyKeyExpr::Any)`.
+
+The pre-release review added the adversarial coverage this endpoint had none
+of — `tests/hostile_store.rs` drives every rejection branch in
+`accept_batch_reply`, and pins two things that were documented and untested:
+that the same query **without** `ReplyKeyExpr::Any` gets zero replies
+(refused on the server), and that a holder with nothing at `…/batch` still
+resolves through the per-chunk fallback. That fallback is not a corner case —
+it is how every snapshot fetched from a router storage resolves.
+EOF
+
+close 49 <<'EOF'
+Shipped in 0.3.0: `…/<algo>/have` answers one bit per address asked, and
+`<tree>/<id>/have` answers four numbers whatever the snapshot's size. Both
+reply with a size that is a function of the *question*, never of the objects
+— which is the whole reason tier 2 may have a probe at all under RFC 07 §3.
+
+Property tests for both validators were added in the pre-release review;
+neither had any test of a rejection branch.
+EOF
+
+close 50 <<'EOF'
+Shipped in 0.3.0 — but **conditionally**, not as filed. See the `[rev]` note
+on `docs/analysis-2026-08.md` §4.3.
+
+The dedup and size-ceiling arguments did not survive measurement: an index
+costs 0.05–0.10% of its payload and the ceiling is ~40 GiB. Only the
+resumability argument held. So a *large* index shards into an
+`IndexDescriptor` and a small one is still served whole — a descriptor on
+every fetch would add a round trip to fix a problem the common case does not
+have.
+EOF
+
+close 51 <<'EOF'
+Shipped in 0.3.0: one `WIRE_VERSION`, a trailing `ext` list on the metadata
+messages, and servers advertising `max_chunks_per_query` so a client clamps
+instead of being rejected with no way to discover why.
+
+The pre-release review typed the pieces that were still strings: `ext` became
+`Ext` with `MAX_FIELDS`/`MAX_VALUE_LEN` enforced at decode (nothing bounded
+it before, on a field that arrives off the network), and the `ENC_*` `&str`
+constants became `WireTag`, which removed a `String` allocation per reply.
+EOF
+
+close 52 <<'EOF'
+Resolved: **availability stays, and stays all-or-nothing.** See the
+correction above and the `[rev]` note on `docs/analysis-2026-08.md` §4.6.
+
+The recommended option — have a holder answer its real bitfield — is not
+implementable on tier 1, and this was established by implementing it and
+watching every striped range come back empty. A bao slice carries sibling
+hashes derived from the whole blob, so a partial holder can serve no verified
+slice at all; advertising one would send clients after chunks they can never
+obtain.
+
+What shipped instead: `download_to(..).striped(&holders)`, so a chunk crosses
+the wire once rather than once per replica, and partial possession is
+reported on **tier 2**, where it is real. `tests/striping.rs` pins the
+constraint so the "obvious improvement" is not re-proposed.
+EOF
+
+close 53 <<'EOF'
+**Rejected: the premise is false.** See the correction above.
+
+"NotFound costs a 30 s timeout" came from a code comment, not a measurement.
+Measured before building: about a millisecond — with a server present, with
+none present, and across a wildcard fan-out. A Zenoh query finalizes once its
+matching queryables complete, and completing without replying is immediate.
+
+`ENC_NACK`, an RFC amendment, and a subtle "authoritative only when no
+positive reply arrives" rule were all avoided by one test
+(`an_unknown_id_fails_fast_not_on_the_timeout`). Silence is how a server says
+"not mine", and it is what lets several servers share one prefix.
+EOF
+
+close 54 <<'EOF'
+Resolved: **fanout stays, and was brought up to the crate's own wire rules.**
+
+Frames are version-first structs carrying an `ENC_FANOUT` tag, so a foreign
+sample is rejected by its tag rather than by a decode failure deep in a
+transfer; the publisher cache, receive buffer and manifest cap are bounded
+and configurable.
+
+The pre-release review then found that the tier had a **hang**: a hostile
+publisher streaming frames a receiver rejects could hold it open
+indefinitely, because `stall_timeout` bounded the wait for a *sample* rather
+than for progress — and this is the one tier with no second responder to fall
+back on. Fixed, and `tests/fanout.rs` now tests the "every receiver verifies"
+claim that makes the tier safe to point at a fleet, which nothing did before.
+
+Adoption is still zero. That is a reason to keep it correct and feature-gated,
+not a reason to ship it broken.
+EOF
+
+close 55 <<'EOF'
+Shipped in 0.3.0: `DEFAULT_CHUNK_SIZE` is 256 KiB, with the measurement in
+its doc comment and `tests/chunk_size.rs` asserting the *shape* of the result
+rather than pinning numbers that would just need updating.
+EOF
+
+close 40 <<'EOF'
+Merged into #41 and shipped as one breaking 0.3.0. Keeping two releases in
+flight bought nothing once wire v3 was going to break the wire anyway.
+
+Every child is closed. See the pre-release review comment on #41 for what
+changed after this epic's work was already complete.
+EOF
+
+close 41 <<'EOF'
+0.3.0 is complete on `main`: 241 tests, 89% line coverage, every gate green
+on both feature sets, all five fuzz targets clean at 100 s each.
+
+**Not tagged and not published** — that is deliberate and is now the only
+thing between here and the release. See the two issues opened alongside this
+close-out for what remains.
+EOF
+
+# ------------------------------------------------------ remaining work ----
+
+create 'Release gate: 0.3.0 cannot be published until the three consumers migrate' "${L_ENHANCEMENT}" <<'EOF'
+0.3.0 is built, reviewed and green on `main`, and is **deliberately untagged**.
+This issue tracks what has to happen before it can be.
+
+## Why it is not just "publish it"
+
+v2 and v3 peers **do not interoperate** — every `ENC_*` tag is re-spelled and
+`WIRE_VERSION` is 3, so a mixed deployment fails closed. The rollout is a cut,
+not a rolling upgrade. All three consumers pin `zblob = "0.2.0"`:
+
+- `zensight` (`zensight-common`, artifact channel, netring)
+- `tcgui` (`tcgui-shared`)
+- `zenkey` (RFC 07 examples)
+
+## What each needs
+
+- [ ] **zensight** — port to the 0.3 API and cut over. `docs/MIGRATION-v3.md`
+      is the guide, and every snippet in it is compiled by
+      `tests/migration_guide.rs`, so it is accurate as of this release.
+- [ ] **tcgui** — same, smaller surface.
+- [ ] **zenkey** — RFC 07 §§2.2–2.5 amendments are **v1.17** (not the v1.9 the
+      original epic said; the set was already at v1.16).
+- [ ] Decide whether any consumer needs a feature that is currently compiled
+      **nowhere in the fleet**: `zstd`, `tracing`, `fanout`, `encryption` are
+      all off by default and all three consumers take default features.
+- [ ] Tag `v0.3.0`, publish to crates.io, then bump the consumers' pins.
+
+## Not blocking, but worth deciding with it
+
+**Chunk addresses did not change.** Existing `DirStore`s and router-hosted
+storages stay warm across the upgrade — the opposite of the sha256→blake3 cut,
+which orphaned every cached chunk. So a storage does not need draining, and
+the cut can be done per-peer as long as no peer talks v2 to a v3 peer.
+EOF
+
+create 'upload_source: the push path can only send a file' "${L_ENHANCEMENT}" <<'EOF'
+The crate is symmetric everywhere except here.
+
+| direction | from/to a file | from/to anything else |
+|---|---|---|
+| serve | `register_file` | `register_source(&dyn BlobSource)` |
+| download | `download_to` | `download_to_writer` |
+| **upload** | `upload_file` | **missing** |
+
+`BlobClient::upload_file(spec, path)` takes a `PathBuf` and opens it with
+`std::fs::File::open` on the blocking pool. A caller pushing something it
+already holds — a generated report, a buffer, an artifact assembled in
+memory — has to write it to a temporary file first, which for a large
+artifact means paying the whole thing to disk for no reason, and on a
+read-only or memory-backed root may be impossible.
+
+## Shape
+
+`upload_source(spec, Arc<dyn BlobSource>) -> Upload<'_>`, the same builder
+`upload_file` returns. `BlobSource` already exists and is already what the
+*server* registers from, so this is joining two things the crate has rather
+than adding a concept:
+
+```rust
+client
+    .upload_source(BlobSpec::new("report-01"), Arc::new(MemoryBlobSource::new(bytes)))
+    .token(token)
+    .await?;
+```
+
+`upload_file` becomes a thin wrapper over it with a `FileBlobSource`.
+
+## Why it is not done yet
+
+It was on the pre-release review's list and was cut for scope — it is
+additive, so unlike everything else in that review it is *not* cheaper before
+0.3.0 is tagged. Doing it after costs nothing.
+
+## Watch out for
+
+The push path re-opens the source per slice via `spawn_blocking`, and
+`BlobSource::open` is documented as cheap and re-openable — which a
+`MemoryBlobSource` satisfies (it clones an `Arc`) but an arbitrary
+implementation might not. Either keep one reader for the whole upload or
+document the requirement at `upload_source` too.
+EOF
+
+create 'Coverage floor: the error-reply paths in server.rs and fanout.rs' "${L_ENHANCEMENT}" <<'EOF'
+`cargo llvm-cov --all-features` is **89.16% of lines** as of the 0.3.0
+pre-release review (it was 77.3% before it). That number is a floor to hold,
+not a target to game — the tests that moved it found seven real defects.
+
+The two weakest files are both dominated by paths that only run when
+something has already gone wrong:
+
+| file | lines | what is uncovered |
+|---|---|---|
+| `server.rs` | 80.7% | `reply_err` paths, push eviction/cleanup, the in-flight semaphore's refusal branch |
+| `fanout.rs` | 77.4% | publisher-side error handling, heartbeat miss detection, late-joiner replay edge cases |
+
+`publish.rs` (77.2%) is third, and for the same reason: most of it needs a
+live session plus a storage that behaves badly.
+
+## Why this is worth doing rather than accepting
+
+These are exactly the paths a *hostile or degraded* peer drives. The
+pre-release review's experience is the argument: the fanout tier was at 75%
+before it, and the uncovered part contained a hang a hostile publisher could
+trigger — found only by writing the adversarial test.
+
+## Approach
+
+Layer 3, not layer 1 (see `CLAUDE.md`'s "Tests"): a hostile peer against the
+*server* — malformed selectors, over-cap range sets, push offers that lie
+about their size, slices for ids the server never accepted — with the same
+oracle the two existing hostile suites use. `tests/hostile_peer.rs` and
+`tests/hostile_store.rs` are the templates; both point at clients, and nothing
+points at a server.
+
+Not a blocker for 0.3.0.
 EOF
 
 echo
