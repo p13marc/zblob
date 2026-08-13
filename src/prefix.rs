@@ -261,4 +261,75 @@ mod tests {
         assert!(ServePrefix::try_from(wide).is_err());
         assert!(ServePrefix::try_from(query).is_ok());
     }
+
+    /// The conversions are the whole surface: a caller reaches a prefix
+    /// through one of them, so a wrong one is a wrong key expression, and
+    /// `From<ServePrefix> for QueryPrefix` in particular has to preserve the
+    /// string rather than re-validating it under the other role's rules.
+    #[test]
+    fn every_conversion_preserves_the_prefix_and_its_role() {
+        use std::str::FromStr;
+
+        let serve = ServePrefix::new("v1/host-a/@blob/art").unwrap();
+        assert_eq!(serve.as_str(), "v1/host-a/@blob/art");
+        assert_eq!(serve.to_string(), "v1/host-a/@blob/art");
+        assert_eq!(serve.as_ref() as &str, "v1/host-a/@blob/art");
+
+        // Serve → query is free and lossless, by value and by reference.
+        assert_eq!(
+            QueryPrefix::from(serve.clone()).as_str(),
+            "v1/host-a/@blob/art"
+        );
+        assert_eq!(QueryPrefix::from(&serve).as_str(), "v1/host-a/@blob/art");
+
+        // Query → serve is fallible, and fails on exactly the prefixes a
+        // server cannot be built on.
+        let concrete = QueryPrefix::new("v1/host-a/@blob/art").unwrap();
+        assert!(concrete.is_concrete());
+        assert_eq!(
+            ServePrefix::try_from(concrete).unwrap().as_str(),
+            "v1/host-a/@blob/art"
+        );
+        let wild = QueryPrefix::new("v1/*/@blob/art").unwrap();
+        assert!(!wild.is_concrete());
+        assert!(ServePrefix::try_from(wild).is_err());
+
+        // The four parsing entry points agree, and all of them reject.
+        for good in ["p/q", "v1/host-a/@blob/art"] {
+            assert_eq!(ServePrefix::from_str(good).unwrap().as_str(), good);
+            assert_eq!(ServePrefix::try_from(good).unwrap().as_str(), good);
+            assert_eq!(
+                ServePrefix::try_from(String::from(good)).unwrap().as_str(),
+                good
+            );
+            assert_eq!(QueryPrefix::from_str(good).unwrap().as_str(), good);
+            assert_eq!(QueryPrefix::try_from(good).unwrap().as_str(), good);
+            assert_eq!(
+                QueryPrefix::try_from(String::from(good)).unwrap().as_str(),
+                good
+            );
+        }
+        for bad in ["", "p/*", "p/**"] {
+            assert!(ServePrefix::from_str(bad).is_err(), "{bad:?}");
+            assert!(ServePrefix::try_from(bad).is_err(), "{bad:?}");
+            assert!(ServePrefix::try_from(String::from(bad)).is_err(), "{bad:?}");
+        }
+        // A query prefix may wildcard an origin but never span segments.
+        assert!(QueryPrefix::from_str("p/*").is_ok());
+        assert!(QueryPrefix::from_str("p/**").is_err());
+        assert!(QueryPrefix::from_str("").is_err());
+    }
+
+    /// Every rejection is an `InvalidPrefix`, not a generic protocol error —
+    /// the distinction that tells a caller it is their configuration and not
+    /// a peer's doing.
+    #[test]
+    fn prefix_rejections_are_classified_as_usage() {
+        for bad in ["", "p/**", "p/*"] {
+            let e = ServePrefix::new(bad).unwrap_err();
+            assert!(matches!(e, BlobError::InvalidPrefix(_)), "{bad:?}: {e}");
+            assert_eq!(e.kind(), crate::error::ErrorKind::Usage);
+            assert!(!e.is_retriable(), "a bad prefix is never worth retrying");
+        }
+    }
 }

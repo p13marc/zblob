@@ -2046,4 +2046,51 @@ mod tests {
         assert_eq!(r.backoff(1), Duration::from_millis(500));
         assert_eq!(r.backoff(10), Duration::from_secs(10)); // capped
     }
+
+    /// `coalesce` decides how many spans a striped query carries, and the
+    /// range grammar caps that at `MAX_RANGE_SPANS` — so merging one range too
+    /// few turns a legal request into a refused one. It is pure, load-bearing,
+    /// and was untested.
+    #[test]
+    fn coalesce_merges_exactly_the_adjacent_runs() {
+        assert_eq!(coalesce(&[]), Vec::<std::ops::Range<u32>>::new());
+        assert_eq!(coalesce(&[5]), vec![5..6]);
+        assert_eq!(coalesce(&[0, 1, 2]), vec![0..3]);
+        assert_eq!(coalesce(&[0, 2, 4]), vec![0..1, 2..3, 4..5]);
+        assert_eq!(coalesce(&[0, 1, 3, 4, 5, 9]), vec![0..2, 3..6, 9..10]);
+        // Only *consecutive* adjacency merges: the input is the client's own
+        // ascending hole list, and a repeat would otherwise silently extend a
+        // range past what was asked for.
+        assert_eq!(coalesce(&[1, 1]), vec![1..2, 1..2]);
+        assert_eq!(coalesce(&[3, 1]), vec![3..4, 1..2]);
+
+        // The covered set is exactly the input, for any ascending run.
+        let indices: Vec<u32> = (0..50).filter(|i| i % 7 != 0).collect();
+        let covered: Vec<u32> = coalesce(&indices).into_iter().flatten().collect();
+        assert_eq!(covered, indices);
+    }
+
+    /// `origin_of` is how a wildcard probe attributes each answer to the
+    /// holder that sent it — get it wrong and a client fetches from a prefix
+    /// nobody serves.
+    #[test]
+    fn origin_of_strips_exactly_the_id_and_endpoint() {
+        assert_eq!(
+            origin_of("v1/host-a/@blob/art/blob-1/manifest", "blob-1", "manifest").as_deref(),
+            Some("v1/host-a/@blob/art")
+        );
+        assert_eq!(
+            origin_of("p/blob-1/have", "blob-1", "have").as_deref(),
+            Some("p")
+        );
+        // A different id, endpoint, or a key with nothing left over is not
+        // this blob's origin.
+        assert_eq!(origin_of("p/other/manifest", "blob-1", "manifest"), None);
+        assert_eq!(origin_of("p/blob-1/have", "blob-1", "manifest"), None);
+        assert_eq!(origin_of("blob-1/manifest", "blob-1", "manifest"), None);
+        assert_eq!(origin_of("", "blob-1", "manifest"), None);
+        // An id that is a suffix of a longer segment must not match: the
+        // separator is required, or `xblob-1` would be read as `blob-1`.
+        assert_eq!(origin_of("p/xblob-1/manifest", "blob-1", "manifest"), None);
+    }
 }
