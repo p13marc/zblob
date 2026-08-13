@@ -60,7 +60,7 @@ async fn a_snapshot_costs_one_query_per_round_not_one_per_chunk() {
         common::serve(tree_prefix.clone()),
         server_store,
     );
-    server.register(index.clone()).await;
+    server.register(index.clone()).await.unwrap();
     let handle = server.spawn().await.unwrap();
 
     let batch = 16usize;
@@ -163,7 +163,7 @@ async fn a_partial_holder_shortens_the_round_instead_of_failing_it() {
             part,
         );
         if n == 0 {
-            srv.register(index.clone()).await;
+            srv.register(index.clone()).await.unwrap();
         }
         handles.push(srv.spawn().await.unwrap());
     }
@@ -302,7 +302,7 @@ async fn a_snapshot_probe_reports_partial_possession() {
             common::serve(format!("{base}/{host}/tree")),
             store,
         );
-        srv.register(index.clone()).await;
+        srv.register(index.clone()).await.unwrap();
         handles.push(srv.spawn().await.unwrap());
     }
 
@@ -352,6 +352,111 @@ async fn a_snapshot_probe_reports_partial_possession() {
 
     for h in handles {
         h.shutdown().await.unwrap();
+    }
+    session.close().await.unwrap();
+}
+
+/// A large index is served as content-addressed chunks and reassembled; a
+/// small one still goes whole, in a single reply.
+///
+/// The second half is the point. An index costs ~0.05–0.10% of the payload it
+/// describes, so nearly every index is a few KB, and putting *every* index
+/// behind a descriptor would add a round trip to every tree fetch to solve a
+/// problem the common case does not have. Sharding is for the minority large
+/// enough that Zenoh's 64 KiB fragmentation starts discarding whole messages.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_large_index_is_sharded_and_a_small_one_is_not() {
+    let session = open_session().await;
+
+    for (label, threshold, files, expect_sharded) in [
+        ("small index, served whole", 256 * 1024usize, 4usize, false),
+        // A threshold low enough that this fixture's index exceeds it.
+        ("large index, served as chunks", 1024, 8, true),
+    ] {
+        let p = unique_prefix();
+        let store_prefix = format!("{p}/store");
+        let tree_prefix = format!("{p}/tree");
+
+        let src = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(src.path()).unwrap();
+        for i in 0..files {
+            std::fs::write(
+                src.path().join(format!("f{i}.bin")),
+                common::pseudo_random(60_000, 200 + i as u64),
+            )
+            .unwrap();
+        }
+        let server_store: Arc<dyn ContentStore> = Arc::new(MemoryStore::new());
+        let index = build_tree(src.path(), "idx", &small_cdc(), &*server_store).unwrap();
+        let encoded_len = zblob::wire::encode(&index).unwrap().len();
+        assert_eq!(
+            encoded_len > threshold,
+            expect_sharded,
+            "{label}: fixture index is {encoded_len} bytes against a {threshold} threshold"
+        );
+        let chunks_before = server_store.hashes().unwrap().len();
+
+        let server = TreeServer::builder(
+            session.clone(),
+            common::serve(store_prefix.clone()),
+            common::serve(tree_prefix.clone()),
+            server_store.clone(),
+        )
+        .index_shard_threshold(threshold)
+        .build();
+        server.register(index.clone()).await.unwrap();
+        let handle = server.spawn().await.unwrap();
+
+        // Sharding puts the index's own pieces in the store; not sharding
+        // leaves the store exactly as the tree build left it.
+        let chunks_after = server_store.hashes().unwrap().len();
+        assert_eq!(
+            chunks_after > chunks_before,
+            expect_sharded,
+            "{label}: store grew by {} index pieces",
+            chunks_after - chunks_before
+        );
+
+        // Either way the client gets the same validated index back, and the
+        // same tree on disk.
+        let client = TreeClient::builder(
+            session.clone(),
+            common::query(store_prefix),
+            common::query(tree_prefix),
+        )
+        .query_timeout(Duration::from_secs(5))
+        .build();
+        // Registered under an id, so fetch it by that id — and require it to
+        // succeed. (Swallowing the error here would make the assertion
+        // vacuous, which is the whole failure mode this suite exists to avoid.)
+        let fetched = client
+            .fetch_index("idx")
+            .await
+            .unwrap_or_else(|e| panic!("{label}: index fetch failed: {e}"));
+        assert_eq!(fetched.root_hash, index.root_hash);
+        assert_eq!(fetched.entries.len(), index.entries.len());
+
+        let dest = tempfile::tempdir().unwrap();
+        let store: Arc<dyn ContentStore> = Arc::new(MemoryStore::new());
+        client
+            .download_tree(
+                &DownloadRequest::pinned("idx", index.root_hash),
+                dest.path(),
+                &store,
+                &(),
+                &CancelToken::new(),
+            )
+            .await
+            .unwrap_or_else(|e| panic!("{label}: download failed: {e}"));
+        for i in 0..files {
+            assert_eq!(
+                std::fs::read(dest.path().join(format!("f{i}.bin"))).unwrap(),
+                common::pseudo_random(60_000, 200 + i as u64),
+                "{label}: file {i}"
+            );
+        }
+
+        handle.shutdown().await.unwrap();
     }
     session.close().await.unwrap();
 }

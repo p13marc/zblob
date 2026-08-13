@@ -403,7 +403,7 @@ async fn pinned_tree_root_rejects_substitution() {
         common::serve(tree_prefix.clone()),
         server_store,
     );
-    server.register(index).await;
+    server.register(index).await.unwrap();
     let handle = server.spawn().await.unwrap();
 
     let dest = tempfile::tempdir().unwrap();
@@ -925,7 +925,7 @@ async fn a_corrupt_store_cannot_materialize_wrong_bytes() {
         common::serve(tree_prefix.clone()),
         server_store,
     );
-    server.register(index.clone()).await;
+    server.register(index.clone()).await.unwrap();
     let handle = server.spawn().await.unwrap();
 
     let client = test_client(session.clone(), &store_prefix, &tree_prefix);

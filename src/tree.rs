@@ -624,7 +624,8 @@ struct TreeInner {
     store_prefix: ServePrefix,
     tree_prefix: ServePrefix,
     store: Arc<dyn ContentStore>,
-    index: tokio::sync::RwLock<std::collections::HashMap<String, TreeIndex>>,
+    index: tokio::sync::RwLock<std::collections::HashMap<String, Registered>>,
+    index_shard_threshold: usize,
     inflight: Arc<Semaphore>,
     compression: ChunkCompression,
     max_want_list: usize,
@@ -640,7 +641,51 @@ pub struct TreeServerBuilder {
     max_inflight: usize,
     compression: ChunkCompression,
     max_want_list: usize,
+    index_shard_threshold: usize,
     on_error: Option<ErrorCallback>,
+}
+
+/// A registered snapshot, plus its sharded form when it is large enough to
+/// need one.
+struct Registered {
+    index: TreeIndex,
+    sharded: Option<crate::wire::IndexDescriptor>,
+}
+
+/// Fixed-size pieces the encoded index is cut into when it is sharded.
+///
+/// Fixed, not content-defined: the CDC parameters live *inside* the index, so
+/// chunking it by content would be circular — and an index is written once,
+/// which is precisely the case CDC does nothing for. 64 KiB matches Zenoh's
+/// batch size, so a piece is one fragment.
+const INDEX_SHARD: usize = 64 * 1024;
+
+/// Cut an encoded index into content-addressed pieces, store them, and
+/// describe the result.
+fn shard_index(
+    encoded: &[u8],
+    store: &dyn ContentStore,
+    root: Hash,
+) -> Result<crate::wire::IndexDescriptor> {
+    let mut chunks = Vec::new();
+    for piece in encoded.chunks(INDEX_SHARD) {
+        let hash = Hash::of(piece);
+        if !store.has(&hash) {
+            store.put(&hash, piece)?;
+        }
+        chunks.push(ChunkRef {
+            hash,
+            len: piece.len() as u32,
+        });
+    }
+    Ok(crate::wire::IndexDescriptor {
+        version: WIRE_VERSION,
+        root,
+        algo: Hash::ALGO.to_string(),
+        index_chunks: chunks,
+        index_len: encoded.len() as u64,
+        ext: Vec::new(),
+    })
 }
 
 impl TreeServerBuilder {
@@ -654,6 +699,19 @@ impl TreeServerBuilder {
     /// feature for [`ChunkCompression::Zstd`]).
     pub fn compression(mut self, c: ChunkCompression) -> Self {
         self.compression = c;
+        self
+    }
+
+    /// Encoded-index size above which the index is served as content-addressed
+    /// chunks rather than as one reply (default 256 KiB).
+    ///
+    /// An index costs roughly 0.05–0.10% of the payload it describes, so this
+    /// threshold is reached by snapshots of a couple of hundred MB and up.
+    /// Below it, a single reply is strictly better: one round trip, no
+    /// descriptor. Above it, Zenoh's 64 KiB fragmentation starts to bite —
+    /// a dropped fragment discards the whole message — and chunks resume.
+    pub fn index_shard_threshold(mut self, bytes: usize) -> Self {
+        self.index_shard_threshold = bytes;
         self
     }
 
@@ -684,6 +742,7 @@ impl TreeServerBuilder {
                 tree_prefix: self.tree_prefix,
                 store: self.store,
                 index: tokio::sync::RwLock::new(std::collections::HashMap::new()),
+                index_shard_threshold: self.index_shard_threshold,
                 inflight: Arc::new(Semaphore::new(self.max_inflight)),
                 compression: self.compression,
                 max_want_list: self.max_want_list,
@@ -710,6 +769,11 @@ impl TreeServer {
             max_inflight: 8,
             compression: ChunkCompression::default(),
             max_want_list: crate::wire::MAX_WANT_LIST,
+            // Above this, an index is served as chunks instead of whole. Set
+            // so that ordinary snapshots — which produce indices of a few KB —
+            // keep their single round trip, and only indices big enough to
+            // fragment badly pay for the extra hop.
+            index_shard_threshold: 256 * 1024,
             on_error: None,
         }
     }
@@ -725,12 +789,26 @@ impl TreeServer {
     }
 
     /// Register a snapshot index (its chunks must already be in the store).
-    pub async fn register(&self, index: TreeIndex) {
+    ///
+    /// An index larger than
+    /// [`index_shard_threshold`](TreeServerBuilder::index_shard_threshold) is
+    /// additionally cut into content-addressed chunks and put in the store, so
+    /// it can be served as an [`IndexDescriptor`](crate::wire::IndexDescriptor)
+    /// — resumable and batched like any other content. Smaller ones are served
+    /// whole, as they always were.
+    pub async fn register(&self, index: TreeIndex) -> Result<()> {
+        let encoded = encode(&index)?;
+        let sharded = if encoded.len() > self.inner.index_shard_threshold {
+            Some(shard_index(&encoded, &*self.inner.store, index.root_hash)?)
+        } else {
+            None
+        };
         self.inner
             .index
             .write()
             .await
-            .insert(index.id.clone(), index);
+            .insert(index.id.clone(), Registered { index, sharded });
+        Ok(())
     }
 
     /// Drop a previously-registered snapshot index by id (e.g. on TTL expiry). The
@@ -979,18 +1057,28 @@ async fn serve_index_query(inner: &TreeInner, query: zenoh::query::Query) -> Res
         [id, crate::STORE_HAVE] => return serve_tree_probe(inner, &query, id).await,
         _ => return Ok(()),
     };
-    let Some(index) = inner.index.read().await.get(id).cloned() else {
-        // Unknown id: silence, not an error reply. A query finalizes when
-        // its matching queryables complete, so this resolves on the client
-        // in about a millisecond rather than on the timeout — see the
-        // `BlobServer` docs on sharing a prefix.
-        return Ok(());
+    let (payload, encoding) = {
+        let registry = inner.index.read().await;
+        let Some(reg) = registry.get(id) else {
+            // Unknown id: silence, not an error reply. A query finalizes when
+            // its matching queryables complete, so this resolves on the client
+            // in about a millisecond rather than on the timeout — see the
+            // `BlobServer` docs on sharing a prefix.
+            return Ok(());
+        };
+        // A small index goes whole, as it always has: one reply, one round
+        // trip. A large one goes as a descriptor pointing at chunks the client
+        // fetches like any other content — resumable, batched, unbounded. The
+        // encoding tag is what tells the two apart, which is what tags are for.
+        match &reg.sharded {
+            Some(desc) => (encode(desc)?, crate::wire::ENC_INDEX_DESC),
+            None => (encode(&reg.index)?, ENC_INDEX),
+        }
     };
-    let payload = encode(&index)?;
     query
         // Our own key, so a wildcard-origin index query can tell holders apart.
         .reply(tree_key(inner.tree_prefix.as_str(), id), payload)
-        .encoding(ENC_INDEX)
+        .encoding(encoding)
         .await
         .map_err(BlobError::zenoh)?;
     Ok(())
@@ -1003,7 +1091,13 @@ async fn serve_index_query(inner: &TreeInner, query: zenoh::query::Query) -> Res
 /// for an unknown chunk — silence means "not mine" and costs the asker
 /// nothing.
 async fn serve_tree_probe(inner: &TreeInner, query: &zenoh::query::Query, id: &str) -> Result<()> {
-    let Some(index) = inner.index.read().await.get(id).cloned() else {
+    let Some(index) = inner
+        .index
+        .read()
+        .await
+        .get(id)
+        .map(|reg| reg.index.clone())
+    else {
         return Ok(());
     };
     let store = inner.store.clone();
@@ -1223,6 +1317,66 @@ impl TreeClient {
         self.fetch_index_matching(id, None).await
     }
 
+    /// Fetch the chunks a descriptor points at and reassemble the encoded
+    /// index from them.
+    ///
+    /// The descriptor is untrusted: it is validated before anything is
+    /// fetched, each chunk is verified against its own address on arrival, and
+    /// the reassembled bytes still have to decode and recompute to the root
+    /// like any other index. The extra hop buys resumability, not trust.
+    async fn assemble_sharded_index(&self, sample: &zenoh::sample::Sample) -> Result<Vec<u8>> {
+        let desc: crate::wire::IndexDescriptor = decode(&sample.payload().to_bytes())?;
+        desc.validate(self.cfg.max_index_bytes)?;
+
+        // The pieces are ordinary content-addressed chunks, so they come back
+        // through the ordinary batched path — no new machinery.
+        let mut got: std::collections::HashMap<Hash, Vec<u8>> = Default::default();
+        for group in desc.index_chunks.chunks(self.cfg.batch_size.max(1)) {
+            let (replies, expected) = crate::store_client::batch_query(
+                &self.session,
+                self.store_prefix.as_str(),
+                group,
+                self.cfg.query_timeout,
+                self.cfg.priority,
+            )
+            .await?;
+            while let Ok(reply) = replies.recv_async().await {
+                let Ok(s) = reply.result() else { continue };
+                if let Some((h, bytes)) = crate::store_client::accept_batch_reply(
+                    self.store_prefix.as_str(),
+                    s,
+                    &expected,
+                ) {
+                    got.entry(h).or_insert(bytes);
+                }
+            }
+        }
+        // Anything the batch left unanswered — a router storage never answers
+        // one — is fetched singly.
+        let mut out = Vec::with_capacity(desc.index_len as usize);
+        for c in &desc.index_chunks {
+            let bytes = match got.remove(&c.hash) {
+                Some(b) => b,
+                None => {
+                    let key = store_key(self.store_prefix.as_str(), Hash::ALGO, &c.hash);
+                    crate::store_client::fetch_one_chunk(
+                        &self.session,
+                        &key,
+                        &c.hash,
+                        Some(c.len),
+                        crate::compress::MAX_UNPACKED,
+                        self.cfg.query_timeout,
+                        self.cfg.priority,
+                    )
+                    .await?
+                    .0
+                }
+            };
+            out.extend_from_slice(&bytes);
+        }
+        Ok(out)
+    }
+
     /// Ask every origin that answers how much of snapshot `id` it has.
     ///
     /// Completes RFC 07 §2.5's probe-then-fetch across all three key families.
@@ -1320,13 +1474,27 @@ impl TreeClient {
         let mut rejected: Option<BlobError> = None;
         while let Ok(reply) = replies.recv_async().await {
             let Ok(sample) = reply.result() else { continue };
-            if sample.encoding().to_string() != ENC_INDEX {
+            let enc = sample.encoding().to_string();
+            // A large index arrives as a descriptor pointing at chunks; a
+            // small one arrives whole. Assemble the former into the latter and
+            // then run the identical validation — the extra hop must not buy
+            // an index any weaker guarantees.
+            let payload: Vec<u8> = if enc == crate::wire::ENC_INDEX_DESC {
+                match self.assemble_sharded_index(sample).await {
+                    Ok(bytes) => bytes,
+                    Err(e) => {
+                        rejected.get_or_insert(e);
+                        continue;
+                    }
+                }
+            } else if enc == ENC_INDEX {
+                sample.payload().to_bytes().into_owned()
+            } else {
                 continue;
-            }
+            };
             // A bad reply from one responder is skipped, not fatal — a
             // hostile or stale replier must not deny what an honest replica
             // still answers. The first rejection is kept for diagnostics.
-            let payload = sample.payload().to_bytes();
             let verdict = if payload.len() > self.cfg.max_index_bytes {
                 Err(BlobError::InvalidManifest(format!(
                     "index payload {} exceeds the {} byte limit",

@@ -25,6 +25,9 @@ pub const ENC_MANIFEST: &str = "zblob/manifest;v=3";
 pub const ENC_SLICE: &str = "zblob/bao4;v=3";
 /// Encoding tag of a Tier-2 tree index reply.
 pub const ENC_INDEX: &str = "zblob/index;v=3";
+/// Encoding tag of a Tier-2 *index descriptor* reply (a large index, served
+/// as content-addressed chunks — see [`IndexDescriptor`]).
+pub const ENC_INDEX_DESC: &str = "zblob/indexdesc;v=3";
 /// Encoding tag of a Tier-2 content-addressed chunk reply.
 ///
 /// Versioned as of v3. It was the one tag that carried no version, on the
@@ -196,6 +199,81 @@ impl HaveBits {
             return Err(BlobError::Protocol(format!(
                 "probe bitfield is {} bytes, expected {want}",
                 self.bits.len()
+            )));
+        }
+        Ok(())
+    }
+}
+
+/// A pointer to an index too large to send whole: the encoded
+/// [`TreeIndex`](crate::TreeIndex),
+/// cut into ordinary content-addressed chunks.
+///
+/// Served on the tree key *instead of* the index itself, and distinguished
+/// from it by the reply's encoding tag. The threshold matters: an index costs
+/// about 0.05–0.10% of the payload it describes, so the overwhelming majority
+/// are a few KB and are best sent as they always were — one reply, one round
+/// trip. What a descriptor buys is for the minority that are not:
+///
+/// - **Resumability.** Zenoh fragments anything over 64 KiB and a dropped
+///   fragment discards the whole message, so a 1.6 MiB index is 26 fragments
+///   re-fetched in full on every loss. As chunks it resumes hole-by-hole like
+///   everything else.
+/// - **No ceiling.** A monolithic index is bounded by what one reply may
+///   carry; a chunked one is not.
+/// - **Metadata dedup.** Two snapshots of a mostly-unchanged tree share their
+///   index chunks, as restic's model does.
+///
+/// The descriptor is untrusted like everything else: its chunks are verified
+/// individually by address, and the reassembled index is verified by
+/// recomputing the root.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct IndexDescriptor {
+    /// Wire schema version (first field; postcard is positional).
+    pub version: u16,
+    /// The snapshot's identity — what the reassembled index must recompute to.
+    pub root: Hash,
+    /// Hash algorithm of `index_chunks`.
+    pub algo: String,
+    /// The encoded index, in order.
+    ///
+    /// Cut at a **fixed** size, not by CDC: the CDC parameters live *inside*
+    /// the index, so content-defined chunking of the index itself would be
+    /// circular — and an index is written once, so CDC buys nothing on it.
+    pub index_chunks: Vec<crate::tree::ChunkRef>,
+    /// Total encoded length of the index, for bounds-checking before assembly.
+    pub index_len: u64,
+    /// Trailing extension list — see [`Ext`].
+    pub ext: Ext,
+}
+
+impl IndexDescriptor {
+    /// Check a descriptor before fetching anything it points at.
+    pub fn validate(&self, max_index_bytes: usize) -> Result<()> {
+        if self.version != WIRE_VERSION {
+            return Err(BlobError::UnsupportedVersion(self.version));
+        }
+        if self.algo != Hash::ALGO {
+            return Err(BlobError::Protocol(format!(
+                "index descriptor uses unsupported algo {}",
+                self.algo
+            )));
+        }
+        if self.index_chunks.is_empty() {
+            return Err(BlobError::Protocol("index descriptor has no chunks".into()));
+        }
+        if self.index_len > max_index_bytes as u64 {
+            return Err(BlobError::InvalidManifest(format!(
+                "index of {} bytes exceeds the {max_index_bytes} byte limit",
+                self.index_len
+            )));
+        }
+        // The parts must add up to the whole, or assembly is not defined.
+        let summed: u64 = self.index_chunks.iter().map(|c| c.len as u64).sum();
+        if summed != self.index_len {
+            return Err(BlobError::Protocol(format!(
+                "index chunks total {summed} bytes, declared {}",
+                self.index_len
             )));
         }
         Ok(())

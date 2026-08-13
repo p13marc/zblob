@@ -47,7 +47,7 @@ async fn a_bare_content_address_can_be_fetched_and_verified() {
         common::serve(tree_prefix.clone()),
         server_store.clone(),
     );
-    server.register(index.clone()).await;
+    server.register(index.clone()).await.unwrap();
     let handle = server.spawn().await.unwrap();
 
     // No TreeClient, no tree prefix, no ContentStore — just the store.
@@ -111,7 +111,7 @@ async fn a_snapshot_can_be_inspected_without_materializing_it() {
         common::serve(tree_prefix.clone()),
         server_store,
     );
-    server.register(index).await;
+    server.register(index).await.unwrap();
     let handle = server.spawn().await.unwrap();
 
     let client = zblob::TreeClient::builder(

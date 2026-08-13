@@ -49,7 +49,7 @@ async fn compressed_wire_and_store_roundtrip() {
     )
     .compression(ChunkCompression::Zstd { level: 3 })
     .build();
-    server.register(index).await;
+    server.register(index).await.unwrap();
     let handle = server.spawn().await.unwrap();
 
     // The client store also compresses at rest.

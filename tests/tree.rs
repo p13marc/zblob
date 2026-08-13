@@ -124,7 +124,7 @@ async fn tree_roundtrip_with_modes_and_mtime() {
         common::serve(tree_prefix.clone()),
         server_store,
     );
-    server.register(index).await;
+    server.register(index).await.unwrap();
     let handle = server.spawn().await.unwrap();
 
     // Download (pinned) into an empty client store + fresh dest dir.
@@ -189,7 +189,7 @@ async fn reedit_transfers_only_changed_chunks() {
         common::serve(tree_prefix.clone()),
         server_store.clone(),
     );
-    server.register(index1).await;
+    server.register(index1).await.unwrap();
     let handle = server.clone().spawn().await.unwrap();
 
     let client_dir = tempfile::tempdir().unwrap();
@@ -212,7 +212,7 @@ async fn reedit_transfers_only_changed_chunks() {
     // Edit one small file → only its chunk(s) change.
     std::fs::write(src.path().join("sub/hello.txt"), b"hello CHANGED world").unwrap();
     let index2 = build_tree(src.path(), "snap2", &small_cdc(), &*server_store).unwrap();
-    server.register(index2.clone()).await;
+    server.register(index2.clone()).await.unwrap();
 
     client
         .download_tree(
@@ -270,7 +270,7 @@ async fn resume_from_prepopulated_store() {
         common::serve(tree_prefix.clone()),
         server_store.clone(),
     );
-    server.register(index.clone()).await;
+    server.register(index.clone()).await.unwrap();
     let handle = server.spawn().await.unwrap();
 
     // Simulate an interrupted earlier pull: half the chunks already on disk.
@@ -335,7 +335,7 @@ async fn cancellable_reports_progress_and_resumes() {
         common::serve(tree_prefix.clone()),
         server_store,
     );
-    server.register(index).await;
+    server.register(index).await.unwrap();
     let handle = server.spawn().await.unwrap();
 
     // Serial, unbatched fetch so the cancel lands mid-stream deterministically.
@@ -520,7 +520,7 @@ async fn hardlinks_roundtrip() {
         common::serve(tree_prefix.clone()),
         server_store,
     );
-    server.register(index).await;
+    server.register(index).await.unwrap();
     let handle = server.spawn().await.unwrap();
 
     let dest = tempfile::tempdir().unwrap();
@@ -570,13 +570,13 @@ async fn empty_file_dir_and_tree_roundtrip() {
         common::serve(tree_prefix.clone()),
         server_store.clone(),
     );
-    server.register(index).await;
+    server.register(index).await.unwrap();
 
     // A fully-empty tree too.
     let empty_src = tempfile::tempdir().unwrap();
     let empty_index = build_tree(empty_src.path(), "void", &small_cdc(), &*server_store).unwrap();
     assert!(empty_index.entries.is_empty());
-    server.register(empty_index).await;
+    server.register(empty_index).await.unwrap();
     let handle = server.spawn().await.unwrap();
 
     let client = test_client(session.clone(), &store_prefix, &tree_prefix);
@@ -643,7 +643,7 @@ async fn readonly_dir_roundtrips_with_mode_restored() {
         common::serve(tree_prefix.clone()),
         server_store,
     );
-    server.register(index).await;
+    server.register(index).await.unwrap();
     let handle = server.spawn().await.unwrap();
 
     let dest = tempfile::tempdir().unwrap();
@@ -706,7 +706,7 @@ async fn concurrent_tree_downloads_share_one_dirstore() {
         common::serve(tree_prefix.clone()),
         server_store,
     );
-    server.register(index).await;
+    server.register(index).await.unwrap();
     let handle = server.spawn().await.unwrap();
 
     let store_dir = tempfile::tempdir().unwrap();
@@ -798,7 +798,7 @@ async fn content_addressed_trees_pin_by_construction() {
         common::serve(tree_prefix.clone()),
         server_store,
     );
-    server.register(index).await;
+    server.register(index).await.unwrap();
     let handle = server.spawn().await.unwrap();
 
     // One value carries both the key and the pin.
@@ -865,7 +865,7 @@ async fn a_sweep_cannot_collect_an_in_flight_download() {
         common::serve(tree_prefix.clone()),
         server_store,
     );
-    server.register(index.clone()).await;
+    server.register(index.clone()).await.unwrap();
     let handle = server.spawn().await.unwrap();
 
     // The client's store starts empty and holds nothing any tag references, so
@@ -962,7 +962,7 @@ async fn a_wildcard_origin_tier2_prefix_is_answerable() {
         common::serve(tree_prefix.clone()),
         server_store,
     );
-    server.register(index.clone()).await;
+    server.register(index.clone()).await.unwrap();
     let handle = server.spawn().await.unwrap();
 
     let dest = tempfile::tempdir().unwrap();

@@ -50,7 +50,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         tree_serve,
         server_store.clone(),
     );
-    server.register(index.clone()).await;
+    server.register(index.clone()).await.unwrap();
     let handle = server.clone().spawn().await?;
 
     // --- consumer: sync (pinned), then re-sync after an edit ----------------
@@ -72,7 +72,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Edit one file, snapshot again, re-sync: only the delta moves.
     std::fs::write(src.path().join("sub/notes.md"), b"# hello, edited\n")?;
     let index2 = build_tree(src.path(), "snap-2", &cdc, &*server_store)?;
-    server.register(index2.clone()).await;
+    server.register(index2.clone()).await.unwrap();
 
     let stats = client
         .download_tree(

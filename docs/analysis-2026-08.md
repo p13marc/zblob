@@ -394,6 +394,34 @@ content-addressed data in the store** —
 `root_hash` stays the mtime-free canonical digest — identity is unchanged;
 only the *container* of the index moves.
 
+> **[rev] Measured first, and it changes the case.** A `TreeIndex` costs
+> **76–113 bytes per chunk**, i.e. **0.05–0.10% of payload**:
+>
+> | tree | payload | chunks | index |
+> |---|---|---|---|
+> | 10 × 1 MiB files | 10 MiB | 69 | 5.1 KiB |
+> | 200 × 256 KiB files | 50 MiB | 402 | 33 KiB |
+> | 2000 × 64 KiB files | 125 MiB | 1169 | 129 KiB |
+>
+> So of this section's three arguments, two are much weaker than they look.
+> **No metadata dedup** costs ~0.1% per snapshot, not a tier of overhead. The
+> **64 MiB ceiling** is not reached until roughly 670k chunks — about **40 GiB
+> of payload** at default parameters — which is far outside this fleet.
+>
+> The third argument survives, and it is the real one: **a large index cannot
+> resume**. Zenoh fragments anything over 64 KiB, and a dropped fragment
+> discards the whole message, so a 130 KiB index is 2 fragments and a 1.6 MiB
+> one (a ~1 GiB snapshot) is 26 — re-fetched in full on every loss, on exactly
+> the flaky links this fleet has.
+>
+> That argues for making large indices resumable, **not** for putting every
+> index behind a descriptor. Serving a descriptor unconditionally adds a round
+> trip to every tree fetch to fix a problem the common case does not have. So:
+> keep the monolithic reply, and shard *only* an index that exceeds a
+> threshold, distinguishing the two by their `ENC_*` tag — which is what the
+> tags are for. Small trees stay one round trip; large ones become resumable,
+> batched and unbounded.
+
 **[rev] Cap and shard it, don't just move it.** restic caps each index *file*
 at 8 MiB and keeps "an arbitrary number of index files containing information
 on non-disjoint sets of packs" — a discipline designed around exactly the
