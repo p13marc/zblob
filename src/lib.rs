@@ -109,7 +109,7 @@ pub use publish::{
 };
 pub use server::{
     BlobServer, BlobServerBuilder, BlobSource, ErrorCallback, FileBlobSource, MemoryBlobSource,
-    PushPolicy, ReadAtSize, ServerHandle, SourceFingerprint,
+    PushConfig, PushPolicy, ReadAtSize, ServerHandle, SourceFingerprint,
 };
 pub use store::{ContentStore, DirStore, MemoryStore};
 pub use store_client::{ChunkProbe, StoreClient, StoreClientBuilder};

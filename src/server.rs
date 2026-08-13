@@ -163,13 +163,78 @@ pub trait PushPolicy: Send + Sync {
     fn allow(&self, manifest: &Manifest, token: Option<&[u8]>) -> bool;
 }
 
+/// How a server accepts verified pushes (uploads), passed to
+/// [`BlobServerBuilder::accept_push`].
+///
+/// The resource bounds live here rather than on the server builder because
+/// they are meaningless without a push configuration. When they were builder
+/// methods, `.push_max_concurrent(2).accept_push(policy, dir)` compiled and
+/// silently kept the default of 8 — the setter found no config to write into
+/// and did nothing. Their doc comments said "call after `accept_push`", which
+/// is documentation compensating for a type error; the type now enforces it.
 #[derive(Clone)]
-struct PushConfig {
+pub struct PushConfig {
     policy: Arc<dyn PushPolicy>,
     spool_dir: std::path::PathBuf,
     max_blob_size: u64,
     max_concurrent: usize,
     idle_timeout: std::time::Duration,
+}
+
+impl std::fmt::Debug for PushConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PushConfig")
+            .field("spool_dir", &self.spool_dir)
+            .field("max_blob_size", &self.max_blob_size)
+            .field("max_concurrent", &self.max_concurrent)
+            .field("idle_timeout", &self.idle_timeout)
+            .finish_non_exhaustive()
+    }
+}
+
+impl PushConfig {
+    /// A push configuration with default bounds: `policy` authorizes each
+    /// offer and slice, `spool_dir` holds in-progress `.part`s and completed
+    /// blobs.
+    #[must_use]
+    pub fn new(policy: Arc<dyn PushPolicy>, spool_dir: impl Into<std::path::PathBuf>) -> Self {
+        Self {
+            policy,
+            spool_dir: spool_dir.into(),
+            max_blob_size: 1 << 40,
+            max_concurrent: 8,
+            idle_timeout: std::time::Duration::from_secs(3600),
+        }
+    }
+
+    /// Largest `total_len` an upload offer may declare (default 1 TiB) — the
+    /// bound on spool preallocation.
+    #[must_use]
+    pub fn max_blob_size(mut self, bytes: u64) -> Self {
+        self.max_blob_size = bytes;
+        self
+    }
+
+    /// Max concurrent in-progress pushes (default 8).
+    #[must_use]
+    pub fn max_concurrent(mut self, n: usize) -> Self {
+        self.max_concurrent = n.max(1);
+        self
+    }
+
+    /// Idle time after which an abandoned push is evicted and its spool files
+    /// removed (default 1 h).
+    #[must_use]
+    pub fn idle_timeout(mut self, t: std::time::Duration) -> Self {
+        self.idle_timeout = t;
+        self
+    }
+
+    /// The directory holding in-progress and completed pushes.
+    #[must_use]
+    pub fn spool_dir(&self) -> &std::path::Path {
+        &self.spool_dir
+    }
 }
 
 /// An in-progress push: spooled `.part` + resume bitfield, mirroring the
@@ -284,58 +349,31 @@ impl BlobServerBuilder {
         self
     }
 
-    /// Accept verified pushes (uploads): `policy` authorizes each offer and
-    /// slice, `spool_dir` holds in-progress `.part`s and completed blobs.
+    /// Accept verified pushes (uploads) under `cfg` — see [`PushConfig`] for
+    /// the policy hook, the spool directory and the resource bounds.
+    ///
     /// Completed uploads are automatically registered and served. Pushes are
     /// **rejected unless this is configured**, and an offer for an id that is
     /// already registered with different content is refused (a push must
-    /// never hijack a served blob).
+    /// never hijack a served blob). Completed `<id>.blob` files stay in the
+    /// spool directory as the registered blob's backing store — remove them
+    /// after [`BlobServer::unregister`] when a pushed blob is retired.
     ///
-    /// Resource bounds (see the `push_*` builder methods): at most
-    /// `push_max_concurrent` in-progress pushes (default 8); pushes idle
-    /// longer than `push_idle_timeout` (default 1 h) are evicted and their
-    /// spool files removed. Completed `<id>.blob` files stay in `spool_dir`
-    /// as the registered blob's backing store — remove them after
-    /// [`BlobServer::unregister`] when a pushed blob is retired.
-    pub fn accept_push(
-        mut self,
-        policy: Arc<dyn PushPolicy>,
-        spool_dir: impl Into<std::path::PathBuf>,
-    ) -> Self {
-        self.cfg.push = Some(PushConfig {
-            policy,
-            spool_dir: spool_dir.into(),
-            max_blob_size: 1 << 40,
-            max_concurrent: 8,
-            idle_timeout: std::time::Duration::from_secs(3600),
-        });
-        self
-    }
-
-    /// Largest `total_len` an upload offer may declare (default 1 TiB) — the
-    /// bound on spool preallocation. Call after [`accept_push`](Self::accept_push).
-    pub fn push_max_blob_size(mut self, bytes: u64) -> Self {
-        if let Some(push) = &mut self.cfg.push {
-            push.max_blob_size = bytes;
-        }
-        self
-    }
-
-    /// Max concurrent in-progress pushes (default 8). Call after
-    /// [`accept_push`](Self::accept_push).
-    pub fn push_max_concurrent(mut self, n: usize) -> Self {
-        if let Some(push) = &mut self.cfg.push {
-            push.max_concurrent = n.max(1);
-        }
-        self
-    }
-
-    /// Idle time after which an abandoned push is evicted and its spool files
-    /// removed (default 1 h). Call after [`accept_push`](Self::accept_push).
-    pub fn push_idle_timeout(mut self, t: std::time::Duration) -> Self {
-        if let Some(push) = &mut self.cfg.push {
-            push.idle_timeout = t;
-        }
+    /// ```no_run
+    /// # use std::sync::Arc;
+    /// # use zblob::{BlobServer, PushConfig, PushPolicy, Manifest, ServePrefix};
+    /// # fn f(session: Arc<zenoh::Session>, prefix: ServePrefix, policy: Arc<dyn PushPolicy>) {
+    /// let server = BlobServer::builder(session, prefix)
+    ///     .accept_push(
+    ///         PushConfig::new(policy, "/var/spool/zblob")
+    ///             .max_concurrent(2)
+    ///             .max_blob_size(64 << 20),
+    ///     )
+    ///     .build();
+    /// # }
+    /// ```
+    pub fn accept_push(mut self, cfg: PushConfig) -> Self {
+        self.cfg.push = Some(cfg);
         self
     }
 

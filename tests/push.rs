@@ -10,7 +10,8 @@ use std::time::Duration;
 use common::{content_hash, open_session, pseudo_random, unique_prefix};
 use zblob::{
     BlobClient, BlobError, BlobServer, BlobSpec, CancelToken, DownloadRequest, MIN_CHUNK_SIZE,
-    Manifest, MemoryBlobSource, Overwrite, Progress, ProgressSink, PushPolicy, RetryPolicy,
+    Manifest, MemoryBlobSource, Overwrite, Progress, ProgressSink, PushConfig, PushPolicy,
+    RetryPolicy,
 };
 
 /// Allows pushes carrying the byte token `"secret"`.
@@ -40,7 +41,7 @@ async fn authorized_push_lands_and_serves() {
     let spool = tempfile::tempdir().unwrap();
 
     let server = BlobServer::builder(session.clone(), common::serve(prefix.clone()))
-        .accept_push(Arc::new(TokenPolicy), spool.path())
+        .accept_push(PushConfig::new(Arc::new(TokenPolicy), spool.path()))
         .build();
     let handle = server.spawn().await.unwrap();
 
@@ -91,7 +92,7 @@ async fn unauthorized_or_unconfigured_push_denied() {
     let spool = tempfile::tempdir().unwrap();
 
     let server = BlobServer::builder(session.clone(), common::serve(prefix.clone()))
-        .accept_push(Arc::new(TokenPolicy), spool.path())
+        .accept_push(PushConfig::new(Arc::new(TokenPolicy), spool.path()))
         .build();
     let handle = server.spawn().await.unwrap();
 
@@ -148,7 +149,7 @@ async fn interrupted_upload_resumes_from_spool() {
     let spool = tempfile::tempdir().unwrap();
 
     let server = BlobServer::builder(session.clone(), common::serve(prefix.clone()))
-        .accept_push(Arc::new(TokenPolicy), spool.path())
+        .accept_push(PushConfig::new(Arc::new(TokenPolicy), spool.path()))
         .build();
     let handle = server.spawn().await.unwrap();
 
@@ -247,7 +248,7 @@ async fn empty_blob_push_finalizes_at_offer() {
     let spool = tempfile::tempdir().unwrap();
 
     let server = BlobServer::builder(session.clone(), common::serve(prefix.clone()))
-        .accept_push(Arc::new(TokenPolicy), spool.path())
+        .accept_push(PushConfig::new(Arc::new(TokenPolicy), spool.path()))
         .build();
     let handle = server.spawn().await.unwrap();
 
@@ -296,7 +297,7 @@ async fn push_cannot_hijack_registered_blob() {
 
     let original = pseudo_random(MIN_CHUNK_SIZE as usize * 2, 71);
     let server = BlobServer::builder(session.clone(), common::serve(prefix.clone()))
-        .accept_push(Arc::new(TokenPolicy), spool.path())
+        .accept_push(PushConfig::new(Arc::new(TokenPolicy), spool.path()))
         .build();
     let registered = server
         .register_source(
@@ -415,8 +416,7 @@ async fn concurrent_push_cap_enforced() {
     let spool = tempfile::tempdir().unwrap();
 
     let server = BlobServer::builder(session.clone(), common::serve(prefix.clone()))
-        .accept_push(Arc::new(TokenPolicy), spool.path())
-        .push_max_concurrent(1)
+        .accept_push(PushConfig::new(Arc::new(TokenPolicy), spool.path()).max_concurrent(1))
         .build();
     let handle = server.spawn().await.unwrap();
 
@@ -504,7 +504,7 @@ async fn a_refusing_co_server_cannot_deny_an_accepting_one() {
 
     // One server accepts pushes…
     let accepting = BlobServer::builder(session.clone(), common::serve(prefix.clone()))
-        .accept_push(Arc::new(OpenPolicy), spool.path())
+        .accept_push(PushConfig::new(Arc::new(OpenPolicy), spool.path()))
         .build()
         .spawn()
         .await

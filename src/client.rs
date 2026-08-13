@@ -887,7 +887,20 @@ impl BlobClient {
                 // state for this id and will reject every slice; the one that
                 // accepted acknowledges them.
                 let mut slice_refusal: Option<String> = None;
-                while let Ok(reply) = replies.recv_async().await {
+                loop {
+                    // Waiting for an ack is the long pole of a push round; a
+                    // cancel here must not have to outlast the query timeout.
+                    let Some(recv) = cancel.until_cancelled(replies.recv_async()).await else {
+                        sink.emit(Progress::Cancelled {
+                            received: sent,
+                            total: count,
+                        });
+                        return Err(BlobError::Cancelled {
+                            received: sent,
+                            total: count,
+                        });
+                    };
+                    let Ok(reply) = recv else { break };
                     match reply.result() {
                         Ok(sample) if sample.encoding().to_string() == ENC_PUSH => {
                             match decode::<u32>(&sample.payload().to_bytes()) {
@@ -1159,11 +1172,18 @@ impl BlobClient {
                 .await
                 .map_err(BlobError::zenoh)?;
 
-            while let Ok(reply) = replies.recv_async().await {
-                if cancel.is_cancelled() {
+            loop {
+                // Wait *and* watch the token: a cancel must not be held up by
+                // a reply that may never arrive (see `cancel.rs`). `None` here
+                // is cancellation, which persists and returns; a closed channel
+                // is an exhausted round, which falls through to the retry
+                // logic below. Collapsing the two would turn a cancel into a
+                // backoff sleep.
+                let Some(recv) = cancel.until_cancelled(replies.recv_async()).await else {
                     drop(replies);
                     return Self::persist_cancel(file, state, part, sink, count).await;
-                }
+                };
+                let Ok(reply) = recv else { break };
                 let Ok(sample) = reply.result() else { continue };
                 if sample.encoding().to_string() != ENC_SLICE {
                     continue;
@@ -1390,7 +1410,16 @@ impl BlobClient {
             }
             drop(tx);
 
-            while let Some((index, leaves, holder, rejected)) = rx.recv().await {
+            loop {
+                // As in the single-origin loop: cancellation must be observed
+                // while waiting on the holders, not only between rounds.
+                // Dropping `tasks` here aborts the outstanding queries.
+                let Some(next) = cancel.until_cancelled(rx.recv()).await else {
+                    return Self::persist_cancel(file, state, Some(part), sink, count).await;
+                };
+                let Some((index, leaves, holder, rejected)) = next else {
+                    break;
+                };
                 if rejected > 0 {
                     rejects[holder] += rejected;
                     stats.rejected += rejected;

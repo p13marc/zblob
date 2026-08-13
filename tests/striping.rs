@@ -16,7 +16,7 @@ use std::time::Duration;
 use common::{content_hash, open_session, pseudo_random, unique_prefix};
 use zblob::{
     BlobClient, BlobServer, BlobSpec, CancelToken, DownloadRequest, MIN_CHUNK_SIZE,
-    MemoryBlobSource, Overwrite, RetryPolicy,
+    MemoryBlobSource, Overwrite, PushConfig, RetryPolicy,
 };
 
 fn client(session: Arc<zenoh::Session>, prefix: &str) -> BlobClient {
@@ -142,7 +142,7 @@ async fn tier1_availability_is_all_or_nothing_by_construction() {
         }
     }
     let handle = BlobServer::builder(session.clone(), common::serve(prefix.clone()))
-        .accept_push(Arc::new(Yes), spool.path())
+        .accept_push(PushConfig::new(Arc::new(Yes), spool.path()))
         .build()
         .spawn()
         .await

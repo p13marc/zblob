@@ -127,3 +127,98 @@ async fn delete_partial_clears_state() {
     handle.shutdown().await.unwrap();
     session.close().await.unwrap();
 }
+
+/// A cancel must be observed *while waiting on the network*, not only between
+/// replies — the failure this asserts against had `is_cancelled()` checked
+/// only after `recv_async().await`, so a stalled peer made the observed
+/// latency of `cancel()` the query timeout rather than "as soon as it can".
+///
+/// The peer here is the worst realistic case and the one the old code handled
+/// worst: it answers the manifest, then accepts every slice query and never
+/// replies to any of them, holding each open. Zenoh finalizes a query only
+/// once every matching queryable has completed, so the client genuinely waits
+/// out the full timeout.
+///
+/// The assertion is a ratio of the client's own configured timeout, not a wall
+/// clock constant: under the old behaviour this returned in ~5 s (the timeout),
+/// under the new one in milliseconds. Anything under a fifth of the timeout
+/// can only be the token.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn cancel_is_observed_while_stalled_on_a_silent_peer() {
+    use zblob::wire::{self, ENC_MANIFEST};
+    use zblob::{Manifest, manifest_key};
+
+    let session = open_session().await;
+    let prefix = unique_prefix();
+    let dir = tempfile::tempdir().unwrap();
+    let dest = dir.path().join("stalled.bin");
+
+    let data = pseudo_random(MIN_CHUNK_SIZE as usize * 8, 0xDEAD);
+    let manifest = Manifest {
+        version: wire::WIRE_VERSION,
+        id: "stalled".into(),
+        filename: None,
+        total_len: data.len() as u64,
+        chunk_size: MIN_CHUNK_SIZE,
+        root: content_hash(&data),
+        created_ms: 0,
+        ext: Vec::new(),
+    };
+
+    let q = session
+        .declare_queryable(format!("{prefix}/**"))
+        .await
+        .unwrap();
+    let srv_prefix = prefix.clone();
+    let peer = tokio::spawn(async move {
+        // Queries are kept alive, never answered and never dropped: dropping
+        // one would complete it and let the client's `get` finalize early.
+        let mut held = Vec::new();
+        while let Ok(query) = q.recv_async().await {
+            if query.key_expr().as_str().ends_with("/manifest") {
+                let _ = query
+                    .reply(
+                        manifest_key(&srv_prefix, "stalled"),
+                        wire::encode(&manifest).unwrap(),
+                    )
+                    .encoding(ENC_MANIFEST)
+                    .await;
+            } else {
+                held.push(query);
+            }
+        }
+    });
+
+    let timeout = Duration::from_secs(5);
+    let client = BlobClient::builder(session.clone(), common::query(&prefix))
+        .query_timeout(timeout)
+        .build();
+
+    let token = CancelToken::new();
+    let t = token.clone();
+    tokio::spawn(async move {
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        t.cancel();
+    });
+
+    let started = std::time::Instant::now();
+    let err = client
+        .download_to(&DownloadRequest::new("stalled"), &dest, &(), &token)
+        .await
+        .unwrap_err();
+    let elapsed = started.elapsed();
+
+    assert!(
+        matches!(err, BlobError::Cancelled { .. }),
+        "expected a cancellation, got {err:?}"
+    );
+    assert!(
+        elapsed < timeout / 5,
+        "cancel took {elapsed:?} of a {timeout:?} timeout — it was polled, not awaited"
+    );
+    // Cancellation still means *paused*: the partial survives for a resume.
+    assert!(dest.with_extension("bin.part").exists());
+
+    peer.abort();
+    session.close().await.unwrap();
+}

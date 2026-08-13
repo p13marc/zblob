@@ -316,8 +316,26 @@ pub async fn receive_fanout(
                 total: 0,
             });
         }
-        let sample = match tokio::time::timeout(cfg.stall_timeout, subscriber.recv_async()).await {
-            Ok(Ok(sample)) => sample,
+        // Watch the token *while* waiting: a cancel must not have to outlast
+        // `stall_timeout` (see `cancel.rs`).
+        let waited = cancel
+            .until_cancelled(tokio::time::timeout(
+                cfg.stall_timeout,
+                subscriber.recv_async(),
+            ))
+            .await;
+        let sample = match waited {
+            Some(Ok(Ok(sample))) => sample,
+            None => {
+                sink.emit(Progress::Cancelled {
+                    received: 0,
+                    total: 0,
+                });
+                return Err(BlobError::Cancelled {
+                    received: 0,
+                    total: 0,
+                });
+            }
             _ => {
                 return Err(deferred_reject.unwrap_or(BlobError::Incomplete {
                     received: 0,
@@ -447,16 +465,31 @@ pub async fn receive_fanout(
                     total: count,
                 });
             }
-            let sample =
-                match tokio::time::timeout(cfg.stall_timeout, subscriber.recv_async()).await {
-                    Ok(Ok(sample)) => sample,
-                    _ => {
-                        return Err(BlobError::Incomplete {
-                            received,
-                            total: count,
-                        });
-                    }
-                };
+            let waited = cancel
+                .until_cancelled(tokio::time::timeout(
+                    cfg.stall_timeout,
+                    subscriber.recv_async(),
+                ))
+                .await;
+            let sample = match waited {
+                Some(Ok(Ok(sample))) => sample,
+                None => {
+                    sink.emit(Progress::Cancelled {
+                        received,
+                        total: count,
+                    });
+                    return Err(BlobError::Cancelled {
+                        received,
+                        total: count,
+                    });
+                }
+                _ => {
+                    return Err(BlobError::Incomplete {
+                        received,
+                        total: count,
+                    });
+                }
+            };
             let Ok((version, frame)) =
                 crate::wire::decode::<(u16, FanoutFrame)>(&sample.payload().to_bytes())
             else {

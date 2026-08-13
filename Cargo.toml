@@ -24,6 +24,9 @@ exclude = ["fuzz/", ".forgejo/", "scripts/"]
 [dependencies]
 zenoh = { version = "1.9", features = ["unstable"] }
 tokio = { version = "1", features = ["fs", "io-util", "rt", "sync", "macros", "time"] }
+# For `CancellationToken` only: its `sync` module is not feature-gated, and
+# zenoh already pulls the crate in, so this costs no extra compilation.
+tokio-util = { version = "0.7", default-features = false }
 serde = { version = "1", features = ["derive"] }
 thiserror = "2"
 # Pinned to the patch, not just the major. 4.0.0 replaced a rounded log2 with
@@ -62,7 +65,7 @@ proptest = "1"
 # library itself uses.
 bao-tree = { version = "0.16", default-features = false, features = ["fs", "validate"] }
 blake3 = "1.8"
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "time"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "test-util"] }
 criterion = "0.5"
 
 [[bench]]
