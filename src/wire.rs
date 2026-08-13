@@ -180,8 +180,11 @@ impl HaveBits {
     }
 
     /// How many entries are held.
+    ///
+    /// Bounded by the bitfield's length, not by the declared count — see
+    /// [`Availability::count`].
     pub fn count_set(&self) -> u32 {
-        (0..self.count).filter(|i| self.is_set(*i)).count() as u32
+        count_bits(&self.bits, self.count)
     }
 
     /// Check a probe reply against the question it answers: right version,
@@ -361,12 +364,16 @@ impl Availability {
 
     /// How many chunks are available.
     ///
-    /// Counts only bits within `chunk_count`. Summing the whole byte vector
-    /// would let a responder over-report by setting the final byte's padding
-    /// bits, or by sending more bytes than the count needs — this is a value
-    /// off the network, so it is not permitted to exceed its own bound.
+    /// Counts only bits within `chunk_count`, so a responder cannot
+    /// over-report by setting the final byte's padding bits or by sending more
+    /// bytes than its count needs.
+    ///
+    /// Note the loop bound: over the **bytes**, not over `chunk_count`.
+    /// `chunk_count` is an unvalidated `u32` off the network, so iterating it
+    /// would let a four-byte field buy four billion iterations — which is how
+    /// the first version of this went, and what the fuzzer noticed.
     pub fn count(&self) -> u32 {
-        (0..self.chunk_count).filter(|i| self.is_set(*i)).count() as u32
+        count_bits(&self.bits, self.chunk_count)
     }
 
     /// Check an availability reply against its own claims: the schema version,
@@ -395,6 +402,23 @@ impl Availability {
         }
         Ok(())
     }
+}
+
+/// Population count of the first `limit` bits of `bits`, LSB-first.
+///
+/// Walks the bytes actually present, masking the final partial byte, so the
+/// cost is bounded by the data rather than by the declared count — which is an
+/// unvalidated number from a remote peer.
+fn count_bits(bits: &[u8], limit: u32) -> u32 {
+    let full = (limit / 8) as usize;
+    let mut n: u32 = bits.iter().take(full).map(|b| b.count_ones()).sum();
+    if let Some(last) = bits.get(full) {
+        let rem = limit % 8;
+        if rem > 0 {
+            n += (last & ((1u8 << rem) - 1)).count_ones();
+        }
+    }
+    n
 }
 
 /// Encode a control message to postcard bytes.
@@ -448,6 +472,38 @@ mod properties {
                 len == chunk_count.div_ceil(8) as usize
             );
         }
+    }
+
+    /// Counting must cost the *bitfield*, not the declared count.
+    ///
+    /// A `chunk_count` of `u32::MAX` with an empty bitfield is four bytes on
+    /// the wire; if counting iterated the count it would buy four billion
+    /// iterations per message. The first version of `count()` did exactly
+    /// that, and the fuzzer found it — as a 750x slowdown, which is what a
+    /// denial of service looks like from the inside.
+    #[test]
+    fn counting_is_bounded_by_the_bitfield_not_the_claim() {
+        let hostile = Availability {
+            version: WIRE_VERSION,
+            chunk_count: u32::MAX,
+            bits: vec![0xff; 4],
+        };
+        let started = std::time::Instant::now();
+        assert_eq!(hostile.count(), 32, "only the bits present may count");
+        assert!(
+            started.elapsed() < std::time::Duration::from_millis(50),
+            "counting took {:?} — it is iterating the claim, not the data",
+            started.elapsed()
+        );
+
+        let hostile = HaveBits {
+            version: WIRE_VERSION,
+            count: u32::MAX,
+            bits: vec![0xff; 4],
+        };
+        let started = std::time::Instant::now();
+        assert_eq!(hostile.count_set(), 32);
+        assert!(started.elapsed() < std::time::Duration::from_millis(50));
     }
 
     /// The honest constructor must satisfy its own validator — otherwise the

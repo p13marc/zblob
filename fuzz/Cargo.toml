@@ -38,3 +38,10 @@ path = "fuzz_targets/decode_index.rs"
 test = false
 doc = false
 bench = false
+
+[[bin]]
+name = "decode_wire"
+path = "fuzz_targets/decode_wire.rs"
+test = false
+doc = false
+bench = false
