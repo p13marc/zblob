@@ -648,6 +648,11 @@ mod properties {
         fn validate_accepts_only_well_sized_bitfields(
             chunk_count in 0u32..5000,
             len in 0usize..800,
+            // The cap was always `u32::MAX` here, so its branch in `validate`
+            // was never taken by any test — and it is the one that keeps a
+            // peer from naming a blob larger than this client will allocate
+            // for.
+            max_chunks in 1u32..5000,
         ) {
             let avail = Availability {
                 version: WIRE_VERSION,
@@ -655,8 +660,8 @@ mod properties {
                 bits: vec![0u8; len],
             };
             prop_assert_eq!(
-                avail.validate(u32::MAX).is_ok(),
-                len == chunk_count.div_ceil(8) as usize
+                avail.validate(max_chunks).is_ok(),
+                len == chunk_count.div_ceil(8) as usize && chunk_count <= max_chunks
             );
         }
     }
@@ -691,6 +696,232 @@ mod properties {
         let started = std::time::Instant::now();
         assert_eq!(hostile.count_set(), 32);
         assert!(started.elapsed() < std::time::Duration::from_millis(50));
+    }
+
+    proptest! {
+        /// A want-list is a *request*, so its validator is the only thing
+        /// standing between a peer and unbounded server work. Whatever it
+        /// accepts must satisfy every bound the server then relies on.
+        #[test]
+        fn accepted_want_lists_are_bounded_and_distinct(
+            n in 0usize..40,
+            max in 1usize..32,
+            version in prop_oneof![Just(WIRE_VERSION), 0u16..8],
+            repeat in any::<bool>(),
+        ) {
+            let mut hashes: Vec<Hash> = (0..n).map(|i| Hash::of(&[i as u8])).collect();
+            if repeat && !hashes.is_empty() {
+                hashes.push(hashes[0]);
+            }
+            let w = WantList { version, hashes };
+            if w.validate(max).is_ok() {
+                prop_assert_eq!(w.version, WIRE_VERSION);
+                prop_assert!(!w.hashes.is_empty());
+                prop_assert!(w.hashes.len() <= max);
+                let distinct: std::collections::HashSet<_> = w.hashes.iter().collect();
+                prop_assert_eq!(distinct.len(), w.hashes.len());
+            }
+        }
+
+        /// A probe reply's size must be a function of the *question* — that is
+        /// the whole reason tier 2 may have a probe at all (RFC 07 §3). So a
+        /// reply that validates has exactly as many entries as were asked
+        /// about, and a bitfield sized to them.
+        #[test]
+        fn accepted_have_bits_answer_exactly_what_was_asked(
+            asked in 0usize..64,
+            count in 0u32..64,
+            bit_len in 0usize..16,
+            version in prop_oneof![Just(WIRE_VERSION), 0u16..8],
+        ) {
+            let h = HaveBits { version, count, bits: vec![0xAA; bit_len] };
+            if h.validate(asked).is_ok() {
+                prop_assert_eq!(h.version, WIRE_VERSION);
+                prop_assert_eq!(h.count as usize, asked);
+                prop_assert_eq!(h.bits.len(), h.count.div_ceil(8) as usize);
+                // …and reading every answered bit stays in bounds.
+                for i in 0..h.count {
+                    let _ = h.is_set(i);
+                }
+                prop_assert!(h.count_set() <= h.count);
+            }
+        }
+
+        /// A descriptor commits the client to fetching what it names, so an
+        /// accepted one must add up and stay under the cap.
+        #[test]
+        fn accepted_index_descriptors_add_up(
+            lens in prop::collection::vec(0u32..4096, 0..8),
+            declared in 0u64..40_000,
+            max in 1usize..30_000,
+            version in prop_oneof![Just(WIRE_VERSION), 0u16..8],
+        ) {
+            let d = IndexDescriptor {
+                version,
+                root: Hash::of(b"root"),
+                algo: crate::hash::HashAlgo::Blake3,
+                index_chunks: lens
+                    .iter()
+                    .enumerate()
+                    .map(|(i, len)| crate::tree::ChunkRef {
+                        hash: Hash::of(&[i as u8]),
+                        len: *len,
+                    })
+                    .collect(),
+                index_len: declared,
+                ext: Ext::new(),
+            };
+            if d.validate(max).is_ok() {
+                prop_assert_eq!(d.version, WIRE_VERSION);
+                prop_assert!(!d.index_chunks.is_empty());
+                prop_assert!(d.index_len <= max as u64);
+                let summed: u64 = d.index_chunks.iter().map(|c| u64::from(c.len)).sum();
+                prop_assert_eq!(summed, d.index_len);
+            }
+        }
+
+        /// A snapshot probe that validates cannot claim more than it counts —
+        /// the arithmetic a caller does with it (a completeness ratio) has no
+        /// other guard.
+        #[test]
+        fn accepted_tree_probes_cannot_claim_more_than_the_total(
+            present in 0u32..1000,
+            total in 0u32..1000,
+            have_index in any::<bool>(),
+            version in prop_oneof![Just(WIRE_VERSION), 0u16..8],
+        ) {
+            let p = TreeProbe {
+                version,
+                have_index,
+                chunks_present: present,
+                chunks_total: total,
+            };
+            if p.validate().is_ok() {
+                prop_assert_eq!(p.version, WIRE_VERSION);
+                prop_assert!(p.chunks_present <= p.chunks_total);
+            }
+        }
+    }
+
+    /// Discriminating power for the four properties above: each validator must
+    /// actually *refuse* the shapes it claims to, or "whatever it accepts
+    /// satisfies X" holds because it accepts nothing — or because it accepts
+    /// everything and X is trivially true of the generator.
+    #[test]
+    fn the_new_validators_refuse_what_they_claim_to() {
+        let h = Hash::of(b"a");
+
+        // WantList: version, empty, over-cap, duplicate.
+        assert!(
+            WantList {
+                version: WIRE_VERSION + 1,
+                hashes: vec![h]
+            }
+            .validate(8)
+            .is_err()
+        );
+        assert!(WantList::new(vec![]).validate(8).is_err());
+        assert!(
+            WantList::new(vec![h, Hash::of(b"b"), Hash::of(b"c")])
+                .validate(2)
+                .is_err()
+        );
+        assert!(WantList::new(vec![h, h]).validate(8).is_err());
+        assert!(
+            WantList::new(vec![h]).validate(8).is_ok(),
+            "the honest case must pass"
+        );
+
+        // HaveBits: version, wrong count, wrong bitfield length.
+        assert!(
+            HaveBits {
+                version: WIRE_VERSION + 1,
+                count: 8,
+                bits: vec![0]
+            }
+            .validate(8)
+            .is_err()
+        );
+        assert!(
+            HaveBits {
+                version: WIRE_VERSION,
+                count: 9,
+                bits: vec![0, 0]
+            }
+            .validate(8)
+            .is_err()
+        );
+        assert!(
+            HaveBits {
+                version: WIRE_VERSION,
+                count: 8,
+                bits: vec![0, 0]
+            }
+            .validate(8)
+            .is_err()
+        );
+        assert!(
+            HaveBits {
+                version: WIRE_VERSION,
+                count: 8,
+                bits: vec![0]
+            }
+            .validate(8)
+            .is_ok()
+        );
+
+        // IndexDescriptor: no chunks, over-cap, parts that do not sum.
+        let desc = |chunks: Vec<u32>, len: u64| IndexDescriptor {
+            version: WIRE_VERSION,
+            root: h,
+            algo: crate::hash::HashAlgo::Blake3,
+            index_chunks: chunks
+                .iter()
+                .enumerate()
+                .map(|(i, l)| crate::tree::ChunkRef {
+                    hash: Hash::of(&[i as u8]),
+                    len: *l,
+                })
+                .collect(),
+            index_len: len,
+            ext: Ext::new(),
+        };
+        assert!(desc(vec![], 0).validate(1000).is_err());
+        assert!(desc(vec![100, 100], 200).validate(100).is_err());
+        assert!(desc(vec![100, 100], 300).validate(1000).is_err());
+        assert!(desc(vec![100, 100], 200).validate(1000).is_ok());
+
+        // TreeProbe: version, and claiming more than the total.
+        assert!(
+            TreeProbe {
+                version: WIRE_VERSION + 1,
+                have_index: true,
+                chunks_present: 1,
+                chunks_total: 1
+            }
+            .validate()
+            .is_err()
+        );
+        assert!(
+            TreeProbe {
+                version: WIRE_VERSION,
+                have_index: true,
+                chunks_present: 2,
+                chunks_total: 1
+            }
+            .validate()
+            .is_err()
+        );
+        assert!(
+            TreeProbe {
+                version: WIRE_VERSION,
+                have_index: true,
+                chunks_present: 1,
+                chunks_total: 1
+            }
+            .validate()
+            .is_ok()
+        );
     }
 
     /// The honest constructor must satisfy its own validator — otherwise the

@@ -31,9 +31,20 @@ pub fn unique_prefix() -> String {
 }
 
 /// Deterministic pseudo-random bytes (xorshift64, no rand dependency).
+///
+/// `seed` is mixed rather than used directly: the state must be non-zero for
+/// xorshift, and the obvious `seed | 1` collapses every even seed onto its odd
+/// successor — so `pseudo_random(n, 900)` and `pseudo_random(n, 901)` returned
+/// *byte-identical* data. A test using consecutive seeds for "distinct"
+/// fixtures silently got duplicates, which is invisible until something
+/// content-addressed deduplicates them.
 pub fn pseudo_random(len: usize, seed: u64) -> Vec<u8> {
     let mut out = Vec::with_capacity(len);
-    let mut x = seed | 1;
+    let mut x = seed
+        .wrapping_mul(0x9E37_79B9_7F4A_7C15)
+        .rotate_left(31)
+        .wrapping_add(0xD1B5_4A32_D192_ED03)
+        | 1;
     for _ in 0..len {
         x ^= x << 13;
         x ^= x >> 7;
