@@ -189,6 +189,12 @@ Three layers, because the first one alone is what let real defects through:
    fanout receiver a hostile publisher could hold open forever. They are where
    new invariants belong.
 
+**Coverage is ~89% of lines** (`cargo llvm-cov --all-features --summary-only`,
+2026-08-13). It is a floor to hold, not a target to game: the number went from
+77% to 89% during the 0.3 pre-release review, and the tests that moved it
+found five real defects. The weakest files are `server.rs` (81%) and
+`fanout.rs` (77%), both dominated by error-reply paths.
+
 **When adding a defence, add it at layer 2 or 3.** A scenario test for the one
 input that motivated the fix is not coverage — it is a regression pin. Also
 assert the test's own discriminating power (the honest control must pass and

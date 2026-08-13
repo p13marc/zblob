@@ -169,7 +169,16 @@ fn index_validation_never_panics_on_hostile_paths() {
             entries,
             root_hash: Hash::of(b"whatever"),
         };
-        let _ = index.validate(); // must not panic (root mismatch or path error)
+        // Must not panic — and must not stop at "duplicate entry path", which
+        // is what the same-path version did on *every* iteration, so the
+        // generated symlink target was never examined.
+        if let Err(e) = index.validate() {
+            assert!(
+                !e.to_string().contains("duplicate entry path"),
+                "the two entries must have distinct paths, or the symlink arm \
+                 is unreachable: {e}"
+            );
+        }
     }
 
     // Discriminating power: the loop above only proves "no panic", which a
