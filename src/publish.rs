@@ -15,8 +15,16 @@
 //! transport, *not* that a storage retained it — and index/chunk keys may land
 //! on different storages with no ordering guarantee. [`SnapshotPublisher::publish`]
 //! therefore finishes with a **read-back settle phase**: it GETs the index and
-//! a sample of chunk keys until they answer (or `settle` expires), so "publish
-//! returned Ok" means "a client can fetch this now".
+//! a sample of chunk keys until they answer (or `settle` expires).
+//!
+//! Be precise about what that buys, because the obvious reading — "publish
+//! returned Ok, so a client can fetch this now" — is only true under
+//! [`SettleCoverage::All`]. The default is `Sample(8)`, which establishes that
+//! the storage received *something* and says nothing about the chunks it did
+//! not probe. And **any** responder satisfies a probe, so a [`TreeServer`] on
+//! the same prefix makes the phase report success without a storage having
+//! retained anything — easy to arrange accidentally while developing. Use
+//! `All` when the producer is about to exit.
 
 use std::sync::Arc;
 use std::time::Duration;

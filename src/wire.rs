@@ -1,4 +1,4 @@
-//! v2 wire encoding — postcard for every control message.
+//! Wire encoding (v3) — postcard for every control message.
 //!
 //! v1 let each server/client pair pick JSON or CBOR at construction time,
 //! which meant a `Format` mismatch surfaced as an opaque decode error deep in

@@ -17,15 +17,30 @@
 //! automatic — `download_tree` takes a temp tag over the snapshot's chunks for
 //! the duration of the transfer:
 //!
-//! ```ignore
+//! ```no_run
+//! # use std::path::Path;
+//! # use std::sync::Arc;
+//! # use zblob::{CancelToken, ContentStore, DownloadRequest, QueryPrefix, TreeClient, TreeIndex, gc};
+//! # async fn f(
+//! #     session: zenoh::Session,
+//! #     store_prefix: QueryPrefix,
+//! #     tree_prefix: QueryPrefix,
+//! #     state_dir: &Path,
+//! #     store: Arc<dyn ContentStore>,
+//! #     req: DownloadRequest,
+//! #     dest: &Path,
+//! #     index: &TreeIndex,
+//! #     cancel: CancelToken,
+//! # ) -> zblob::Result<()> {
 //! let temps = Arc::new(gc::TempTags::new());
-//! let tags = SnapshotTags::open(state_dir.join("tags"))?;
-//! let client = TreeClient::builder(session, store_prefix, tree_prefix)
-//!     .temp_tags(temps.clone())     // downloads now protect themselves
+//! let tags = gc::SnapshotTags::open(state_dir.join("tags"))?;
+//! let client = TreeClient::builder(&session, store_prefix, tree_prefix)
+//!     .temp_tags(temps.clone()) // downloads now protect themselves
 //!     .build();
-//! client.download_tree(&req, &dest, &store).cancel(&cancel).await?;
-//! tags.set("current", &index)?;      // survives restart
+//! client.download_tree(&req, dest, &store).cancel(&cancel).await?;
+//! tags.set("current", index)?; // survives restart
 //! let stats = gc::sweep(&*store, &tags, &temps, [])?;
+//! # let _ = stats; Ok(()) }
 //! ```
 //!
 //! Without a shared registry a concurrent sweep is free to delete chunks a

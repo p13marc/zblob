@@ -168,31 +168,41 @@ without new measurements.
 Three layers, because the first one alone is what let real defects through:
 
 1. **Scenario tests** (`tests/{roundtrip,resume,cancel,tamper,tree,
-   tree_security,storage,push,multisource,coverage,compression,fanout}.rs`) —
-   one file per concern. Useful, but they only ever assert outcomes for inputs
-   *the author chose*, so they confirm the implementation rather than
-   interrogate it.
+   tree_security,storage,push,multisource,coverage,compression,batch,
+   striping,chunk_size,read_surface,limits,fanout}.rs`) — one file per
+   concern. Useful, but they only ever assert outcomes for inputs *the author
+   chose*, so they confirm the implementation rather than interrogate it.
+   `limits.rs` is the exception in spirit: it drives every allocation bound
+   with an input just over the line *and* one just under.
 2. **Property tests** (`proptest`, in `#[cfg(test)] mod properties` inside
-   `src/{lib,chunk,resume,verify}.rs`) — invariants over generated inputs:
-   the range grammar's accept-set, chunk-grid tiling, bitfield view coherence,
-   CDC losslessness, and the bao core (a slice decodes to exactly its byte
-   range; any mutation is caught; a slice cannot be replayed at another index).
+   `src/{keys,chunk,resume,verify,wire}.rs`) — invariants over generated
+   inputs: the range grammar's accept-set, chunk-grid tiling, bitfield view
+   coherence, CDC losslessness, what each of the five wire validators lets
+   through, and the bao core (a slice decodes to exactly its byte range; any
+   mutation is caught; a slice cannot be replayed at another index).
 3. **Adversarial + contract suites** (`tests/hostile_peer.rs`,
-   `tests/store_contract.rs`, `tests/minifuzz.rs`) — a peer that mutates every
-   reply against a fixed oracle ("succeed with exactly the right bytes, or
-   fail cleanly"), and one contract executed against *every* `ContentStore`
-   configuration. These found bugs the scenario tests could not: they are
-   where new invariants belong.
+   `tests/hostile_store.rs`, `tests/store_contract.rs`, `tests/minifuzz.rs`)
+   — peers that mutate every reply against a fixed oracle ("succeed with
+   exactly the right bytes, or fail cleanly") for tier 1 and tier 2, and one
+   contract executed against *every* `ContentStore` configuration. These found
+   bugs the scenario tests could not — including, while being written, a
+   fanout receiver a hostile publisher could hold open forever. They are where
+   new invariants belong.
 
 **When adding a defence, add it at layer 2 or 3.** A scenario test for the one
 input that motivated the fix is not coverage — it is a regression pin. Also
 assert the test's own discriminating power (the honest control must pass and
 the hostile case must fail), or a harness bug can make the suite vacuous;
-`hostile_peer.rs` and `tree_security.rs` both do this explicitly. Shared helpers are in `tests/common/mod.rs`:
+`hostile_peer.rs`, `hostile_store.rs` and `tree_security.rs` all do this
+explicitly — and it earns its keep: the fanout tamper test's control caught
+that a single publish burst raced the subscriber declaration, which had made
+both the hostile case and the control pass for the same wrong reason. Shared helpers are in `tests/common/mod.rs`:
 `open_session()` opens an isolated in-process session with scouting disabled
 (the loopback pattern — tests must not discover each other or the LAN),
 `unique_prefix()` namespaces keys per test, `pseudo_random()` gives
-deterministic data without a rand dependency, and `common::bao` crafts real
+deterministic data without a rand dependency (it mixes its seed — the obvious
+`seed | 1` made consecutive seeds return *identical* bytes, which is invisible
+until something content-addressed deduplicates them), and `common::bao` crafts real
 (or deliberately tampered) bao slices for adversarial fake servers. Servers
 are started with `spawn().await` (queryables are declared before it returns)
 — never sleep-and-hope. Follow these patterns for new tests.

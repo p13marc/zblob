@@ -143,12 +143,16 @@ pub(crate) fn validate_id(id: &str) -> Result<()> {
 /// Caller-side parameters for registering a blob: everything in the
 /// [`Manifest`] that isn't computed from the bytes.
 ///
-/// ```ignore
+/// ```no_run
+/// # use zblob::{BlobServer, BlobSpec};
+/// # async fn f(server: BlobServer, path: &std::path::Path, now_ms: i64)
+/// # -> zblob::Result<()> {
 /// let spec = BlobSpec::new("report-01")
 ///     .filename("report.pcap")
 ///     .chunk_size(256 * 1024)
 ///     .created_ms(now_ms);
 /// let manifest = server.register_file(spec, path).await?;
+/// # let _ = manifest; Ok(()) }
 /// ```
 #[derive(Debug, Clone)]
 pub struct BlobSpec {

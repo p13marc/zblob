@@ -30,7 +30,7 @@ there is no end-of-transfer hash pass, a tampered reply is dropped alone and
 re-fetched, and a partial download is always a proven-correct partial. Pin the
 root (`DownloadRequest::pinned`) and a server cannot substitute content at all.
 
-## Two tiers
+## Three tiers
 
 **Tier 1 — single blob.** One queryable serves every blob under a key prefix.
 A download is a manifest GET, then range-set slice GETs
@@ -45,26 +45,29 @@ origins). Serving something implies being able to ask for it, so the
 conversion one way is free and the other way is fallible.
 
 ```rust,ignore
+use zblob::{BlobClient, BlobServer, BlobSpec, DownloadRequest, QueryPrefix, ServePrefix};
+
 // Server
-let serve = zblob::ServePrefix::new("demo/blobs")?;
-let query = zblob::QueryPrefix::from(&serve);
-let server = zblob::BlobServer::new(session.clone(), serve);
+let serve = ServePrefix::new("demo/blobs")?;
+let query = QueryPrefix::from(&serve);
+let server = BlobServer::new(&session, serve);
 let manifest = server
-    .register_file(zblob::BlobSpec::new("blob-1").filename("report.pcap"), &path)
+    .register_file(BlobSpec::new("blob-1").filename("report.pcap"), &path)
     .await?;
 let handle = server.spawn().await?; // distribute (id, manifest.root) out of band
 
 // Client — the caller picks the destination; pin the root when you know it.
-let client = zblob::BlobClient::new(session, query);
+// A transfer is a call builder: the two things it cannot do without are
+// positional, and progress/cancellation/overwrite are set on the builder.
+let client = BlobClient::new(&session, query);
 let stats = client
-    .download_to(
-        &zblob::DownloadRequest::pinned("blob-1", manifest.root),
-        &dest_path,
-        &(),
-        &zblob::CancelToken::new(),
-    )
+    .download_to(&DownloadRequest::pinned("blob-1", manifest.root), &dest_path)
+    .progress(&|p| println!("{p:?}"))
+    .cancel(&cancel)
     .await?;
 ```
+
+*(This is `examples/blob_transfer.rs`, which CI compiles and runs.)*
 
 Tier 1 also supports **push** (verified uploads gated by a `PushPolicy`
 authorization hook), **availability introspection** (`…/have` bitfields per
@@ -87,36 +90,61 @@ change re-transfers only its neighborhood.
 [FastCDC]: https://www.usenix.org/conference/atc16/technical-sessions/presentation/xia
 
 ```rust,ignore
-let store: Arc<dyn zblob::ContentStore> = Arc::new(zblob::MemoryStore::new());
-let index = zblob::build_tree(dir, "snap-1", &zblob::CdcParams::default(), &*store)?;
+use std::sync::Arc;
+use zblob::{
+    CdcParams, ContentStore, DownloadRequest, MemoryStore, Publisher, ServePrefix,
+    SettleCoverage, TreeClient, TreeServer, build_tree,
+};
 
-let store_p = zblob::ServePrefix::new("demo/store")?;
-let tree_p = zblob::ServePrefix::new("demo/tree")?;
+let store: Arc<dyn ContentStore> = Arc::new(MemoryStore::new());
+let index = build_tree(dir, "snap-1", &CdcParams::default(), &store)?;
 
-// serve live...
-let server = zblob::TreeServer::new(
-    session.clone(), store_p.clone(), tree_p.clone(), store.clone());
-server.register(index.clone()).await;
+let store_p = ServePrefix::new("demo/store")?;
+let tree_p = ServePrefix::new("demo/tree")?;
+
+// Serve it live…
+let server = TreeServer::new(&session, store_p.clone(), tree_p.clone(), store.clone());
+server.register(index.clone()).await?;
 let handle = server.spawn().await?;
 
-// ...or publish into a router storage (with read-back settling) and exit:
-zblob::publish_snapshot(&session, &store_p, &tree_p, &index, &*store,
-                        zblob::ChunkCompression::default(),
-                        zblob::SettleCoverage::All, settle).await?;
+// …or publish into a router storage, wait for the read-back to settle, and
+// exit. See docs/router-storage.md.
+Publisher::new(&session, store_p.clone())
+    .snapshots(tree_p.clone())
+    .coverage(SettleCoverage::All)
+    .publish(&index, &store)
+    .await?;
 
-// client
-let client = zblob::TreeClient::new(
-    session, (&store_p).into(), (&tree_p).into());
-client.download_tree(
-    &zblob::DownloadRequest::pinned("snap-1", index.root_hash),
-    &dest, &content_store, &(), &zblob::CancelToken::new(),
-).await?;
+// Consumer — either way, the same call.
+let client = TreeClient::new(&session, (&store_p).into(), (&tree_p).into());
+client
+    .download_tree(&DownloadRequest::pinned("snap-1", index.root_hash), &dest, &cache)
+    .await?;
+
+// …or pull one file out of the snapshot without materializing the tree.
+let conf = client
+    .fetch_file(&DownloadRequest::pinned("snap-1", index.root_hash), "etc/app.conf", &cache)
+    .await?;
 ```
 
-Tier 2 also ships **seeding** (`seed::seed_store` satisfies chunks from prior
-local copies and zero regions before touching the network) and **lifecycle**
+*(Derived from `examples/tree_sync.rs` and `examples/durable_store.rs`.)*
+
+Tier 2 also ships a **batched fetch** (`<store>/<algo>/batch` — one round for
+many chunks instead of one query each), **probes** that report partial
+possession (`StoreClient::probe`, `TreeClient::probe_snapshot`) so a client can
+pick a holder before fetching, **index sharding** for snapshots whose index is
+itself large, **seeding** (`seed::seed_store` satisfies chunks from prior local
+copies and zero regions before touching the network), **lifecycle**
 (`gc::sweep` mark-and-sweep with persistent snapshot tags and in-flight temp
-tags).
+tags), and a `DirStore` that is atomic, fsynced, optionally zstd-compressed and
+optionally sealed with XChaCha20-Poly1305.
+
+**Fanout tier — one-to-many rollout** (feature `fanout`). `fanout_file`
+publishes a manifest and its bao slices through a `zenoh-ext`
+`AdvancedPublisher`, so a late joiner replays the cache and every receiver
+verifies each slice against the pinned root exactly as a downloader does. No
+resume: an interrupted receiver starts over.
+
 
 ## Cargo features
 

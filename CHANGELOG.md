@@ -80,11 +80,77 @@ previously unstated.
   stops costing a wire break. First use: servers advertise their
   `max_chunks_per_query` and clients clamp to it, instead of being rejected
   with `InvalidRanges` and no way to discover why.
-- `TransferStats::queries`; `SettleCoverage` on `publish_snapshot`;
-  `MaterializePolicy`; `BlobSource::fingerprint`; `gc::TagRecord`.
+- `TransferStats::queries`; `SettleCoverage`; `MaterializePolicy`;
+  `BlobSource::fingerprint`; `gc::TagRecord`.
+
+**Pre-release API review.** 0.3.0 was built, then reviewed before tagging;
+these changes are all source-breaking and all free while the release is
+unpublished.
+
+- **Transfers are call builders.** `download_to(&req, &dest, &sink, &cancel)`
+  took four positional arguments of which two were `&()` and
+  `&CancelToken::new()` at nearly every call site — arguments that exist to
+  say "no thanks", transposable with the ones that matter without the compiler
+  noticing. What a transfer cannot do without stays positional; the rest moves
+  onto a `#[must_use]` builder that runs when awaited, matching
+  `zenoh::Session::get`. `Download`, `StagedDownload`, `DownloadToWriter`,
+  `Upload`, `TreeDownload`. `download_striped` folds into `.striped(holders)`,
+  and `Overwrite` becomes per-transfer rather than per-client.
+- **`BlobId`, `HashAlgo`, `Ext`** — three fields that arrived off the network
+  as `String`, `String` and `Vec<(u16, Vec<u8>)>` and were checked by a
+  validator somebody had to remember to call. Validation moves into
+  `Deserialize`; all three are wire-transparent, so `WIRE_VERSION` does not
+  move. `Ext` gains `MAX_FIELDS`/`MAX_VALUE_LEN`, which nothing bounded.
+- **`BlobError` splits its catch-all.** `Protocol(String)` carried 56 of the
+  crate's error sites: `UnsafePath`, `InvalidPrefix`, `MalformedMessage`,
+  `Usage`, `NotSettled` and `Task` now say which, `Zenoh`/`Encode` keep their
+  cause, and `kind()`/`is_retriable()`/`is_cancelled()` classify.
+- **`CancelToken` is prompt.** It wraps `tokio_util`'s token and gains
+  `cancelled()`/`until_cancelled()`; every receive loop now waits through it.
+- **`PushConfig`** — the three push bounds were builder methods that silently
+  did nothing unless called after `accept_push`.
+- **`Publisher`/`SnapshotPublisher`** replace the five `publish_*` free
+  functions, the widest of which took eight arguments.
+- **`zblob::keys`** — the seventeen key builders and parsers move off the
+  crate root. `parse_id` borrows; `parse_tier2_tail` returns a `Tier2Tail`.
+- **`WireTag`** replaces the `ENC_*` `&str` constants: the old comparison
+  allocated a `String` per reply and related two values nothing typed.
+- **New capabilities**: `TreeClient::fetch_file` (one path out of a snapshot
+  without materializing the tree), server introspection
+  (`registered`/`manifest`/`index`/`serves`), `TreeIndex` navigation
+  (`entry`/`entries`/`files`/`file_chunks`), `progress_channel`,
+  `BlobClient::priority`, `TransferStats: Add + AddAssign + Sum`, and
+  `bao_tree::{ReadAt, Size}` re-exported so `ReadAtSize` is implementable
+  downstream at all.
+- Sessions are `&zenoh::Session`, not `Arc<zenoh::Session>` (which was an
+  `Arc<Arc<..>>`); `#[must_use]` on every builder method; `Debug` on the 17
+  public types that lacked it; `#[non_exhaustive]` on the output structs.
 
 ### Fixed
 
+- **The reactor was blocked in three public async paths**: `publish_hashes`
+  and `publish_store` read the store inline (a file read per chunk, and a full
+  recursive `read_dir`), and `TreeServer::register` sharded an index on the
+  async thread — ~64 fsynced atomic renames for a 4 MB index. All three now go
+  through the blocking pool, in batches rather than per chunk.
+- **`ContentStore` could not report I/O failure.** `has -> bool` and
+  `get -> Option<Vec<u8>>` spelled `EIO`, `EACCES` and "absent" identically,
+  and the client's response to absence is to re-fetch and `put` back into the
+  same broken store. All four accessors return `io::Result`; the deliberate
+  heal-on-refetch policy for a *corrupt* chunk survives as an explicit
+  `Ok(None)`.
+- **`cancel()` was polled, never awaited.** Every check sat after a blocking
+  receive, so the observed latency was the query timeout — measured at 5.00 s
+  of a 5 s budget against a peer that stops answering, versus 0.17 s now.
+- **A hostile fanout publisher could hold a receiver open forever**, because
+  `stall_timeout` bounded the wait for a *sample* rather than for progress.
+  This is the one tier with no second responder to fall back on.
+- **`TransferStats::queries` reported 0** for every ordinary single-origin
+  download — it was incremented on the striped and tier-2 paths only.
+- **`SettleCoverage::Sample(k)` could probe `k + 1` keys**, one over its own
+  documented bound.
+- An unreadable or undecodable resume sidecar restarted the whole download
+  silently; it now says so (restarting remains correct).
 - `publish_chunk`/`publish_index` set no congestion control, and publications
   default to `Drop` — bulk PUTs into a storage were silently sheddable while
   the sampled read-back still returned `Ok`. Both block now.

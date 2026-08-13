@@ -26,7 +26,7 @@ Because chunk keys are **immutable** (`<prefix>/blake3/<hash>` only ever maps to
 one byte string), the storage's last-writer-wins reconciliation is a no-op and
 re-publishing is idempotent.
 
-`publish_snapshot` ends with a **read-back settle phase** — it GETs the index
+`SnapshotPublisher::publish` ends with a **read-back settle phase** — it GETs the index
 and, per `SettleCoverage`, either a bounded sample of chunk keys or all of them,
 until the storage answers (or the settle budget expires).
 
@@ -43,9 +43,9 @@ easy to arrange accidentally while developing.
 ```mermaid
 flowchart LR
     subgraph Producer["producer"]
-        BT["build_tree(dir, id, cdc, store)"] --> PS["publish_snapshot(...)"]
-        PS --> PC["publish_snapshot_chunks"]
-        PS --> PI["publish_index"]
+        BT["build_tree(dir, id, cdc, store)"] --> PS["SnapshotPublisher::publish"]
+        PS --> PC["chunks_for(index)"]
+        PS --> PI["index(index)"]
         PS --> RB["read-back settle"]
         RB --> EX["(then exits)"]
     end
@@ -68,20 +68,30 @@ flowchart LR
     FE -->|"GET"| ST
 ```
 
-`zblob` provides the producer side:
+`zblob` provides the producer side through `Publisher`:
 
-- `publish_chunk` — PUT one content-addressed chunk.
-- `publish_snapshot_chunks` — PUT the chunks one snapshot references.
-- `publish_store` — PUT *every* chunk in a store. This mirrors a whole content
-  store to a router, which is occasionally what you want and is usually not:
-  a producer's store holds other snapshots' chunks too.
-- `publish_index` — PUT an encoded `TreeIndex`.
-- `publish_snapshot` — the snapshot's chunks, its index, then read-back
-  settling.
+- `Publisher::chunk` — PUT one content-addressed chunk.
+- `Publisher::chunks` — PUT a named set of chunks out of a store.
+- `Publisher::store` — PUT *every* chunk in a store. This mirrors a whole
+  content store to a router, which is occasionally what you want and is
+  usually not: a producer's store holds other snapshots' chunks too.
+- `Publisher::snapshots(tree_prefix)` upgrades it to a `SnapshotPublisher`,
+  which adds:
+  - `index` — PUT an encoded `TreeIndex`.
+  - `chunks_for` — PUT exactly the chunks one snapshot references.
+  - `publish` — the snapshot's chunks, its index, then read-back settling.
 
-The consumer side is **unchanged**: `TreeClient::download_tree` issues ordinary
-GETs, which the storage answers exactly as a `TreeServer` would. Producer and
-consumer only have to agree on the `store_prefix` and `tree_prefix`.
+The consumer side needs **no code changes**: `TreeClient::download_tree` issues
+ordinary GETs and the storage answers them. But it does not take the same
+*route*. A storage serves by key and has nothing at `<store>/<algo>/batch`, so
+the batched fetch finds no answer and every chunk resolves through the
+per-chunk fallback — one GET each, rather than one round per batch. That is
+the intended behaviour and the reason the fallback exists; it is also why a
+snapshot fetched from a storage costs more round trips than the same snapshot
+fetched from a `TreeServer`. `tests/hostile_store.rs` pins it.
+
+Producer and consumer only have to agree on the `store_prefix` and
+`tree_prefix`.
 
 ## Running it
 
@@ -102,18 +112,21 @@ The essentials of the config:
 A producer then publishes against the same prefixes:
 
 ```rust,ignore
-let store = zblob::MemoryStore::new();
-let index = zblob::build_tree(dir, "snap-1", &zblob::CdcParams::default(), &store)?;
-zblob::publish_snapshot(
-    &session,
-    "fleet/_blob/store",
-    "fleet/_blob/tree",
-    &index,
-    &store,
-    zblob::ChunkCompression::default(),
-    zblob::SettleCoverage::All,         // the producer is about to exit
-    std::time::Duration::from_secs(10), // settle budget
-).await?;
+use std::sync::Arc;
+use zblob::{CdcParams, ContentStore, MemoryStore, Publisher, ServePrefix, SettleCoverage};
+
+let store: Arc<dyn ContentStore> = Arc::new(MemoryStore::new());
+let index = zblob::build_tree(dir, "snap-1", &CdcParams::default(), &store)?;
+
+// Prefixes are typed by role: a producer *serves* these keys, so they must be
+// concrete — `ServePrefix::new` refuses a wildcard rather than letting one
+// reach the wire.
+Publisher::new(&session, ServePrefix::new("fleet/_blob/store")?)
+    .snapshots(ServePrefix::new("fleet/_blob/tree")?)
+    .coverage(SettleCoverage::All) // the producer is about to exit
+    .settle(std::time::Duration::from_secs(10))
+    .publish(&index, &store)
+    .await?;
 // producer may now exit; the router serves the snapshot
 ```
 

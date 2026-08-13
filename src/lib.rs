@@ -1,9 +1,53 @@
-//! `zblob` — generic resumable chunked blob transfer over Zenoh.
+//! `zblob` — generic resumable chunked blob and directory transfer over Zenoh.
 //!
-//! A small, self-contained library for downloading a large artifact (a file, a
-//! report bundle, a pcap) from one Zenoh peer to another with **progress**,
-//! **BLAKE3 verified streaming**, **range resume**, and **bounded memory**. It
-//! carries no application-specific types.
+//! A small, self-contained library for moving a large artifact (a file, a
+//! report bundle, a pcap, a directory tree) between Zenoh peers with
+//! **progress**, **BLAKE3 verified streaming**, **range resume**, and
+//! **bounded memory**. It carries no application-specific types.
+//!
+//! # The three tiers
+//!
+//! | Tier | What it moves | Entry points |
+//! |---|---|---|
+//! | **1 — blob by id** | one blob, named by a caller-chosen [`BlobId`] | [`BlobServer`], [`BlobClient`] |
+//! | **2 — content-addressed trees** | a directory snapshot, deduplicated chunk-wise | [`TreeServer`], [`TreeClient`], [`StoreClient`], [`Publisher`] |
+//! | **fanout** (feature `fanout`) | one-to-many rollout of one blob | [`fanout::fanout_file`], [`fanout::receive_fanout`] |
+//!
+//! Tier 1 is the whole of the model described below. **Tier 2** is the casync
+//! model: a snapshot is a [`TreeIndex`] (a depth-first entry list whose files
+//! reference their chunks by BLAKE3 hash) plus a [`ContentStore`] keyed
+//! `<prefix>/blake3/<hex>`. A client fetches only the chunks it is *missing*,
+//! in batched rounds, and materializes defensively — so an interrupted pull
+//! resumes for free and identical chunks transfer once across files, versions
+//! and producers. A producer can serve it live with a [`TreeServer`], or
+//! [`Publisher`] it into a router-hosted Zenoh storage and exit (see
+//! `docs/router-storage.md`). [`TreeClient::fetch_file`] pulls one path out of
+//! a snapshot without materializing the tree, and the probes
+//! ([`StoreClient::probe`], [`TreeClient::probe_snapshot`]) report *partial*
+//! possession, so a client can choose a holder before fetching.
+//!
+//! Every key expression is built through [`keys`], and every prefix is typed
+//! by the role it plays: a server owns a concrete [`ServePrefix`], a client
+//! asks through a [`QueryPrefix`] that may name several origins. A server
+//! cannot be built on a wildcard because there is no value to build one from.
+//!
+//! ```no_run
+//! # use zblob::{BlobClient, BlobServer, BlobSpec, DownloadRequest, QueryPrefix, ServePrefix};
+//! # async fn f(session: zenoh::Session, path: &std::path::Path, dest: &std::path::Path)
+//! # -> zblob::Result<()> {
+//! let serve = ServePrefix::new("demo/blobs")?;
+//! let server = BlobServer::new(&session, serve.clone());
+//! let manifest = server.register_file(BlobSpec::new("blob-1"), path).await?;
+//! let handle = server.spawn().await?;
+//!
+//! // Transfers are call builders: what to fetch and where it goes are
+//! // positional; progress, cancellation and overwrite policy are optional.
+//! let client = BlobClient::new(&session, QueryPrefix::from(&serve));
+//! let stats = client
+//!     .download_to(&DownloadRequest::pinned("blob-1", manifest.root), dest)
+//!     .await?;
+//! # Ok(()) }
+//! ```
 //!
 //! # Model (wire v3)
 //!

@@ -1,4 +1,4 @@
-//! BLAKE3 + bao-tree verified streaming — the v2 integrity core.
+//! BLAKE3 + bao-tree verified streaming — the integrity core (wire v3).
 //!
 //! A blob's identity is its BLAKE3 root computed over a bao tree at
 //! [`BAO_BLOCK`] (16 KiB verification groups). The server sends each transfer

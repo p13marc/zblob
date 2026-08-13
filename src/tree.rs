@@ -19,7 +19,7 @@
 //! deployments that want it, with the usual consequence: the key means
 //! whatever its last writer said.
 //!
-//! Security model (v2): the index is attacker input until proven otherwise.
+//! Security model: the index is attacker input until proven otherwise.
 //! Every path is sanitized (relative, `Normal` components only), symlinks are
 //! materialized **last** and their targets confined to the tree, file parents
 //! are canonicalized back under the destination root before writing, and the

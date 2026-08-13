@@ -4,6 +4,21 @@
 //! substrate at once: "progress" is simply *which hashes are on disk*. The
 //! trait is sync (local, fast ops) — async call sites wrap it in
 //! `spawn_blocking`; a remote chunk is fetched once and `put` here.
+//!
+//! Sync is a deliberate choice, not an omission. AFIT is not dyn-safe on this
+//! crate's MSRV and `Arc<dyn ContentStore>` is load-bearing, so async would
+//! mean boxed futures on the hottest trait in the crate — and the real
+//! third-party implementations are blocking anyway, which would push
+//! `spawn_blocking` downstream *per operation*, where it cannot batch. This
+//! crate knows a round of chunks is coming; a store never does. Hence
+//! [`has_many`](ContentStore::has_many) / [`get_many`](ContentStore::get_many)
+//! / [`put_many`](ContentStore::put_many), which default to looping so a
+//! simple store need not implement them, and which a transactional store can
+//! override to see one visit per round instead of one per chunk.
+//!
+//! [`for_each_hash`](ContentStore::for_each_hash) is the one required method
+//! beyond the four accessors: `hashes()` materializes the whole keyspace, and
+//! `gc::sweep` and `Publisher::store` had nothing else to enumerate with.
 
 use std::collections::HashMap;
 use std::io::Write;

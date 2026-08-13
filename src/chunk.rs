@@ -1,6 +1,7 @@
 //! Chunking policy.
 //!
-//! Two unrelated kinds of "chunk" exist in this crate, and v2 keeps them apart
+//! Two unrelated kinds of "chunk" exist in this crate, and the types keep them
+//! apart
 //! by construction (they were one trait in v1, which let a content-defined
 //! chunker be handed to the offset-addressed Tier-1 protocol and silently
 //! produce a broken manifest):

@@ -11,6 +11,30 @@
 //! The caller chooses the destination path ([`BlobClient::download_to`]) — the
 //! server's advisory filename is never joined to any path (the v1 traversal
 //! vector, C2).
+//!
+//! # Transfers are call builders
+//!
+//! Each entry point returns a builder that runs when awaited, matching
+//! `zenoh::Session::get`'s own idiom: [`Download`], [`StagedDownload`],
+//! [`DownloadToWriter`] and [`Upload`]. What a transfer cannot do without is
+//! positional; progress, cancellation, overwrite policy and multi-origin
+//! striping are optional and set on the builder.
+//!
+//! ```no_run
+//! # use zblob::{BlobClient, CancelToken, DownloadRequest, Overwrite};
+//! # async fn f(client: BlobClient, req: DownloadRequest, cancel: CancelToken)
+//! # -> zblob::Result<()> {
+//! let stats = client
+//!     .download_to(&req, "/tmp/out.bin".as_ref())
+//!     .cancel(&cancel)
+//!     .overwrite(Overwrite::Replace)
+//!     .await?;
+//! # let _ = stats; Ok(()) }
+//! ```
+//!
+//! Cancellation is observed *while waiting on the network*, not between
+//! replies — see [`crate::CancelToken`] for why that distinction is the whole
+//! reason the token is not an `AtomicBool`.
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;

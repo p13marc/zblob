@@ -171,6 +171,13 @@ Full survey notes are in the appendix; the conclusions that matter:
 
 ## 3. Release 0.3 — API-additive, no wire change
 
+> **[rev 2026-08-13]** This split did not survive. Sections 3 and 4 shipped as
+> one breaking `0.3.0` — see the CHANGELOG. Keeping two releases in flight
+> bought nothing once §4 was going to break the wire anyway, and the
+> pre-release review then broke the *source* API further (call builders,
+> `BlobId`/`HashAlgo`/`Ext`, `zblob::keys`), which this section assumed it
+> would not.
+
 Everything in this section is `cargo semver`-minor and unblocks the explorers.
 This is the release to make *soon*.
 
@@ -377,6 +384,13 @@ symmetric sentence it's missing; RFC 08's probe-prefix type extends to tier 2.
 
 ### 4.3 The tree index becomes a blob (restic's lesson)
 
+> **[rev 2026-08-13]** Shipped *conditionally*, not as written. The dedup and
+> size-ceiling arguments below were measured and did not hold: an index costs
+> 0.05–0.10% of its payload and the ceiling is ~40 GiB. Only the resumability
+> argument survived, so **large** indices shard into an `IndexDescriptor` and
+> small ones are still served whole — a descriptor on every fetch would add a
+> round trip to fix a problem the common case does not have.
+
 Today `TreeIndex` is a monolithic reply (64 MiB cap, `tree.rs:766`), fetched
 whole, undeduplicated, and unresumable. v3: **the index is itself
 content-addressed data in the store** —
@@ -452,6 +466,14 @@ negotiation — one extra field, no handshake.
 
 ### 4.6 Availability becomes real — or leaves
 
+> **[rev 2026-08-13]** The recommended option is **impossible on tier 1** and
+> was withdrawn after being implemented: a bao slice carries sibling hashes
+> derived from the whole blob, so a partial holder can serve no verified slice
+> at all, and an in-flight push advertising its resume bitfield would send
+> clients after chunks they can never obtain. `Availability` stays
+> all-or-nothing by construction. Partial possession is real on *tier 2*, and
+> that is what §4.2's probe reports. See `tests/striping.rs`.
+
 `Availability` is answered as `full` unconditionally (`server.rs:538`) and
 consulted by nothing. Two honest options:
 
@@ -483,6 +505,15 @@ Consumption is zero for both; each is ~500 lines and a wire surface.
   the crate's own wire rules.
 
 ### 4.8 Negative replies for unknown ids
+
+> **[rev 2026-08-13]** **Rejected: the premise is false.** The "30 s timeout"
+> came from a code comment, not a measurement. Measured before building: about
+> a millisecond, with a server present, with none present, and across a
+> wildcard fan-out — a Zenoh query finalizes once its matching queryables
+> complete, and completing without replying is immediate. `ENC_NACK`, the RFC
+> amendment and the "authoritative only when no positive reply arrives" rule
+> were all avoided by one test
+> (`an_unknown_id_fails_fast_not_on_the_timeout`).
 
 `serve_one` returns `Ok(())` for an unknown id (`server.rs:531`), so `NotFound`
 costs a 30 s timeout. v3 adds a tiny tagged reply
