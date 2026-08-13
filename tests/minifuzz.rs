@@ -84,12 +84,42 @@ fn wire_decoders_never_panic_on_garbage() {
     let mut rng = Rng(0xCAFE);
     for _ in 0..20_000 {
         let bytes = rng.bytes(200);
-        assert!(
-            wire::decode::<Manifest>(&bytes).is_err() || !bytes.is_empty(),
-            "decoding must never panic"
-        );
-        let _ = wire::decode::<TreeIndex>(&bytes);
-        let _ = wire::decode::<wire::Availability>(&bytes);
+        // Reaching the next line at all is the assertion: a decoder that
+        // panicked would abort the test. (This used to read
+        // `decode(..).is_err() || !bytes.is_empty()`, whose second arm is true
+        // for every input the generator produces — so it asserted nothing, and
+        // would have held even for a decoder that accepted random bytes as a
+        // manifest.) What *is* checked is that garbage never decodes
+        // successfully into a structure the rest of the crate would trust.
+        if let Ok(m) = wire::decode::<Manifest>(&bytes) {
+            assert!(
+                m.validate(u64::MAX).is_err(),
+                "random bytes decoded to a manifest that passes validation: {m:?}"
+            );
+        }
+        if let Ok(i) = wire::decode::<TreeIndex>(&bytes) {
+            assert!(
+                i.validate().is_err(),
+                "random bytes decoded to an index that passes validation"
+            );
+        }
+        if let Ok(a) = wire::decode::<wire::Availability>(&bytes)
+            && a.validate(u32::MAX).is_ok()
+        {
+            // Anything that validates must be self-consistent, or the client
+            // would index past the end of a bitfield a peer sent.
+            assert_eq!(
+                a.bits.len(),
+                a.chunk_count.div_ceil(8) as usize,
+                "a validated availability must size its bitfield to its count"
+            );
+        }
+        // The four validators added in v3 are attacker-input boundaries too,
+        // and had no fuzz coverage at all.
+        let _ = wire::decode::<wire::WantList>(&bytes).map(|w| w.validate(4096));
+        let _ = wire::decode::<wire::HaveBits>(&bytes).map(|h| h.validate(4096));
+        let _ = wire::decode::<wire::IndexDescriptor>(&bytes).map(|d| d.validate(1 << 20));
+        let _ = wire::decode::<wire::TreeProbe>(&bytes).map(|p| p.validate());
     }
     // Truncations of a *valid* encoding must error, not panic.
     let m = Manifest {
@@ -113,16 +143,21 @@ fn wire_decoders_never_panic_on_garbage() {
 fn index_validation_never_panics_on_hostile_paths() {
     let mut rng = Rng(0xD00D);
     for _ in 0..5_000 {
-        let path = rng.ascii(40);
+        // Two *distinct* paths. They used to be the same string, so
+        // `validate` returned `duplicate entry path` before it ever looked at
+        // the symlink — and the generated `target`, the hostile input this
+        // test exists for, was never examined.
+        let dir_path = rng.ascii(40);
+        let link_path = rng.ascii(40);
         let target = rng.ascii(40);
         let entries = vec![
             zblob::Entry::Dir {
-                path: path.clone(),
+                path: dir_path,
                 mode: (rng.next() & 0xffff) as u32,
                 mtime: rng.next() as i64,
             },
             zblob::Entry::Symlink {
-                path: path.clone(),
+                path: link_path,
                 target,
             },
         ];
@@ -135,5 +170,28 @@ fn index_validation_never_panics_on_hostile_paths() {
             root_hash: Hash::of(b"whatever"),
         };
         let _ = index.validate(); // must not panic (root mismatch or path error)
+    }
+
+    // Discriminating power: the loop above only proves "no panic", which a
+    // validator that accepted everything would also satisfy. These are the
+    // shapes it must actually refuse, through the same entry point.
+    for (name, path, target) in [
+        ("traversal", "a", "../../etc/passwd"),
+        ("absolute target", "a", "/etc/passwd"),
+        ("traversing path", "../escape", "x"),
+        ("absolute path", "/abs", "x"),
+    ] {
+        let index = TreeIndex {
+            version: wire::WIRE_VERSION,
+            id: BlobId::new("fuzz").unwrap(),
+            algo: HashAlgo::Blake3,
+            cdc: zblob::CdcParams::default(),
+            entries: vec![zblob::Entry::Symlink {
+                path: path.into(),
+                target: target.into(),
+            }],
+            root_hash: Hash::of(b"whatever"),
+        };
+        assert!(index.validate().is_err(), "{name} must be refused");
     }
 }

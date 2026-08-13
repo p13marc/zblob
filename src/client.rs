@@ -484,6 +484,16 @@ impl BlobClient {
     /// Pairing the two in one call means the safe path is also the shortest
     /// one, which is the only way a security property reliably survives
     /// contact with application code.
+    /// The Zenoh priority this client's queries (and therefore the replies
+    /// they draw) carry.
+    ///
+    /// Replies inherit the querier's QoS, so the client is the only place
+    /// this can be set — see [`BlobClientBuilder::priority`].
+    #[must_use]
+    pub fn priority(&self) -> Priority {
+        self.cfg.priority
+    }
+
     /// Download a blob to the file at `dest` (written via `<dest>.part` + a
     /// resume sidecar, then atomically renamed into place). Returns a
     /// [`Download`] — `.await` it to run the transfer.

@@ -376,14 +376,29 @@ async fn wildcard_prefixes_are_queryable_but_not_servable() {
 /// Bulk transfers must yield: replies inherit the querier's QoS, so the
 /// client is the only place priority can be set — and the default must sit
 /// below `Data` or a large transfer starves telemetry on a shared link.
-#[test]
-fn bulk_transfers_default_to_a_yielding_priority() {
-    // Zenoh numbers priorities so that a *greater* discriminant is a *lower*
-    // priority. If that ever flips, the crate's bulk default must be revisited.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn bulk_transfers_default_to_a_yielding_priority() {
+    // This asserted only that `DataLow as u8 > Data as u8` — a property of
+    // *Zenoh's enum*, which would hold unchanged if this crate defaulted to
+    // `RealTime`. The claim is about the default zblob picks, so ask zblob.
+    let session = open_session().await;
+    let prefix = unique_prefix();
+
+    let client = BlobClient::new(&session, common::query(&prefix));
     assert!(
-        zblob::Priority::DataLow as u8 > zblob::Priority::Data as u8,
-        "Priority ordering changed; revisit the bulk default"
+        client.priority() as u8 > zblob::Priority::Data as u8,
+        "the bulk default ({:?}) must yield to ordinary data traffic",
+        client.priority()
     );
+
+    // Discriminating power: the knob genuinely moves it, so the assertion
+    // above is reading a real value and not a constant.
+    let urgent = BlobClient::builder(&session, common::query(&prefix))
+        .priority(zblob::Priority::RealTime)
+        .build();
+    assert_eq!(urgent.priority(), zblob::Priority::RealTime);
+
+    session.close().await.unwrap();
 }
 
 /// A registered file that changes on disk must be diagnosed, not served.
