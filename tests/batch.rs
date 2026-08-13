@@ -8,8 +8,8 @@ use std::time::Duration;
 
 use common::{open_session, unique_prefix};
 use zblob::{
-    CancelToken, CdcParams, ContentStore, DownloadRequest, Hash, MemoryStore, StoreClient,
-    TreeClient, TreeServer, build_tree,
+    CdcParams, ContentStore, DownloadRequest, Hash, MemoryStore, StoreClient, TreeClient,
+    TreeServer, build_tree,
 };
 
 fn small_cdc() -> CdcParams {
@@ -80,8 +80,6 @@ async fn a_snapshot_costs_one_query_per_round_not_one_per_chunk() {
             &DownloadRequest::pinned("big", index.root_hash),
             dest.path(),
             &store,
-            &(),
-            &CancelToken::new(),
         )
         .await
         .expect("batched download");
@@ -116,8 +114,6 @@ async fn a_snapshot_costs_one_query_per_round_not_one_per_chunk() {
             &DownloadRequest::pinned("big", index.root_hash),
             dest2.path(),
             &store2,
-            &(),
-            &CancelToken::new(),
         )
         .await
         .expect("unbatched download");
@@ -183,8 +179,6 @@ async fn a_partial_holder_shortens_the_round_instead_of_failing_it() {
             &DownloadRequest::pinned("split", index.root_hash),
             dest.path(),
             &store,
-            &(),
-            &CancelToken::new(),
         )
         .await
         .expect("two partial holders together hold everything");
@@ -344,8 +338,6 @@ async fn a_snapshot_probe_reports_partial_possession() {
         &DownloadRequest::pinned("snap", index.root_hash),
         dest.path(),
         &store,
-        &(),
-        &CancelToken::new(),
     )
     .await
     .expect("the holder that said complete really is");
@@ -443,8 +435,6 @@ async fn a_large_index_is_sharded_and_a_small_one_is_not() {
                 &DownloadRequest::pinned("idx", index.root_hash),
                 dest.path(),
                 &store,
-                &(),
-                &CancelToken::new(),
             )
             .await
             .unwrap_or_else(|e| panic!("{label}: download failed: {e}"));

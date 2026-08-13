@@ -1699,7 +1699,23 @@ impl TreeClient {
     /// already in `store`, so a re-run only redoes local writes. Callers who
     /// need an atomic cut-over should materialize into a fresh directory and
     /// swap it in themselves.
-    pub async fn download_tree(
+    pub fn download_tree<'a>(
+        &'a self,
+        req: &'a DownloadRequest,
+        dest_root: &'a Path,
+        store: &'a Arc<dyn ContentStore>,
+    ) -> TreeDownload<'a> {
+        TreeDownload {
+            client: self,
+            req,
+            dest_root,
+            store,
+            sink: None,
+            cancel: None,
+        }
+    }
+
+    async fn run_download_tree(
         &self,
         req: &DownloadRequest,
         dest_root: &Path,
@@ -1989,6 +2005,65 @@ impl TreeClient {
             }
         }
         Ok(stats)
+    }
+}
+
+/// A configured snapshot download, awaited to run it. See
+/// [`TreeClient::download_tree`].
+#[must_use = "a download does nothing until it is awaited"]
+pub struct TreeDownload<'a> {
+    client: &'a TreeClient,
+    req: &'a DownloadRequest,
+    dest_root: &'a Path,
+    store: &'a Arc<dyn ContentStore>,
+    sink: Option<&'a dyn ProgressSink>,
+    cancel: Option<&'a CancelToken>,
+}
+
+impl std::fmt::Debug for TreeDownload<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("TreeDownload")
+            .field("req", &self.req)
+            .field("dest_root", &self.dest_root)
+            .finish_non_exhaustive()
+    }
+}
+
+impl<'a> TreeDownload<'a> {
+    /// Send progress events to `sink` (default: discard them).
+    pub fn progress(mut self, sink: &'a dyn ProgressSink) -> Self {
+        self.sink = Some(sink);
+        self
+    }
+
+    /// Stop when `cancel` is cancelled. Fetched chunks stay in the store, so
+    /// a re-run resumes from them.
+    pub fn cancel(mut self, cancel: &'a CancelToken) -> Self {
+        self.cancel = Some(cancel);
+        self
+    }
+}
+
+impl<'a> std::future::IntoFuture for TreeDownload<'a> {
+    type Output = Result<TransferStats>;
+    type IntoFuture =
+        std::pin::Pin<Box<dyn std::future::Future<Output = Self::Output> + Send + 'a>>;
+
+    fn into_future(self) -> Self::IntoFuture {
+        Box::pin(async move {
+            let sink = self.sink.unwrap_or(crate::client::NO_PROGRESS);
+            let fresh;
+            let cancel = match self.cancel {
+                Some(c) => c,
+                None => {
+                    fresh = CancelToken::new();
+                    &fresh
+                }
+            };
+            self.client
+                .run_download_tree(self.req, self.dest_root, self.store, sink, cancel)
+                .await
+        })
     }
 }
 

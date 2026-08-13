@@ -67,7 +67,9 @@ async fn interrupt_then_resume_across_clients() {
         at: 3,
     };
     let err = client
-        .download_to(&DownloadRequest::new("blob-r"), &dest, &sink, &token)
+        .download_to(&DownloadRequest::new("blob-r"), &dest)
+        .progress(&sink)
+        .cancel(&token)
         .await
         .expect_err("must cancel");
     assert!(matches!(err, BlobError::Cancelled { .. }), "{err}");
@@ -82,12 +84,9 @@ async fn interrupt_then_resume_across_clients() {
     let client2 = test_client(&session, &prefix);
     let stats = tokio::time::timeout(
         Duration::from_secs(20),
-        client2.download_to(
-            &DownloadRequest::new("blob-r"),
-            &dest,
-            &sink,
-            &CancelToken::new(),
-        ),
+        client2
+            .download_to(&DownloadRequest::new("blob-r"), &dest)
+            .progress(&sink),
     )
     .await
     .expect("timed out")
@@ -192,12 +191,7 @@ async fn middle_hole_is_refetched_as_a_range() {
     let client = test_client(&session, &prefix);
     tokio::time::timeout(
         Duration::from_secs(20),
-        client.download_to(
-            &DownloadRequest::pinned("holey", pinned_root),
-            &dest,
-            &(),
-            &CancelToken::new(),
-        ),
+        client.download_to(&DownloadRequest::pinned("holey", pinned_root), &dest),
     )
     .await
     .expect("timed out")

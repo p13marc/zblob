@@ -11,8 +11,8 @@ use std::time::Duration;
 
 use common::{open_session, pseudo_random, unique_prefix};
 use zblob::{
-    BlobClient, BlobError, BlobId, BlobServer, BlobSpec, CancelToken, DownloadRequest, Hash,
-    MIN_CHUNK_SIZE, MemoryBlobSource, RetryPolicy, manifest_key, parse_ranges, slice_key,
+    BlobClient, BlobError, BlobId, BlobServer, BlobSpec, DownloadRequest, Hash, MIN_CHUNK_SIZE,
+    MemoryBlobSource, RetryPolicy, manifest_key, parse_ranges, slice_key,
     wire::{ENC_MANIFEST, ENC_SLICE, encode},
 };
 
@@ -54,8 +54,6 @@ async fn pinned_root_rejects_substituted_content() {
         .download_to(
             &DownloadRequest::pinned("blob-s", Hash::of(&expected)),
             &dest,
-            &(),
-            &CancelToken::new(),
         )
         .await
         .expect_err("must reject substituted content");
@@ -136,12 +134,7 @@ async fn tampered_slice_dropped_alone_and_healed() {
 
     let client = test_client(&session, &prefix);
     let err = client
-        .download_to(
-            &DownloadRequest::pinned("blob-t", root),
-            &dest,
-            &(),
-            &CancelToken::new(),
-        )
+        .download_to(&DownloadRequest::pinned("blob-t", root), &dest)
         .await
         .expect_err("tampered chunk must keep the transfer incomplete");
     match err {
@@ -158,12 +151,7 @@ async fn tampered_slice_dropped_alone_and_healed() {
     honest.store(true, Ordering::SeqCst);
     tokio::time::timeout(
         Duration::from_secs(20),
-        client.download_to(
-            &DownloadRequest::pinned("blob-t", root),
-            &dest,
-            &(),
-            &CancelToken::new(),
-        ),
+        client.download_to(&DownloadRequest::pinned("blob-t", root), &dest),
     )
     .await
     .expect("timed out")

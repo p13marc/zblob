@@ -19,8 +19,8 @@ use std::time::Duration;
 
 use common::{open_session, pseudo_random, unique_prefix};
 use zblob::{
-    BlobClient, BlobError, BlobId, CancelToken, DownloadRequest, Hash, MIN_CHUNK_SIZE, Manifest,
-    RetryPolicy, manifest_key, parse_ranges, slice_key,
+    BlobClient, BlobError, BlobId, DownloadRequest, Hash, MIN_CHUNK_SIZE, Manifest, RetryPolicy,
+    manifest_key, parse_ranges, slice_key,
     wire::{self, ENC_MANIFEST, ENC_SLICE},
 };
 
@@ -188,12 +188,7 @@ async fn slice_reply_mutations_never_yield_wrong_bytes() {
         let client = test_client(&session, &prefix);
         let outcome = tokio::time::timeout(
             Duration::from_secs(15),
-            client.download_to(
-                &DownloadRequest::pinned("hostile", root),
-                &dest,
-                &(),
-                &CancelToken::new(),
-            ),
+            client.download_to(&DownloadRequest::pinned("hostile", root), &dest),
         )
         .await;
 
@@ -387,12 +382,7 @@ async fn manifest_reply_mutations_are_survivable() {
         let client = test_client(&session, &prefix);
         let outcome = tokio::time::timeout(
             Duration::from_secs(10),
-            client.download_to(
-                &DownloadRequest::pinned("m", root),
-                &dest,
-                &(),
-                &CancelToken::new(),
-            ),
+            client.download_to(&DownloadRequest::pinned("m", root), &dest),
         )
         .await
         .unwrap_or_else(|_| panic!("{label}: download hung"));
@@ -487,12 +477,7 @@ async fn a_hostile_responder_cannot_deny_an_honest_one() {
         let client = test_client(&session, &prefix);
         let outcome = tokio::time::timeout(
             Duration::from_secs(15),
-            client.download_to(
-                &DownloadRequest::pinned("contested", manifest.root),
-                &dest,
-                &(),
-                &CancelToken::new(),
-            ),
+            client.download_to(&DownloadRequest::pinned("contested", manifest.root), &dest),
         )
         .await
         .unwrap_or_else(|_| panic!("{hostile_reply}: hung"));
@@ -559,9 +544,6 @@ async fn hostile_push_offer_replies_are_survivable() {
             client.upload_file(
                 zblob::BlobSpec::new("up").chunk_size(MIN_CHUNK_SIZE),
                 &src_path,
-                None,
-                &(),
-                &CancelToken::new(),
             ),
         )
         .await

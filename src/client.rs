@@ -481,19 +481,112 @@ impl BlobClient {
     /// Pairing the two in one call means the safe path is also the shortest
     /// one, which is the only way a security property reliably survives
     /// contact with application code.
-    pub async fn download_staged(
+    /// Download a blob to the file at `dest` (written via `<dest>.part` + a
+    /// resume sidecar, then atomically renamed into place). Returns a
+    /// [`Download`] — `.await` it to run the transfer.
+    ///
+    /// Call again with the same arguments to resume after `Incomplete`,
+    /// `Cancelled`, or a crash. Set progress, cancellation, overwrite policy
+    /// and striping on the returned builder.
+    pub fn download_to<'a>(&'a self, req: &'a DownloadRequest, dest: &'a Path) -> Download<'a> {
+        Download {
+            client: self,
+            req,
+            dest,
+            sink: None,
+            cancel: None,
+            overwrite: None,
+            holders: None,
+        }
+    }
+
+    /// Download into `dir`, staged under the blob's id, returning where it
+    /// landed and the server's advisory filename. `.await` the returned
+    /// [`StagedDownload`] to run it.
+    ///
+    /// [`download_to`](Self::download_to) is deliberately caller-chooses-the
+    /// -destination: the server's filename is advisory and this crate never
+    /// joins it to a path, which is the structural fix for v1's traversal
+    /// vector — applied at the API's shape rather than at the write site. That
+    /// stays true here and is not negotiable.
+    ///
+    /// What it left every caller to reinvent is the *convention* around it,
+    /// and both downstream GUIs reinvented the same one: stage under the id,
+    /// keep the suggested name aside, offer it in a save-as dialog later.
+    /// Staging under the **id** rather than the suggested name is the load
+    /// bearing part — two concurrent downloads whose servers both claim
+    /// `report.pcap` must not collide.
+    ///
+    /// Pairing the two in one call means the safe path is also the shortest
+    /// one, which is the only way a security property reliably survives
+    /// contact with application code.
+    pub fn download_staged<'a>(
+        &'a self,
+        req: &'a DownloadRequest,
+        dir: &'a Path,
+    ) -> StagedDownload<'a> {
+        StagedDownload {
+            inner: self.download_to(req, dir),
+        }
+    }
+
+    /// Download into `writer`, **without resume**: no `.part`, no sidecar — an
+    /// interrupted call must start over, and the writer must be
+    /// sized/seekable for the whole blob. `.await` the returned
+    /// [`DownloadToWriter`] to run it.
+    pub fn download_to_writer<'a, W>(
+        &'a self,
+        req: &'a DownloadRequest,
+        writer: &'a mut W,
+    ) -> DownloadToWriter<'a, W>
+    where
+        W: tokio::io::AsyncWrite + tokio::io::AsyncSeek + Unpin + Send,
+    {
+        DownloadToWriter {
+            client: self,
+            req,
+            writer,
+            sink: None,
+            cancel: None,
+        }
+    }
+
+    /// Upload (push) the file at `path` to a server that has
+    /// [`accept_push`](crate::BlobServerBuilder::accept_push) configured,
+    /// under `spec`. `.await` the returned [`Upload`] to run it.
+    ///
+    /// The whole file is hashed locally first; every slice the server receives
+    /// is verified against that root, and a completed upload is registered and
+    /// served by the receiver. Interrupted uploads resume: the server's offer
+    /// reply names exactly the chunks it is still missing. Resolves to the
+    /// manifest (distribute `(id, root)` to downloaders).
+    pub fn upload_file(&self, spec: BlobSpec, path: impl Into<PathBuf>) -> Upload<'_> {
+        Upload {
+            client: self,
+            spec,
+            path: path.into(),
+            token: None,
+            sink: None,
+            cancel: None,
+        }
+    }
+
+    async fn run_download_staged(
         &self,
         req: &DownloadRequest,
         dir: &Path,
         sink: &dyn ProgressSink,
         cancel: &CancelToken,
+        overwrite: Overwrite,
     ) -> Result<Staged> {
         validate_id(&req.id)?;
         tokio::fs::create_dir_all(dir).await?;
         // `validate_id` has already refused separators, `..` and wildcards, so
         // the id is a single safe component.
         let path = dir.join(&req.id);
-        let stats = self.download_to(req, &path, sink, cancel).await?;
+        let stats = self
+            .run_download_to(req, &path, sink, cancel, overwrite)
+            .await?;
         // Re-read rather than plumbing it out of the transfer: the manifest is
         // cheap, and the alternative is threading a value through a function
         // whose whole job is bytes.
@@ -516,17 +609,20 @@ impl BlobClient {
     ///
     /// Call again with the same arguments to resume after `Incomplete`,
     /// `Cancelled`, or a crash.
-    pub async fn download_to(
+    async fn run_download_to(
         &self,
         req: &DownloadRequest,
         dest: &Path,
         sink: &dyn ProgressSink,
         cancel: &CancelToken,
+        overwrite: Overwrite,
     ) -> Result<TransferStats> {
         // Single-flight: a second concurrent download to the same destination
         // through this client is refused instead of silently corrupting state.
         let guard = ActiveGuard::acquire(&self.active, dest)?;
-        let result = self.download_to_inner(req, dest, sink, cancel).await;
+        let result = self
+            .download_to_inner(req, dest, sink, cancel, overwrite)
+            .await;
         drop(guard);
         match &result {
             Err(BlobError::Cancelled { .. }) | Ok(_) => {}
@@ -556,20 +652,23 @@ impl BlobClient {
     /// Get `holders` from [`probe`](Self::probe). With fewer than two this
     /// degrades to `download_to`, which is the right thing rather than an
     /// error.
-    pub async fn download_striped(
+    async fn run_download_striped(
         &self,
         req: &DownloadRequest,
         dest: &Path,
         holders: &[BlobProbe],
         sink: &dyn ProgressSink,
         cancel: &CancelToken,
+        overwrite: Overwrite,
     ) -> Result<TransferStats> {
         if holders.len() < 2 {
-            return self.download_to(req, dest, sink, cancel).await;
+            return self
+                .run_download_to(req, dest, sink, cancel, overwrite)
+                .await;
         }
         let guard = ActiveGuard::acquire(&self.active, dest)?;
         let result = self
-            .download_striped_inner(req, dest, holders, sink, cancel)
+            .download_striped_inner(req, dest, holders, sink, cancel, overwrite)
             .await;
         drop(guard);
         if let Err(e) = &result
@@ -589,9 +688,10 @@ impl BlobClient {
         holders: &[BlobProbe],
         sink: &dyn ProgressSink,
         cancel: &CancelToken,
+        overwrite: Overwrite,
     ) -> Result<TransferStats> {
         let started_at = tokio::time::Instant::now();
-        if self.cfg.overwrite == Overwrite::Refuse && tokio::fs::try_exists(dest).await? {
+        if overwrite == Overwrite::Refuse && tokio::fs::try_exists(dest).await? {
             return Err(BlobError::DestinationExists(dest.to_path_buf()));
         }
         // Every holder must agree on the content, or "striping" would be
@@ -655,7 +755,7 @@ impl BlobClient {
 
         file.sync_data().await?;
         drop(file);
-        if self.cfg.overwrite == Overwrite::Refuse && tokio::fs::try_exists(dest).await? {
+        if overwrite == Overwrite::Refuse && tokio::fs::try_exists(dest).await? {
             return Err(BlobError::DestinationExists(dest.to_path_buf()));
         }
         tokio::fs::rename(&part, dest).await?;
@@ -724,10 +824,10 @@ impl BlobClient {
     /// served by the receiver. Interrupted uploads resume: the server's offer
     /// reply names exactly the chunks it is still missing. Returns the
     /// manifest (distribute `(id, root)` to downloaders).
-    pub async fn upload_file(
+    async fn run_upload_file(
         &self,
         spec: BlobSpec,
-        path: impl Into<PathBuf>,
+        path: PathBuf,
         token: Option<Vec<u8>>,
         sink: &dyn ProgressSink,
         cancel: &CancelToken,
@@ -742,7 +842,6 @@ impl BlobClient {
                 self.prefix
             )));
         }
-        let path = path.into();
 
         // Hash the source once: outboard + manifest, exactly like server-side
         // registration.
@@ -961,7 +1060,7 @@ impl BlobClient {
     /// no sidecar — an interrupted call must start over, and the writer must
     /// be sized/seekable for the whole blob. Emits `Started`/`Chunk` progress;
     /// the `Ok` return is completion.
-    pub async fn download_to_writer<W>(
+    async fn run_download_to_writer<W>(
         &self,
         req: &DownloadRequest,
         writer: &mut W,
@@ -1012,6 +1111,7 @@ impl BlobClient {
         dest: &Path,
         sink: &dyn ProgressSink,
         cancel: &CancelToken,
+        overwrite: Overwrite,
     ) -> Result<TransferStats> {
         let started_at = tokio::time::Instant::now();
 
@@ -1023,7 +1123,7 @@ impl BlobClient {
         // was then refused. It is re-checked after the transfer as well, since
         // the destination can appear while we are fetching; that late check is
         // the TOCTOU backstop, not the policy.
-        if self.cfg.overwrite == Overwrite::Refuse && tokio::fs::try_exists(dest).await? {
+        if overwrite == Overwrite::Refuse && tokio::fs::try_exists(dest).await? {
             return Err(BlobError::DestinationExists(dest.to_path_buf()));
         }
 
@@ -1089,7 +1189,7 @@ impl BlobClient {
         // no second hash pass. Make it durable, then move it into place.
         file.sync_data().await?;
         drop(file);
-        if self.cfg.overwrite == Overwrite::Refuse && tokio::fs::try_exists(dest).await? {
+        if overwrite == Overwrite::Refuse && tokio::fs::try_exists(dest).await? {
             return Err(BlobError::DestinationExists(dest.to_path_buf()));
         }
         tokio::fs::rename(&part, dest).await?;
@@ -1497,6 +1597,302 @@ impl BlobClient {
         Err(BlobError::Cancelled {
             received: state.received(),
             total: count,
+        })
+    }
+}
+
+/// A configured download, awaited to run it.
+///
+/// Returned by [`BlobClient::download_to`]. The two arguments a transfer
+/// cannot do without — what to fetch and where to put it — are positional;
+/// progress, cancellation, overwrite policy and multi-origin striping are
+/// optional and set here.
+///
+/// The old shape took all five positionally, which meant `&()` and
+/// `&CancelToken::new()` at nearly every call site: two arguments that
+/// existed to say "no thanks", and could be swapped with the ones that
+/// mattered without the compiler noticing.
+///
+/// ```no_run
+/// # use zblob::{BlobClient, DownloadRequest, CancelToken, Overwrite};
+/// # async fn f(client: BlobClient, req: DownloadRequest, cancel: CancelToken) -> zblob::Result<()> {
+/// let stats = client.download_to(&req, "/tmp/out.bin".as_ref()).await?;
+///
+/// let stats = client
+///     .download_to(&req, "/tmp/out.bin".as_ref())
+///     .cancel(&cancel)
+///     .overwrite(Overwrite::Replace)
+///     .await?;
+/// # let _ = stats; Ok(()) }
+/// ```
+#[must_use = "a download does nothing until it is awaited"]
+pub struct Download<'a> {
+    client: &'a BlobClient,
+    req: &'a DownloadRequest,
+    dest: &'a Path,
+    sink: Option<&'a dyn ProgressSink>,
+    cancel: Option<&'a CancelToken>,
+    overwrite: Option<Overwrite>,
+    holders: Option<&'a [BlobProbe]>,
+}
+
+impl std::fmt::Debug for Download<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Download")
+            .field("req", &self.req)
+            .field("dest", &self.dest)
+            .field("overwrite", &self.overwrite)
+            .field("holders", &self.holders.map(<[BlobProbe]>::len))
+            .finish_non_exhaustive()
+    }
+}
+
+impl<'a> Download<'a> {
+    /// Send progress events to `sink` (default: discard them).
+    pub fn progress(mut self, sink: &'a dyn ProgressSink) -> Self {
+        self.sink = Some(sink);
+        self
+    }
+
+    /// Stop when `cancel` is cancelled, persisting resume state
+    /// (default: never).
+    pub fn cancel(mut self, cancel: &'a CancelToken) -> Self {
+        self.cancel = Some(cancel);
+        self
+    }
+
+    /// Override the client's overwrite policy for this transfer.
+    ///
+    /// It was previously settable only per *client*, which is the wrong
+    /// granularity: whether replacing an existing file is acceptable is a
+    /// property of the transfer, not of the connection.
+    pub fn overwrite(mut self, policy: Overwrite) -> Self {
+        self.overwrite = Some(policy);
+        self
+    }
+
+    /// Fetch from several holders at once, dealing chunks between them.
+    ///
+    /// Get `holders` from [`BlobClient::probe`]. With fewer than two this
+    /// degrades to an ordinary download, which is the right thing rather than
+    /// an error.
+    pub fn striped(mut self, holders: &'a [BlobProbe]) -> Self {
+        self.holders = Some(holders);
+        self
+    }
+}
+
+/// The no-op progress sink used when a call sets none.
+pub(crate) const NO_PROGRESS: &(dyn ProgressSink + 'static) = &();
+
+impl<'a> std::future::IntoFuture for Download<'a> {
+    type Output = Result<TransferStats>;
+    type IntoFuture =
+        std::pin::Pin<Box<dyn std::future::Future<Output = Self::Output> + Send + 'a>>;
+
+    fn into_future(self) -> Self::IntoFuture {
+        Box::pin(async move {
+            let sink = self.sink.unwrap_or(NO_PROGRESS);
+            let fresh;
+            let cancel = match self.cancel {
+                Some(c) => c,
+                None => {
+                    fresh = CancelToken::new();
+                    &fresh
+                }
+            };
+            let overwrite = self.overwrite.unwrap_or(self.client.cfg.overwrite);
+            match self.holders {
+                Some(holders) => {
+                    self.client
+                        .run_download_striped(self.req, self.dest, holders, sink, cancel, overwrite)
+                        .await
+                }
+                None => {
+                    self.client
+                        .run_download_to(self.req, self.dest, sink, cancel, overwrite)
+                        .await
+                }
+            }
+        })
+    }
+}
+
+/// A configured staged download, awaited to run it. See
+/// [`BlobClient::download_staged`].
+#[must_use = "a download does nothing until it is awaited"]
+#[derive(Debug)]
+pub struct StagedDownload<'a> {
+    inner: Download<'a>,
+}
+
+impl<'a> StagedDownload<'a> {
+    /// Send progress events to `sink` (default: discard them).
+    pub fn progress(mut self, sink: &'a dyn ProgressSink) -> Self {
+        self.inner = self.inner.progress(sink);
+        self
+    }
+
+    /// Stop when `cancel` is cancelled, persisting resume state.
+    pub fn cancel(mut self, cancel: &'a CancelToken) -> Self {
+        self.inner = self.inner.cancel(cancel);
+        self
+    }
+
+    /// Override the client's overwrite policy for this transfer.
+    pub fn overwrite(mut self, policy: Overwrite) -> Self {
+        self.inner = self.inner.overwrite(policy);
+        self
+    }
+}
+
+impl<'a> std::future::IntoFuture for StagedDownload<'a> {
+    type Output = Result<Staged>;
+    type IntoFuture =
+        std::pin::Pin<Box<dyn std::future::Future<Output = Self::Output> + Send + 'a>>;
+
+    fn into_future(self) -> Self::IntoFuture {
+        Box::pin(async move {
+            let d = self.inner;
+            let sink = d.sink.unwrap_or(NO_PROGRESS);
+            let fresh;
+            let cancel = match d.cancel {
+                Some(c) => c,
+                None => {
+                    fresh = CancelToken::new();
+                    &fresh
+                }
+            };
+            let overwrite = d.overwrite.unwrap_or(d.client.cfg.overwrite);
+            d.client
+                .run_download_staged(d.req, d.dest, sink, cancel, overwrite)
+                .await
+        })
+    }
+}
+
+/// A configured download into a writer, awaited to run it. See
+/// [`BlobClient::download_to_writer`].
+#[must_use = "a download does nothing until it is awaited"]
+pub struct DownloadToWriter<'a, W> {
+    client: &'a BlobClient,
+    req: &'a DownloadRequest,
+    writer: &'a mut W,
+    sink: Option<&'a dyn ProgressSink>,
+    cancel: Option<&'a CancelToken>,
+}
+
+impl<W> std::fmt::Debug for DownloadToWriter<'_, W> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("DownloadToWriter")
+            .field("req", &self.req)
+            .finish_non_exhaustive()
+    }
+}
+
+impl<'a, W> DownloadToWriter<'a, W> {
+    /// Send progress events to `sink` (default: discard them).
+    pub fn progress(mut self, sink: &'a dyn ProgressSink) -> Self {
+        self.sink = Some(sink);
+        self
+    }
+
+    /// Stop when `cancel` is cancelled. There is no resume state to persist
+    /// here — an interrupted writer download starts over.
+    pub fn cancel(mut self, cancel: &'a CancelToken) -> Self {
+        self.cancel = Some(cancel);
+        self
+    }
+}
+
+impl<'a, W> std::future::IntoFuture for DownloadToWriter<'a, W>
+where
+    W: tokio::io::AsyncWrite + tokio::io::AsyncSeek + Unpin + Send,
+{
+    type Output = Result<TransferStats>;
+    type IntoFuture =
+        std::pin::Pin<Box<dyn std::future::Future<Output = Self::Output> + Send + 'a>>;
+
+    fn into_future(self) -> Self::IntoFuture {
+        Box::pin(async move {
+            let sink = self.sink.unwrap_or(NO_PROGRESS);
+            let fresh;
+            let cancel = match self.cancel {
+                Some(c) => c,
+                None => {
+                    fresh = CancelToken::new();
+                    &fresh
+                }
+            };
+            self.client
+                .run_download_to_writer(self.req, self.writer, sink, cancel)
+                .await
+        })
+    }
+}
+
+/// A configured upload, awaited to run it. See [`BlobClient::upload_file`].
+#[must_use = "an upload does nothing until it is awaited"]
+pub struct Upload<'a> {
+    client: &'a BlobClient,
+    spec: BlobSpec,
+    path: PathBuf,
+    token: Option<Vec<u8>>,
+    sink: Option<&'a dyn ProgressSink>,
+    cancel: Option<&'a CancelToken>,
+}
+
+impl std::fmt::Debug for Upload<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Upload")
+            .field("spec", &self.spec)
+            .field("path", &self.path)
+            .field("token", &self.token.as_ref().map(Vec::len))
+            .finish_non_exhaustive()
+    }
+}
+
+impl<'a> Upload<'a> {
+    /// Attach an opaque credential the server's
+    /// [`PushPolicy`](crate::PushPolicy) sees with every request.
+    pub fn token(mut self, token: impl Into<Vec<u8>>) -> Self {
+        self.token = Some(token.into());
+        self
+    }
+
+    /// Send progress events to `sink` (default: discard them).
+    pub fn progress(mut self, sink: &'a dyn ProgressSink) -> Self {
+        self.sink = Some(sink);
+        self
+    }
+
+    /// Stop when `cancel` is cancelled. The server keeps its spool, so a
+    /// later upload of the same id resumes from what it already holds.
+    pub fn cancel(mut self, cancel: &'a CancelToken) -> Self {
+        self.cancel = Some(cancel);
+        self
+    }
+}
+
+impl<'a> std::future::IntoFuture for Upload<'a> {
+    type Output = Result<Manifest>;
+    type IntoFuture =
+        std::pin::Pin<Box<dyn std::future::Future<Output = Self::Output> + Send + 'a>>;
+
+    fn into_future(self) -> Self::IntoFuture {
+        Box::pin(async move {
+            let sink = self.sink.unwrap_or(NO_PROGRESS);
+            let fresh;
+            let cancel = match self.cancel {
+                Some(c) => c,
+                None => {
+                    fresh = CancelToken::new();
+                    &fresh
+                }
+            };
+            self.client
+                .run_upload_file(self.spec, self.path, self.token, sink, cancel)
+                .await
         })
     }
 }

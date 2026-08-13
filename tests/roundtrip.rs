@@ -10,8 +10,8 @@ use std::time::Duration;
 
 use common::{content_hash, open_session, pseudo_random, unique_prefix};
 use zblob::{
-    BlobClient, BlobError, BlobServer, BlobSpec, CancelToken, DownloadRequest, Hash,
-    MIN_CHUNK_SIZE, MemoryBlobSource, Overwrite, Progress, RetryPolicy,
+    BlobClient, BlobError, BlobServer, BlobSpec, DownloadRequest, Hash, MIN_CHUNK_SIZE,
+    MemoryBlobSource, Overwrite, Progress, RetryPolicy,
 };
 
 /// A client tuned for tests: fail fast instead of the 30 s defaults.
@@ -61,12 +61,9 @@ async fn roundtrip_file_multichunk_pinned() {
     let client = test_client(&session, &prefix);
     let stats = tokio::time::timeout(
         Duration::from_secs(20),
-        client.download_to(
-            &DownloadRequest::pinned("blob-1", manifest.root),
-            &dest,
-            &sink,
-            &CancelToken::new(),
-        ),
+        client
+            .download_to(&DownloadRequest::pinned("blob-1", manifest.root), &dest)
+            .progress(&sink),
     )
     .await
     .expect("timed out")
@@ -127,24 +124,14 @@ async fn roundtrip_memory_source_tiny_and_empty() {
 
     let tiny_dest = dest_dir.path().join("tiny.bin");
     client
-        .download_to(
-            &DownloadRequest::new("tiny"),
-            &tiny_dest,
-            &(),
-            &CancelToken::new(),
-        )
+        .download_to(&DownloadRequest::new("tiny"), &tiny_dest)
         .await
         .expect("download tiny");
     assert_eq!(std::fs::read(&tiny_dest).unwrap(), tiny);
 
     let empty_dest = dest_dir.path().join("empty.bin");
     client
-        .download_to(
-            &DownloadRequest::new("empty"),
-            &empty_dest,
-            &(),
-            &CancelToken::new(),
-        )
+        .download_to(&DownloadRequest::new("empty"), &empty_dest)
         .await
         .expect("download empty");
     assert_eq!(std::fs::read(&empty_dest).unwrap(), b"");
@@ -176,8 +163,6 @@ async fn wrong_pin_rejected_before_any_write() {
         .download_to(
             &DownloadRequest::pinned("blob-p", Hash::of(b"the wrong content")),
             &dest,
-            &(),
-            &CancelToken::new(),
         )
         .await
         .expect_err("must reject");
@@ -216,12 +201,7 @@ async fn overwrite_policy_refuse_and_replace() {
     // on a request it then refused.)
     let refuse = test_client(&session, &prefix);
     let err = refuse
-        .download_to(
-            &DownloadRequest::new("blob-o"),
-            &dest,
-            &(),
-            &CancelToken::new(),
-        )
+        .download_to(&DownloadRequest::new("blob-o"), &dest)
         .await
         .expect_err("must refuse");
     assert!(matches!(err, BlobError::DestinationExists(_)), "{err}");
@@ -237,12 +217,7 @@ async fn overwrite_policy_refuse_and_replace() {
         .query_timeout(Duration::from_secs(5))
         .build();
     replace
-        .download_to(
-            &DownloadRequest::new("blob-o"),
-            &dest,
-            &(),
-            &CancelToken::new(),
-        )
+        .download_to(&DownloadRequest::new("blob-o"), &dest)
         .await
         .expect("replace");
     assert_eq!(std::fs::read(&dest).unwrap(), data);

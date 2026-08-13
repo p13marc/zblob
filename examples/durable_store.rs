@@ -31,8 +31,8 @@
 use std::sync::Arc;
 
 use zblob::{
-    CancelToken, CdcParams, ContentStore, DirStore, DownloadRequest, QueryPrefix, ServePrefix,
-    TreeClient, TreeServer, build_tree, build_tree_from, gc,
+    CdcParams, ContentStore, DirStore, DownloadRequest, QueryPrefix, ServePrefix, TreeClient,
+    TreeServer, build_tree, build_tree_from, gc,
 };
 
 #[tokio::main]
@@ -136,8 +136,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             &DownloadRequest::pinned("v2", v2.root_hash),
             &out,
             &client_store,
-            &(),
-            &CancelToken::new(),
         )
         .await?;
     println!(

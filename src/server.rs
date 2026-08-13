@@ -390,7 +390,7 @@ impl BlobServerBuilder {
     /// # use std::sync::Arc;
     /// # use zblob::{BlobServer, PushConfig, PushPolicy, Manifest, ServePrefix};
     /// # fn f(session: zenoh::Session, prefix: ServePrefix, policy: Arc<dyn PushPolicy>) {
-    /// let server = BlobServer::builder(session, prefix)
+    /// let server = BlobServer::builder(&session, prefix)
     ///     .accept_push(
     ///         PushConfig::new(policy, "/var/spool/zblob")
     ///             .max_concurrent(2)

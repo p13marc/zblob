@@ -53,12 +53,7 @@ async fn large_blob_spans_multiple_queries() {
         .build();
     let stats = tokio::time::timeout(
         Duration::from_secs(30),
-        client.download_to(
-            &DownloadRequest::new("big"),
-            &dest,
-            &(),
-            &CancelToken::new(),
-        ),
+        client.download_to(&DownloadRequest::new("big"), &dest),
     )
     .await
     .expect("timed out")
@@ -104,12 +99,8 @@ async fn stray_or_mismatched_partial_restarts_clean() {
         }
     };
     client
-        .download_to(
-            &DownloadRequest::new("clean"),
-            &dest,
-            &sink,
-            &CancelToken::new(),
-        )
+        .download_to(&DownloadRequest::new("clean"), &dest)
+        .progress(&sink)
         .await
         .expect("download");
     assert!(
@@ -131,12 +122,9 @@ async fn stray_or_mismatched_partial_restarts_clean() {
     }
     let token = CancelToken::new();
     let _ = client
-        .download_to(
-            &DownloadRequest::new("clean"),
-            &dest2,
-            &CancelFirst(token.clone()),
-            &token,
-        )
+        .download_to(&DownloadRequest::new("clean"), &dest2)
+        .progress(&CancelFirst(token.clone()))
+        .cancel(&token)
         .await;
     let part2 = dir.path().join("out2.bin.part");
     assert!(part2.exists());
@@ -148,12 +136,7 @@ async fn stray_or_mismatched_partial_restarts_clean() {
         .set_len(10)
         .unwrap();
     client
-        .download_to(
-            &DownloadRequest::new("clean"),
-            &dest2,
-            &(),
-            &CancelToken::new(),
-        )
+        .download_to(&DownloadRequest::new("clean"), &dest2)
         .await
         .expect("re-download after truncation");
     assert_eq!(std::fs::read(&dest2).unwrap(), data);
@@ -188,12 +171,7 @@ async fn concurrent_downloads_to_different_destinations() {
         let dest = dir.path().join(format!("copy{i}.bin"));
         joins.push(tokio::spawn(async move {
             client
-                .download_to(
-                    &DownloadRequest::new("shared"),
-                    &dest,
-                    &(),
-                    &CancelToken::new(),
-                )
+                .download_to(&DownloadRequest::new("shared"), &dest)
                 .await
                 .map(|_| dest)
         }));
@@ -231,12 +209,7 @@ async fn download_to_writer_roundtrip() {
     let client = test_client(&session, &prefix);
     let mut cursor = std::io::Cursor::new(Vec::new());
     let stats = client
-        .download_to_writer(
-            &DownloadRequest::pinned("wr", manifest.root),
-            &mut cursor,
-            &(),
-            &CancelToken::new(),
-        )
+        .download_to_writer(&DownloadRequest::pinned("wr", manifest.root), &mut cursor)
         .await
         .expect("writer download");
     assert_eq!(cursor.into_inner(), data);
@@ -275,12 +248,7 @@ async fn file_outboard_spill_roundtrip() {
     let dest = dir.path().join("out.bin");
     let client = test_client(&session, &prefix);
     client
-        .download_to(
-            &DownloadRequest::pinned("spill", manifest.root),
-            &dest,
-            &(),
-            &CancelToken::new(),
-        )
+        .download_to(&DownloadRequest::pinned("spill", manifest.root), &dest)
         .await
         .expect("download from file outboard");
     assert_eq!(std::fs::read(&dest).unwrap(), data);
@@ -335,12 +303,7 @@ async fn unusable_prefixes_and_ids_fail_loudly() {
     let dest = dir.path().join("out.bin");
     let client = test_client(&session, &good);
     client
-        .download_to(
-            &DownloadRequest::pinned("ok", manifest.root),
-            &dest,
-            &(),
-            &CancelToken::new(),
-        )
+        .download_to(&DownloadRequest::pinned("ok", manifest.root), &dest)
         .await
         .expect("download under a verbatim-segment prefix");
     assert_eq!(std::fs::read(&dest).unwrap(), data);
@@ -394,12 +357,7 @@ async fn wildcard_prefixes_are_queryable_but_not_servable() {
     let dir = tempfile::tempdir().unwrap();
     let dest = dir.path().join("out.bin");
     test_client(&session, &concrete)
-        .download_to(
-            &DownloadRequest::pinned("probed", manifest.root),
-            &dest,
-            &(),
-            &CancelToken::new(),
-        )
+        .download_to(&DownloadRequest::pinned("probed", manifest.root), &dest)
         .await
         .expect("concrete fetch");
     assert_eq!(std::fs::read(&dest).unwrap(), data);
@@ -456,12 +414,7 @@ async fn a_mutated_source_is_diagnosed_not_served_forever() {
     // Discriminating power first: while the file is untouched, it downloads.
     let out = dir.path().join("before.bin");
     client
-        .download_to(
-            &DownloadRequest::pinned("mut", manifest.root),
-            &out,
-            &(),
-            &CancelToken::new(),
-        )
+        .download_to(&DownloadRequest::pinned("mut", manifest.root), &out)
         .await
         .expect("an unmodified source must serve normally");
     assert_eq!(std::fs::read(&out).unwrap(), original);
@@ -471,12 +424,7 @@ async fn a_mutated_source_is_diagnosed_not_served_forever() {
 
     let out2 = dir.path().join("after.bin");
     let err = client
-        .download_to(
-            &DownloadRequest::pinned("mut", manifest.root),
-            &out2,
-            &(),
-            &CancelToken::new(),
-        )
+        .download_to(&DownloadRequest::pinned("mut", manifest.root), &out2)
         .await
         .expect_err("a mutated source must not silently fail forever");
     // The manifest itself is refused now, so this fails fast rather than
@@ -527,12 +475,7 @@ async fn re_registration_cannot_silently_swap_content() {
     let dir = tempfile::tempdir().unwrap();
     let out = dir.path().join("still.bin");
     test_client(&session, &prefix)
-        .download_to(
-            &DownloadRequest::pinned("stable", m1.root),
-            &out,
-            &(),
-            &CancelToken::new(),
-        )
+        .download_to(&DownloadRequest::pinned("stable", m1.root), &out)
         .await
         .expect("the original registration must still serve");
     assert_eq!(std::fs::read(&out).unwrap(), first);
@@ -657,12 +600,7 @@ async fn a_client_clamps_to_the_server_s_advertised_cap() {
         .max_chunks_per_query(512)
         .build();
     client
-        .download_to(
-            &DownloadRequest::pinned("capped", manifest.root),
-            &dest,
-            &(),
-            &CancelToken::new(),
-        )
+        .download_to(&DownloadRequest::pinned("capped", manifest.root), &dest)
         .await
         .expect("a client must clamp to the advertised cap, not be rejected by it");
     assert_eq!(std::fs::read(&dest).unwrap(), data);

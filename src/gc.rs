@@ -23,7 +23,7 @@
 //! let client = TreeClient::builder(session, store_prefix, tree_prefix)
 //!     .temp_tags(temps.clone())     // downloads now protect themselves
 //!     .build();
-//! client.download_tree(&req, &dest, &store, &(), &cancel).await?;
+//! client.download_tree(&req, &dest, &store).cancel(&cancel).await?;
 //! tags.set("current", &index)?;      // survives restart
 //! let stats = gc::sweep(&*store, &tags, &temps, [])?;
 //! ```

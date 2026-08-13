@@ -96,7 +96,8 @@ pub mod wire;
 pub use cancel::CancelToken;
 pub use chunk::{CdcParams, DEFAULT_CHUNK_SIZE, MAX_CHUNK_SIZE, MIN_CHUNK_SIZE, TransferChunks};
 pub use client::{
-    BlobClient, BlobClientBuilder, BlobProbe, DownloadRequest, Overwrite, RetryPolicy, Staged,
+    BlobClient, BlobClientBuilder, BlobProbe, Download, DownloadRequest, DownloadToWriter,
+    Overwrite, RetryPolicy, Staged, StagedDownload, Upload,
 };
 pub use compress::ChunkCompression;
 #[cfg(feature = "encryption")]
@@ -120,8 +121,8 @@ pub use server::{
 pub use store::{ContentStore, DirStore, MemoryStore};
 pub use store_client::{ChunkProbe, StoreClient, StoreClientBuilder};
 pub use tree::{
-    ChunkRef, Entry, MaterializePolicy, TreeClient, TreeClientBuilder, TreeIndex, TreeServer,
-    TreeServerBuilder, build_tree, build_tree_from,
+    ChunkRef, Entry, MaterializePolicy, TreeClient, TreeClientBuilder, TreeDownload, TreeIndex,
+    TreeServer, TreeServerBuilder, build_tree, build_tree_from,
 };
 #[doc(no_inline)]
 pub use zenoh::qos::Priority;

@@ -10,8 +10,8 @@ use std::time::Duration;
 
 use common::{open_session, unique_prefix};
 use zblob::{
-    CancelToken, CdcParams, ChunkCompression, ContentStore, DirStore, DownloadRequest, MemoryStore,
-    TreeClient, TreeServer, build_tree,
+    CdcParams, ChunkCompression, ContentStore, DirStore, DownloadRequest, MemoryStore, TreeClient,
+    TreeServer, build_tree,
 };
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -73,8 +73,6 @@ async fn compressed_wire_and_store_roundtrip() {
             &DownloadRequest::pinned("zsnap", expected_root),
             dest.path(),
             &client_store,
-            &(),
-            &CancelToken::new(),
         )
         .await
         .expect("compressed download");

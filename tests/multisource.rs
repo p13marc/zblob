@@ -9,8 +9,8 @@ use std::time::Duration;
 
 use common::{content_hash, open_session, pseudo_random, unique_prefix};
 use zblob::{
-    BlobClient, BlobError, BlobServer, BlobSpec, CancelToken, DownloadRequest, MIN_CHUNK_SIZE,
-    MemoryBlobSource, RetryPolicy,
+    BlobClient, BlobError, BlobServer, BlobSpec, DownloadRequest, MIN_CHUNK_SIZE, MemoryBlobSource,
+    RetryPolicy,
 };
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -57,12 +57,7 @@ async fn two_replicas_serve_one_download_and_report_availability() {
     let dest = dir.path().join("out.bin");
     let stats = tokio::time::timeout(
         Duration::from_secs(20),
-        client.download_to(
-            &DownloadRequest::new("replicated"),
-            &dest,
-            &(),
-            &CancelToken::new(),
-        ),
+        client.download_to(&DownloadRequest::new("replicated"), &dest),
     )
     .await
     .expect("timed out")
@@ -117,13 +112,12 @@ async fn concurrent_same_destination_single_flights() {
                 let _ = tx.send(());
             }
         };
-        c1.download_to(&DownloadRequest::new("sf"), &d1, &sink, &CancelToken::new())
+        c1.download_to(&DownloadRequest::new("sf"), &d1)
+            .progress(&sink)
             .await
     });
     started_rx.await.expect("first download must start");
-    let second = client
-        .download_to(&DownloadRequest::new("sf"), &dest, &(), &CancelToken::new())
-        .await;
+    let second = client.download_to(&DownloadRequest::new("sf"), &dest).await;
     assert!(
         matches!(&second, Err(BlobError::Usage(msg)) if msg.contains("already in progress")),
         "second concurrent download must be refused: {second:?}"

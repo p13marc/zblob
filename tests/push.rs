@@ -54,13 +54,12 @@ async fn authorized_push_lands_and_serves() {
     let client = test_client(&session, &prefix);
     let manifest = tokio::time::timeout(
         Duration::from_secs(20),
-        client.upload_file(
-            BlobSpec::new("pushed").chunk_size(MIN_CHUNK_SIZE),
-            &src_path,
-            Some(b"secret".to_vec()),
-            &(),
-            &CancelToken::new(),
-        ),
+        client
+            .upload_file(
+                BlobSpec::new("pushed").chunk_size(MIN_CHUNK_SIZE),
+                &src_path,
+            )
+            .token(b"secret".to_vec()),
     )
     .await
     .expect("timed out")
@@ -71,12 +70,7 @@ async fn authorized_push_lands_and_serves() {
     let dl = tempfile::tempdir().unwrap();
     let dest = dl.path().join("down.bin");
     client
-        .download_to(
-            &DownloadRequest::pinned("pushed", manifest.root),
-            &dest,
-            &(),
-            &CancelToken::new(),
-        )
+        .download_to(&DownloadRequest::pinned("pushed", manifest.root), &dest)
         .await
         .expect("download pushed blob");
     assert_eq!(std::fs::read(&dest).unwrap(), data);
@@ -104,13 +98,8 @@ async fn unauthorized_or_unconfigured_push_denied() {
     let client = test_client(&session, &prefix);
     // Wrong token → denied by policy.
     let err = client
-        .upload_file(
-            BlobSpec::new("nope").chunk_size(MIN_CHUNK_SIZE),
-            &src_path,
-            Some(b"wrong".to_vec()),
-            &(),
-            &CancelToken::new(),
-        )
+        .upload_file(BlobSpec::new("nope").chunk_size(MIN_CHUNK_SIZE), &src_path)
+        .token(b"wrong".to_vec())
         .await
         .expect_err("must be denied");
     assert!(matches!(err, BlobError::PushDenied(_)), "{err}");
@@ -125,13 +114,8 @@ async fn unauthorized_or_unconfigured_push_denied() {
     let plain_handle = plain.spawn().await.unwrap();
     let client2 = test_client(&session, &plain_prefix);
     let err = client2
-        .upload_file(
-            BlobSpec::new("x").chunk_size(MIN_CHUNK_SIZE),
-            &src_path,
-            Some(b"secret".to_vec()),
-            &(),
-            &CancelToken::new(),
-        )
+        .upload_file(BlobSpec::new("x").chunk_size(MIN_CHUNK_SIZE), &src_path)
+        .token(b"secret".to_vec())
         .await
         .expect_err("push must be off by default");
     assert!(matches!(err, BlobError::PushDenied(_)), "{err}");
@@ -182,10 +166,10 @@ async fn interrupted_upload_resumes_from_spool() {
         .upload_file(
             BlobSpec::new("resumable").chunk_size(MIN_CHUNK_SIZE),
             &src_path,
-            Some(b"secret".to_vec()),
-            &sink,
-            &token,
         )
+        .token(b"secret".to_vec())
+        .progress(&sink)
+        .cancel(&token)
         .await
         .expect_err("must cancel");
     assert!(matches!(err, BlobError::Cancelled { .. }), "{err}");
@@ -202,13 +186,13 @@ async fn interrupted_upload_resumes_from_spool() {
     };
     let manifest = tokio::time::timeout(
         Duration::from_secs(20),
-        client.upload_file(
-            BlobSpec::new("resumable").chunk_size(MIN_CHUNK_SIZE),
-            &src_path,
-            Some(b"secret".to_vec()),
-            &sink,
-            &CancelToken::new(),
-        ),
+        client
+            .upload_file(
+                BlobSpec::new("resumable").chunk_size(MIN_CHUNK_SIZE),
+                &src_path,
+            )
+            .token(b"secret".to_vec())
+            .progress(&sink),
     )
     .await
     .expect("timed out")
@@ -222,12 +206,7 @@ async fn interrupted_upload_resumes_from_spool() {
     let dl = tempfile::tempdir().unwrap();
     let dest = dl.path().join("down.bin");
     client
-        .download_to(
-            &DownloadRequest::pinned("resumable", manifest.root),
-            &dest,
-            &(),
-            &CancelToken::new(),
-        )
+        .download_to(&DownloadRequest::pinned("resumable", manifest.root), &dest)
         .await
         .expect("download");
     assert_eq!(
@@ -258,13 +237,8 @@ async fn empty_blob_push_finalizes_at_offer() {
 
     let client = test_client(&session, &prefix);
     let manifest = client
-        .upload_file(
-            BlobSpec::new("void"),
-            &src_path,
-            Some(b"secret".to_vec()),
-            &(),
-            &CancelToken::new(),
-        )
+        .upload_file(BlobSpec::new("void"), &src_path)
+        .token(b"secret".to_vec())
         .await
         .expect("empty upload");
     assert_eq!(manifest.total_len, 0);
@@ -272,12 +246,7 @@ async fn empty_blob_push_finalizes_at_offer() {
     let dl = tempfile::tempdir().unwrap();
     let dest = dl.path().join("void.bin");
     client
-        .download_to(
-            &DownloadRequest::pinned("void", manifest.root),
-            &dest,
-            &(),
-            &CancelToken::new(),
-        )
+        .download_to(&DownloadRequest::pinned("void", manifest.root), &dest)
         .await
         .expect("download empty pushed blob");
     assert_eq!(std::fs::read(&dest).unwrap(), b"");
@@ -319,10 +288,8 @@ async fn push_cannot_hijack_registered_blob() {
         .upload_file(
             BlobSpec::new("victim").chunk_size(MIN_CHUNK_SIZE),
             &evil_path,
-            Some(b"secret".to_vec()),
-            &(),
-            &CancelToken::new(),
         )
+        .token(b"secret".to_vec())
         .await
         .expect_err("hijack must be refused");
     assert!(matches!(err, BlobError::PushDenied(_)), "{err}");
@@ -331,12 +298,7 @@ async fn push_cannot_hijack_registered_blob() {
     let dl = tempfile::tempdir().unwrap();
     let dest = dl.path().join("check.bin");
     client
-        .download_to(
-            &DownloadRequest::pinned("victim", registered.root),
-            &dest,
-            &(),
-            &CancelToken::new(),
-        )
+        .download_to(&DownloadRequest::pinned("victim", registered.root), &dest)
         .await
         .expect("original still served");
     assert_eq!(std::fs::read(&dest).unwrap(), original);
@@ -348,10 +310,8 @@ async fn push_cannot_hijack_registered_blob() {
         .upload_file(
             BlobSpec::new("victim").chunk_size(MIN_CHUNK_SIZE),
             &same_path,
-            Some(b"secret".to_vec()),
-            &(),
-            &CancelToken::new(),
         )
+        .token(b"secret".to_vec())
         .await
         .expect("idempotent re-push of identical content");
     assert_eq!(m.root, registered.root);
@@ -395,9 +355,6 @@ async fn hostile_offer_reply_is_rejected_cleanly() {
         .upload_file(
             BlobSpec::new("garbage").chunk_size(MIN_CHUNK_SIZE),
             &src_path,
-            None,
-            &(),
-            &CancelToken::new(),
         )
         .await
         .expect_err("garbage ranges must be rejected");
@@ -439,24 +396,16 @@ async fn concurrent_push_cap_enforced() {
     }
     let token = CancelToken::new();
     let _ = client
-        .upload_file(
-            BlobSpec::new("slot").chunk_size(MIN_CHUNK_SIZE),
-            &a,
-            Some(b"secret".to_vec()),
-            &CancelFirst(token.clone()),
-            &token,
-        )
+        .upload_file(BlobSpec::new("slot").chunk_size(MIN_CHUNK_SIZE), &a)
+        .token(b"secret".to_vec())
+        .progress(&CancelFirst(token.clone()))
+        .cancel(&token)
         .await;
 
     // A second, different id is now over the cap.
     let err = client
-        .upload_file(
-            BlobSpec::new("overflow").chunk_size(MIN_CHUNK_SIZE),
-            &a,
-            Some(b"secret".to_vec()),
-            &(),
-            &CancelToken::new(),
-        )
+        .upload_file(BlobSpec::new("overflow").chunk_size(MIN_CHUNK_SIZE), &a)
+        .token(b"secret".to_vec())
         .await
         .expect_err("second push must exceed the cap");
     assert!(
@@ -465,13 +414,8 @@ async fn concurrent_push_cap_enforced() {
     );
     // Resuming the *first* id still works (it holds the slot, not a new one).
     client
-        .upload_file(
-            BlobSpec::new("slot").chunk_size(MIN_CHUNK_SIZE),
-            &a,
-            Some(b"secret".to_vec()),
-            &(),
-            &CancelToken::new(),
-        )
+        .upload_file(BlobSpec::new("slot").chunk_size(MIN_CHUNK_SIZE), &a)
+        .token(b"secret".to_vec())
         .await
         .expect("resuming the slot-holder completes");
 
@@ -526,9 +470,6 @@ async fn a_refusing_co_server_cannot_deny_an_accepting_one() {
         client.upload_file(
             BlobSpec::new("coexist").chunk_size(MIN_CHUNK_SIZE),
             &src_path,
-            None,
-            &(),
-            &CancelToken::new(),
         ),
     )
     .await
@@ -540,12 +481,7 @@ async fn a_refusing_co_server_cannot_deny_an_accepting_one() {
     let dest = tempfile::tempdir().unwrap().keep();
     let out = dest.join("back.bin");
     client
-        .download_to(
-            &DownloadRequest::pinned("coexist", manifest.root),
-            &out,
-            &(),
-            &CancelToken::new(),
-        )
+        .download_to(&DownloadRequest::pinned("coexist", manifest.root), &out)
         .await
         .expect("the pushed blob must be downloadable");
     assert_eq!(std::fs::read(&out).unwrap(), data);
@@ -567,13 +503,7 @@ async fn upload_refuses_a_wildcard_prefix() {
     let base = unique_prefix();
     let wildcard = format!("{base}/*/blob");
     let err = test_client(&session, &wildcard)
-        .upload_file(
-            BlobSpec::new("nope").chunk_size(MIN_CHUNK_SIZE),
-            &src_path,
-            None,
-            &(),
-            &CancelToken::new(),
-        )
+        .upload_file(BlobSpec::new("nope").chunk_size(MIN_CHUNK_SIZE), &src_path)
         .await
         .expect_err("a wildcard upload prefix must be refused");
     assert!(matches!(err, BlobError::Usage(_)), "{err}");
@@ -583,13 +513,7 @@ async fn upload_refuses_a_wildcard_prefix() {
     // different error).
     let concrete = format!("{base}/one/blob");
     let err2 = test_client(&session, &concrete)
-        .upload_file(
-            BlobSpec::new("nope").chunk_size(MIN_CHUNK_SIZE),
-            &src_path,
-            None,
-            &(),
-            &CancelToken::new(),
-        )
+        .upload_file(BlobSpec::new("nope").chunk_size(MIN_CHUNK_SIZE), &src_path)
         .await
         .expect_err("nothing is serving that prefix");
     assert!(

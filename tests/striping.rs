@@ -83,13 +83,11 @@ async fn striping_sends_each_chunk_once_not_once_per_replica() {
     let dir = tempfile::tempdir().unwrap();
     let dest = dir.path().join("striped.bin");
     let stats = prober
-        .download_striped(
+        .download_to(
             &DownloadRequest::pinned("shared", content_hash(&data)),
             &dest,
-            &holders,
-            &(),
-            &CancelToken::new(),
         )
+        .striped(&holders)
         .await
         .expect("striped download");
 
@@ -166,10 +164,9 @@ async fn tier1_availability_is_all_or_nothing_by_construction() {
         .upload_file(
             BlobSpec::new("halfway").chunk_size(MIN_CHUNK_SIZE),
             &src_path,
-            None,
-            &StopEarly(cancel.clone()),
-            &cancel,
         )
+        .progress(&StopEarly(cancel.clone()))
+        .cancel(&cancel)
         .await;
 
     // The server does not advertise the half it holds — it *cannot* serve any
@@ -233,15 +230,10 @@ async fn a_single_holder_degrades_to_a_plain_download() {
 
     let dir = tempfile::tempdir().unwrap();
     let dest = dir.path().join("solo.bin");
-    c.download_striped(
-        &DownloadRequest::pinned("solo", content_hash(&data)),
-        &dest,
-        &holders,
-        &(),
-        &CancelToken::new(),
-    )
-    .await
-    .expect("one holder is not an error");
+    c.download_to(&DownloadRequest::pinned("solo", content_hash(&data)), &dest)
+        .striped(&holders)
+        .await
+        .expect("one holder is not an error");
     assert_eq!(std::fs::read(&dest).unwrap(), data);
 
     handle.shutdown().await.unwrap();

@@ -13,7 +13,7 @@ use std::time::Duration;
 
 use common::{open_session, unique_prefix};
 use zblob::{
-    BlobClient, BlobServer, BlobSpec, CancelToken, CdcParams, ContentStore, DownloadRequest, Hash,
+    BlobClient, BlobServer, BlobSpec, CdcParams, ContentStore, DownloadRequest, Hash,
     MIN_CHUNK_SIZE, MemoryBlobSource, MemoryStore, StoreClient, TreeServer, build_tree,
 };
 
@@ -201,8 +201,6 @@ async fn a_probe_attributes_each_answer_to_its_origin() {
         .download_staged(
             &DownloadRequest::pinned("shared", chosen.manifest.root),
             dir.path(),
-            &(),
-            &CancelToken::new(),
         )
         .await
         .expect("fetch from the chosen origin");
@@ -242,21 +240,11 @@ async fn staged_downloads_named_alike_do_not_collide() {
     let dir = tempfile::tempdir().unwrap();
 
     let a = client
-        .download_staged(
-            &DownloadRequest::new("blob-one"),
-            dir.path(),
-            &(),
-            &CancelToken::new(),
-        )
+        .download_staged(&DownloadRequest::new("blob-one"), dir.path())
         .await
         .unwrap();
     let b = client
-        .download_staged(
-            &DownloadRequest::new("blob-two"),
-            dir.path(),
-            &(),
-            &CancelToken::new(),
-        )
+        .download_staged(&DownloadRequest::new("blob-two"), dir.path())
         .await
         .unwrap();
 

@@ -9,8 +9,8 @@
 use std::sync::Arc;
 
 use zblob::{
-    CancelToken, CdcParams, ContentStore, DownloadRequest, MemoryStore, QueryPrefix, ServePrefix,
-    TreeClient, TreeServer, build_tree,
+    CdcParams, ContentStore, DownloadRequest, MemoryStore, QueryPrefix, ServePrefix, TreeClient,
+    TreeServer, build_tree,
 };
 
 #[tokio::main]
@@ -58,8 +58,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             &DownloadRequest::pinned("snap-1", index.root_hash),
             dest.path(),
             &client_store,
-            &(),
-            &CancelToken::new(),
         )
         .await?;
     println!("first sync: fetched {} chunks", stats.chunks_fetched);
@@ -74,8 +72,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             &DownloadRequest::pinned("snap-2", index2.root_hash),
             dest.path(),
             &client_store,
-            &(),
-            &CancelToken::new(),
         )
         .await?;
     println!(

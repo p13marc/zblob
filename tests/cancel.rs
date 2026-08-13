@@ -63,7 +63,9 @@ async fn cancel_persists_then_resumes() {
         token: token.clone(),
     };
     let err = client
-        .download_to(&DownloadRequest::new("blob-x"), &dest, &sink, &token)
+        .download_to(&DownloadRequest::new("blob-x"), &dest)
+        .progress(&sink)
+        .cancel(&token)
         .await
         .expect_err("must cancel");
     assert!(matches!(err, BlobError::Cancelled { .. }), "{err}");
@@ -73,12 +75,7 @@ async fn cancel_persists_then_resumes() {
     // Resume (fresh token) → completes + verifies.
     tokio::time::timeout(
         Duration::from_secs(20),
-        client.download_to(
-            &DownloadRequest::new("blob-x"),
-            &dest,
-            &(),
-            &CancelToken::new(),
-        ),
+        client.download_to(&DownloadRequest::new("blob-x"), &dest),
     )
     .await
     .expect("resume timed out")
@@ -116,7 +113,9 @@ async fn delete_partial_clears_state() {
         token: token.clone(),
     };
     let _ = client
-        .download_to(&DownloadRequest::new("blob-y"), &dest, &sink, &token)
+        .download_to(&DownloadRequest::new("blob-y"), &dest)
+        .progress(&sink)
+        .cancel(&token)
         .await;
     assert!(dir.path().join("d.bin.part").exists());
 
@@ -203,7 +202,8 @@ async fn cancel_is_observed_while_stalled_on_a_silent_peer() {
 
     let started = std::time::Instant::now();
     let err = client
-        .download_to(&DownloadRequest::new("stalled"), &dest, &(), &token)
+        .download_to(&DownloadRequest::new("stalled"), &dest)
+        .cancel(&token)
         .await
         .unwrap_err();
     let elapsed = started.elapsed();

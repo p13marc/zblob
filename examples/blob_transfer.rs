@@ -8,8 +8,7 @@
 use std::sync::Arc;
 
 use zblob::{
-    BlobClient, BlobServer, BlobSpec, CancelToken, DownloadRequest, Progress, QueryPrefix,
-    ServePrefix,
+    BlobClient, BlobServer, BlobSpec, DownloadRequest, Progress, QueryPrefix, ServePrefix,
 };
 
 #[tokio::main]
@@ -40,19 +39,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let dest = dir.path().join("downloaded.bin");
     let client = BlobClient::new(&session, query_prefix);
     let stats = client
-        .download_to(
-            &DownloadRequest::pinned("demo-blob", manifest.root),
-            &dest,
-            &|p: Progress| {
-                if let Progress::Chunk {
-                    received, total, ..
-                } = p
-                {
-                    println!("  chunk {received}/{total}");
-                }
-            },
-            &CancelToken::new(),
-        )
+        .download_to(&DownloadRequest::pinned("demo-blob", manifest.root), &dest)
+        .progress(&|p: Progress| {
+            if let Progress::Chunk {
+                received, total, ..
+            } = p
+            {
+                println!("  chunk {received}/{total}");
+            }
+        })
         .await?;
 
     println!(

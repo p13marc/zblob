@@ -17,8 +17,7 @@ use std::time::Duration;
 
 use common::{isolated_config, unique_prefix};
 use zblob::{
-    CancelToken, CdcParams, ContentStore, DownloadRequest, MemoryStore, TreeClient, build_tree,
-    publish_snapshot,
+    CdcParams, ContentStore, DownloadRequest, MemoryStore, TreeClient, build_tree, publish_snapshot,
 };
 
 /// A minimal stand-in for `zenoh-plugin-storage-manager`: retain PUTs on a key
@@ -118,8 +117,6 @@ async fn publish_to_storage_then_download_without_server() {
             &DownloadRequest::pinned("snap1", expected_root),
             client_dir.path(),
             &client_store,
-            &(),
-            &CancelToken::new(),
         )
         .await
         .expect("download from storage");

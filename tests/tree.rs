@@ -137,8 +137,6 @@ async fn tree_roundtrip_with_modes_and_mtime() {
             &DownloadRequest::pinned("snap1", expected_root),
             client_dir.path(),
             &client_store,
-            &(),
-            &CancelToken::new(),
         ),
     )
     .await
@@ -202,8 +200,6 @@ async fn reedit_transfers_only_changed_chunks() {
             &DownloadRequest::new("snap1"),
             client_dir.path(),
             &client_store,
-            &(),
-            &CancelToken::new(),
         )
         .await
         .unwrap();
@@ -219,8 +215,6 @@ async fn reedit_transfers_only_changed_chunks() {
             &DownloadRequest::new("snap2"),
             client_dir.path(),
             &client_store,
-            &(),
-            &CancelToken::new(),
         )
         .await
         .unwrap();
@@ -292,8 +286,6 @@ async fn resume_from_prepopulated_store() {
             &DownloadRequest::new("snap1"),
             client_dir.path(),
             &client_store,
-            &(),
-            &CancelToken::new(),
         )
         .await
         .unwrap();
@@ -380,13 +372,9 @@ async fn cancellable_reports_progress_and_resumes() {
         };
         let dest = tempfile::tempdir().unwrap();
         let err = client
-            .download_tree(
-                &DownloadRequest::new("snap1"),
-                dest.path(),
-                &client_store,
-                &sink,
-                &cancel,
-            )
+            .download_tree(&DownloadRequest::new("snap1"), dest.path(), &client_store)
+            .progress(&sink)
+            .cancel(&cancel)
             .await
             .expect_err("cancelled mid-stream");
         match err {
@@ -405,13 +393,8 @@ async fn cancellable_reports_progress_and_resumes() {
     let sink = RecordingSink::default();
     let dest = tempfile::tempdir().unwrap();
     client
-        .download_tree(
-            &DownloadRequest::new("snap1"),
-            dest.path(),
-            &client_store,
-            &sink,
-            &CancelToken::new(),
-        )
+        .download_tree(&DownloadRequest::new("snap1"), dest.path(), &client_store)
+        .progress(&sink)
         .await
         .expect("resume completes");
     assert_dirs_equal(src.path(), dest.path());
@@ -464,15 +447,11 @@ async fn cancellable_reports_progress_and_resumes() {
         }
         let dest = tempfile::tempdir().unwrap();
         let err = batched
-            .download_tree(
-                &DownloadRequest::new("snap1"),
-                dest.path(),
-                &fresh,
-                &CancelAfterOne {
-                    cancel: cancel.clone(),
-                },
-                &cancel,
-            )
+            .download_tree(&DownloadRequest::new("snap1"), dest.path(), &fresh)
+            .progress(&CancelAfterOne {
+                cancel: cancel.clone(),
+            })
+            .cancel(&cancel)
             .await
             .expect_err("a cancel must surface even when a round resolved it all");
         assert!(matches!(err, BlobError::Cancelled { .. }), "{err}");
@@ -483,13 +462,7 @@ async fn cancellable_reports_progress_and_resumes() {
 
         let dest2 = tempfile::tempdir().unwrap();
         batched
-            .download_tree(
-                &DownloadRequest::new("snap1"),
-                dest2.path(),
-                &fresh,
-                &(),
-                &CancelToken::new(),
-            )
+            .download_tree(&DownloadRequest::new("snap1"), dest2.path(), &fresh)
             .await
             .expect("resume after a batched cancel must complete");
         assert_dirs_equal(src.path(), dest2.path());
@@ -529,13 +502,7 @@ async fn hardlinks_roundtrip() {
     let client = test_client(&session, &store_prefix, &tree_prefix);
     let client_store: Arc<dyn ContentStore> = Arc::new(MemoryStore::new());
     client
-        .download_tree(
-            &DownloadRequest::new("hl"),
-            dest.path(),
-            &client_store,
-            &(),
-            &CancelToken::new(),
-        )
+        .download_tree(&DownloadRequest::new("hl"), dest.path(), &client_store)
         .await
         .unwrap();
 
@@ -586,13 +553,7 @@ async fn empty_file_dir_and_tree_roundtrip() {
 
     let dest = tempfile::tempdir().unwrap();
     client
-        .download_tree(
-            &DownloadRequest::new("edges"),
-            dest.path(),
-            &store,
-            &(),
-            &CancelToken::new(),
-        )
+        .download_tree(&DownloadRequest::new("edges"), dest.path(), &store)
         .await
         .expect("edges tree");
     assert_dirs_equal(src.path(), dest.path());
@@ -601,13 +562,7 @@ async fn empty_file_dir_and_tree_roundtrip() {
 
     let void_dest = tempfile::tempdir().unwrap();
     client
-        .download_tree(
-            &DownloadRequest::new("void"),
-            void_dest.path(),
-            &store,
-            &(),
-            &CancelToken::new(),
-        )
+        .download_tree(&DownloadRequest::new("void"), void_dest.path(), &store)
         .await
         .expect("empty tree");
     assert_eq!(std::fs::read_dir(void_dest.path()).unwrap().count(), 0);
@@ -652,13 +607,7 @@ async fn readonly_dir_roundtrips_with_mode_restored() {
     let client = test_client(&session, &store_prefix, &tree_prefix);
     let store: Arc<dyn ContentStore> = Arc::new(MemoryStore::new());
     client
-        .download_tree(
-            &DownloadRequest::new("ro"),
-            dest.path(),
-            &store,
-            &(),
-            &CancelToken::new(),
-        )
+        .download_tree(&DownloadRequest::new("ro"), dest.path(), &store)
         .await
         .expect("read-only dir tree");
     assert_eq!(
@@ -723,13 +672,7 @@ async fn concurrent_tree_downloads_share_one_dirstore() {
         let path = dest.path().to_path_buf();
         joins.push(tokio::spawn(async move {
             client
-                .download_tree(
-                    &DownloadRequest::new("shared"),
-                    &path,
-                    &store,
-                    &(),
-                    &CancelToken::new(),
-                )
+                .download_tree(&DownloadRequest::new("shared"), &path, &store)
                 .await
         }));
     }
@@ -808,13 +751,7 @@ async fn content_addressed_trees_pin_by_construction() {
     let client = test_client(&session, &store_prefix, &tree_prefix);
     let store: Arc<dyn ContentStore> = Arc::new(MemoryStore::new());
     client
-        .download_tree(
-            &DownloadRequest::by_root(root),
-            dest.path(),
-            &store,
-            &(),
-            &CancelToken::new(),
-        )
+        .download_tree(&DownloadRequest::by_root(root), dest.path(), &store)
         .await
         .expect("content-addressed fetch");
     assert_dirs_equal(src.path(), dest.path());
@@ -823,13 +760,7 @@ async fn content_addressed_trees_pin_by_construction() {
     // some other snapshot the way a name could.
     let other = zblob::Hash::of(b"a tree that does not exist here");
     let err = client
-        .download_tree(
-            &DownloadRequest::by_root(other),
-            dest.path(),
-            &store,
-            &(),
-            &CancelToken::new(),
-        )
+        .download_tree(&DownloadRequest::by_root(other), dest.path(), &store)
         .await
         .expect_err("unknown root must not resolve");
     assert!(matches!(err, BlobError::NotFound(_)), "{err}");
@@ -905,8 +836,6 @@ async fn a_sweep_cannot_collect_an_in_flight_download() {
             &DownloadRequest::pinned("swept", index.root_hash),
             dest.path(),
             &client_store,
-            &(),
-            &CancelToken::new(),
         )
         .await
         .expect("a concurrent sweep must not break the download");
@@ -980,8 +909,6 @@ async fn a_wildcard_origin_tier2_prefix_is_answerable() {
         &DownloadRequest::pinned("anyorigin", index.root_hash),
         dest.path(),
         &client_store,
-        &(),
-        &CancelToken::new(),
     )
     .await
     .expect("a wildcard-origin prefix must reach the server that owns the id");

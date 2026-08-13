@@ -9,8 +9,8 @@ use std::time::Duration;
 
 use common::{open_session, unique_prefix};
 use zblob::{
-    BlobError, BlobId, CancelToken, CdcParams, ContentStore, DownloadRequest, Entry, Hash,
-    HashAlgo, MemoryStore, TreeClient, TreeIndex, TreeServer, build_tree, wire,
+    BlobError, BlobId, CdcParams, ContentStore, DownloadRequest, Entry, Hash, HashAlgo,
+    MemoryStore, TreeClient, TreeIndex, TreeServer, build_tree, wire,
 };
 
 fn small_cdc() -> CdcParams {
@@ -135,13 +135,7 @@ async fn zip_slip_index_rejected_nothing_written() {
         let client = test_client(&session, &store_prefix, &tree_prefix);
         let store: Arc<dyn ContentStore> = Arc::new(MemoryStore::new());
         let err = client
-            .download_tree(
-                &DownloadRequest::new(&id),
-                &dest,
-                &store,
-                &(),
-                &CancelToken::new(),
-            )
+            .download_tree(&DownloadRequest::new(&id), &dest, &store)
             .await
             .expect_err("zip-slip must be rejected");
         assert!(
@@ -186,13 +180,7 @@ async fn escaping_symlink_target_rejected() {
     let client = test_client(&session, &store_prefix, &tree_prefix);
     let store: Arc<dyn ContentStore> = Arc::new(MemoryStore::new());
     let err = client
-        .download_tree(
-            &DownloadRequest::new("sym"),
-            dest.path(),
-            &store,
-            &(),
-            &CancelToken::new(),
-        )
+        .download_tree(&DownloadRequest::new("sym"), dest.path(), &store)
         .await
         .expect_err("escaping symlink must be rejected");
     assert!(matches!(err, BlobError::UnsafePath(_)), "{err}");
@@ -369,13 +357,7 @@ async fn forged_root_hash_rejected() {
     let client = test_client(&session, &store_prefix, &tree_prefix);
     let store: Arc<dyn ContentStore> = Arc::new(MemoryStore::new());
     let err = client
-        .download_tree(
-            &DownloadRequest::new("forged"),
-            dest.path(),
-            &store,
-            &(),
-            &CancelToken::new(),
-        )
+        .download_tree(&DownloadRequest::new("forged"), dest.path(), &store)
         .await
         .expect_err("forged root must be rejected");
     assert!(matches!(err, BlobError::RootMismatch { .. }), "{err}");
@@ -414,8 +396,6 @@ async fn pinned_tree_root_rejects_substitution() {
             &DownloadRequest::pinned("pinned", Hash::of(b"the tree I actually wanted")),
             dest.path(),
             &store,
-            &(),
-            &CancelToken::new(),
         )
         .await
         .expect_err("wrong pin must fail");
@@ -472,13 +452,7 @@ async fn wrong_content_chunk_ignored() {
     .build();
     let store: Arc<dyn ContentStore> = Arc::new(MemoryStore::new());
     let err = client
-        .download_tree(
-            &DownloadRequest::new("wrongchunk"),
-            dest.path(),
-            &store,
-            &(),
-            &CancelToken::new(),
-        )
+        .download_tree(&DownloadRequest::new("wrongchunk"), dest.path(), &store)
         .await
         .expect_err("corrupt chunk must not complete");
     assert!(matches!(err, BlobError::NotFound(_)), "{err}");
@@ -533,13 +507,7 @@ async fn existing_directory_is_not_silently_destroyed() {
 
     let store: Arc<dyn ContentStore> = Arc::new(MemoryStore::new());
     let err = test_client(&session, &store_prefix, &tree_prefix)
-        .download_tree(
-            &DownloadRequest::new("clobber"),
-            dest.path(),
-            &store,
-            &(),
-            &CancelToken::new(),
-        )
+        .download_tree(&DownloadRequest::new("clobber"), dest.path(), &store)
         .await
         .expect_err("replacing a directory must be refused by default");
     assert!(matches!(err, BlobError::UnsafePath(_)), "{err}");
@@ -565,13 +533,7 @@ async fn existing_directory_is_not_silently_destroyed() {
     .build();
     let store2: Arc<dyn ContentStore> = Arc::new(MemoryStore::new());
     permissive
-        .download_tree(
-            &DownloadRequest::new("clobber"),
-            dest2.path(),
-            &store2,
-            &(),
-            &CancelToken::new(),
-        )
+        .download_tree(&DownloadRequest::new("clobber"), dest2.path(), &store2)
         .await
         .expect("an opted-in caller may replace the directory");
     assert_eq!(
@@ -625,13 +587,7 @@ async fn setid_bits_are_masked_unless_requested() {
     let dest = tempfile::tempdir().unwrap();
     let store: Arc<dyn ContentStore> = Arc::new(MemoryStore::new());
     test_client(&session, &store_prefix, &tree_prefix)
-        .download_tree(
-            &DownloadRequest::new("setuid"),
-            dest.path(),
-            &store,
-            &(),
-            &CancelToken::new(),
-        )
+        .download_tree(&DownloadRequest::new("setuid"), dest.path(), &store)
         .await
         .expect("the snapshot itself is legitimate; only the bit is refused");
     let mode = std::fs::metadata(dest.path().join("rooted"))
@@ -653,13 +609,7 @@ async fn setid_bits_are_masked_unless_requested() {
     .query_timeout(Duration::from_secs(3))
     .materialize_policy(zblob::MaterializePolicy::default().restore_setid(true))
     .build()
-    .download_tree(
-        &DownloadRequest::new("setuid"),
-        dest2.path(),
-        &store2,
-        &(),
-        &CancelToken::new(),
-    )
+    .download_tree(&DownloadRequest::new("setuid"), dest2.path(), &store2)
     .await
     .expect("opted-in restore");
     let mode2 = std::fs::metadata(dest2.path().join("rooted"))
@@ -754,13 +704,7 @@ async fn preexisting_symlink_cannot_be_traversed() {
         std::os::unix::fs::symlink(outside.path(), dest.path().join("cache")).unwrap();
 
         let err = client
-            .download_tree(
-                &DownloadRequest::new(id),
-                dest.path(),
-                &store,
-                &(),
-                &CancelToken::new(),
-            )
+            .download_tree(&DownloadRequest::new(id), dest.path(), &store)
             .await
             .expect_err("symlink traversal must be refused");
         assert!(matches!(err, BlobError::UnsafePath(_)), "{id}: {err}");
@@ -825,13 +769,7 @@ async fn an_over_long_chunk_reply_is_skipped_not_fatal() {
     let dest = tempfile::tempdir().unwrap();
     let store: Arc<dyn ContentStore> = Arc::new(MemoryStore::new());
     test_client(&session, &store_prefix, &tree_prefix)
-        .download_tree(
-            &DownloadRequest::new("bloat"),
-            dest.path(),
-            &store,
-            &(),
-            &CancelToken::new(),
-        )
+        .download_tree(&DownloadRequest::new("bloat"), dest.path(), &store)
         .await
         .expect("an honest holder is answering; the fetch must complete");
     assert_eq!(std::fs::read(dest.path().join("f.bin")).unwrap(), payload);
@@ -944,8 +882,6 @@ async fn a_corrupt_store_cannot_materialize_wrong_bytes() {
             &DownloadRequest::pinned("rot", index.root_hash),
             dest.path(),
             &lying,
-            &(),
-            &CancelToken::new(),
         )
         .await
         .expect_err("a corrupt store must not produce a 'verified' tree");
@@ -959,8 +895,6 @@ async fn a_corrupt_store_cannot_materialize_wrong_bytes() {
             &DownloadRequest::pinned("rot", index.root_hash),
             dest2.path(),
             &honest,
-            &(),
-            &CancelToken::new(),
         )
         .await
         .expect("an honest store must still work");
