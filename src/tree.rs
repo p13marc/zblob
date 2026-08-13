@@ -400,11 +400,79 @@ pub fn build_tree(
     cdc: &CdcParams,
     store: &dyn ContentStore,
 ) -> Result<TreeIndex> {
+    build_tree_from(root, id, cdc, store, None)
+}
+
+/// [`build_tree`], reusing a previous snapshot's work where the tree has not
+/// changed.
+///
+/// For each file, if `(path, size, mtime)` matches the parent snapshot's entry
+/// and the parent's chunks are all still in `store`, that entry's chunk
+/// references are reused and the file is not read at all. Everything else is
+/// chunked as usual.
+///
+/// This is restic's parent-snapshot trick, and it is the producer-side
+/// counterpart of [`seed`](crate::seed) — which grows a *consumer's* store
+/// from what it already has locally, while a producer re-hashed its entire
+/// tree on every snapshot. For a sensor snapshotting a mostly-static directory
+/// repeatedly, that was the dominant cost.
+///
+/// Three things it is careful about:
+///
+/// - **The CDC parameters must match.** Chunk boundaries are a function of the
+///   parameters *and* the data, so reusing references cut with different ones
+///   would produce an index whose chunks do not tile as its own parameters
+///   say. A mismatched parent is an error, not a silent full rebuild.
+/// - **`(size, mtime)` is a heuristic, and it has a real blind spot.** mtime
+///   is deliberately excluded from `root_hash` — byte-identical trees must
+///   hash identically whenever they were copied — and is used here for the
+///   different question of *has this file changed*, which is what rsync, tar
+///   and restic all use it for.
+///
+///   It is wrong when a file is rewritten **to the same length within the same
+///   second**: `"mode = 'a'\n"` becoming `"mode = 'b'\n"` is exactly that, and
+///   it is not a contrived case — it is a config edit. The snapshot then
+///   claims the old content. Nothing is corrupted (every reused reference is
+///   still content-addressed and every chunk still verifies), but the snapshot
+///   does not describe the tree.
+///
+///   Filesystem mtime granularity is what bounds this: a snapshot taken a
+///   second or more after the last write is safe. When that cannot be assumed
+///   — a producer snapshotting immediately after writing — use
+///   [`build_tree`], which reads everything and cannot be fooled. There is no
+///   middle setting on purpose: "sometimes verify" is the option that reads
+///   like safety and is not.
+/// - **Reused chunks must still exist.** A reference to a chunk the store no
+///   longer holds would build an index nobody can fetch, so presence is
+///   checked and a miss falls back to re-chunking.
+pub fn build_tree_from(
+    root: &Path,
+    id: impl Into<String>,
+    cdc: &CdcParams,
+    store: &dyn ContentStore,
+    parent: Option<&TreeIndex>,
+) -> Result<TreeIndex> {
     cdc.validate()?;
     let id = id.into();
     validate_id(&id)?;
+    // Index the parent's file entries by path for O(1) lookup during the walk.
+    let mut reusable: HashMap<&str, &Entry> = HashMap::new();
+    if let Some(parent) = parent {
+        if parent.cdc != *cdc {
+            return Err(BlobError::Protocol(format!(
+                "parent snapshot was cut with different CDC parameters ({:?} vs {:?}); \
+                 its chunk references would not tile under these",
+                parent.cdc, cdc
+            )));
+        }
+        for e in &parent.entries {
+            if matches!(e, Entry::File { .. }) {
+                reusable.insert(e.path(), e);
+            }
+        }
+    }
     let mut entries = Vec::new();
-    walk(root, cdc, store, &mut entries)?;
+    walk(root, cdc, store, &reusable, &mut entries)?;
     let root_hash = root_digest(&entries)?;
     let index = TreeIndex {
         version: WIRE_VERSION,
@@ -468,6 +536,7 @@ fn walk(
     root: &Path,
     cdc: &CdcParams,
     store: &dyn ContentStore,
+    reusable: &HashMap<&str, &Entry>,
     entries: &mut Vec<Entry>,
 ) -> Result<()> {
     fn read_dir_sorted(dir: &Path) -> std::io::Result<std::vec::IntoIter<std::fs::DirEntry>> {
@@ -510,6 +579,28 @@ fn walk(
                 });
                 continue;
             }
+            // Unchanged since the parent snapshot? Then its chunk references
+            // still describe this file, and it need not be read at all.
+            let mtime = mtime_of(&meta);
+            if let Some(Entry::File {
+                size: prev_size,
+                mtime: prev_mtime,
+                chunks: prev_chunks,
+                ..
+            }) = reusable.get(rel.as_str()).copied()
+                && *prev_size == meta.len()
+                && *prev_mtime == mtime
+                && prev_chunks.iter().all(|c| store.has(&c.hash))
+            {
+                entries.push(Entry::File {
+                    path: rel,
+                    mode: mode_of(&meta),
+                    mtime,
+                    size: *prev_size,
+                    chunks: prev_chunks.clone(),
+                });
+                continue;
+            }
             let file = std::fs::File::open(&path)?;
             let mut refs = Vec::new();
             let mut size: u64 = 0;
@@ -528,7 +619,7 @@ fn walk(
             entries.push(Entry::File {
                 path: rel,
                 mode: mode_of(&meta),
-                mtime: mtime_of(&meta),
+                mtime,
                 size,
                 chunks: refs,
             });

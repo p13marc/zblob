@@ -43,6 +43,8 @@ pub const ENC_AVAIL: &str = "zblob/have;v=3";
 pub const ENC_HAVEBITS: &str = "zblob/havebits;v=3";
 /// Encoding tag of tier-2 snapshot probe replies ([`TreeProbe`]).
 pub const ENC_TREEPROBE: &str = "zblob/treeprobe;v=3";
+/// Encoding tag of `fanout` tier samples (feature-gated).
+pub const ENC_FANOUT: &str = "zblob/fanout;v=3";
 
 /// A trailing, length-prefixed extension list carried by the *metadata*
 /// messages ([`crate::Manifest`]).

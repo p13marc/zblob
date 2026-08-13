@@ -115,7 +115,7 @@ pub use store::{ContentStore, DirStore, MemoryStore};
 pub use store_client::{ChunkProbe, StoreClient, StoreClientBuilder};
 pub use tree::{
     ChunkRef, Entry, MaterializePolicy, TreeClient, TreeClientBuilder, TreeIndex, TreeServer,
-    TreeServerBuilder, build_tree,
+    TreeServerBuilder, build_tree, build_tree_from,
 };
 #[doc(no_inline)]
 pub use zenoh::qos::Priority;

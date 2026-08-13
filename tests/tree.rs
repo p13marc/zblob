@@ -988,3 +988,111 @@ async fn a_wildcard_origin_tier2_prefix_is_answerable() {
     handle.shutdown().await.unwrap();
     session.close().await.unwrap();
 }
+
+/// A snapshot taken against a parent reuses unchanged files without reading
+/// them, and produces **the same root** a full build would.
+///
+/// The root equality is the property that matters: an incremental build is an
+/// optimisation, and an optimisation that changes identity is a bug.
+///
+/// Proving the work was skipped needs care. Counting store writes proves
+/// nothing — `walk` only writes chunks the store lacks, so a *full* rebuild
+/// against a warm store writes almost nothing either. So the test instead
+/// rewrites a file's contents while restoring its size and mtime: an
+/// incremental build must then report the *old* chunks (it never opened the
+/// file) and a full build the new ones. That is exactly the heuristic's
+/// documented blind spot, used here as an instrument.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_incremental_snapshot_reuses_unchanged_files_and_keeps_the_root() {
+    let src = tempfile::tempdir().unwrap();
+    for i in 0..6 {
+        std::fs::write(
+            src.path().join(format!("f{i}.bin")),
+            common::pseudo_random(40_000, 300 + i as u64),
+        )
+        .unwrap();
+    }
+    let store = MemoryStore::new();
+    let parent = zblob::build_tree(src.path(), "s1", &small_cdc(), &store).unwrap();
+
+    // Rewrite f0's *contents* but put its size and mtime back, so the
+    // heuristic cannot tell it changed.
+    let f0 = src.path().join("f0.bin");
+    let before = std::fs::metadata(&f0).unwrap().modified().unwrap();
+    let disguised = common::pseudo_random(40_000, 777);
+    std::fs::write(&f0, &disguised).unwrap();
+    std::fs::File::options()
+        .write(true)
+        .open(&f0)
+        .unwrap()
+        .set_modified(before)
+        .unwrap();
+
+    let entry_of = |idx: &zblob::TreeIndex, path: &str| {
+        idx.entries
+            .iter()
+            .find(|e| e.path() == path)
+            .cloned()
+            .expect("entry present")
+    };
+
+    let incremental =
+        zblob::build_tree_from(src.path(), "s2", &small_cdc(), &store, Some(&parent)).unwrap();
+    assert_eq!(
+        entry_of(&incremental, "f0.bin"),
+        entry_of(&parent, "f0.bin"),
+        "an unchanged (size, mtime) file must be reused without being read"
+    );
+
+    // Discriminating power: a full build *does* read it and sees the change.
+    let full = zblob::build_tree(src.path(), "s2", &small_cdc(), &MemoryStore::new()).unwrap();
+    assert_ne!(
+        entry_of(&full, "f0.bin"),
+        entry_of(&parent, "f0.bin"),
+        "the file really did change on disk"
+    );
+
+    // Now a genuine change, mtime and all: the incremental build must agree
+    // with a full one, byte for byte and root for root.
+    std::fs::write(
+        src.path().join("f3.bin"),
+        common::pseudo_random(41_000, 999),
+    )
+    .unwrap();
+    let fresh = MemoryStore::new();
+    let base = zblob::build_tree(src.path(), "s3", &small_cdc(), &fresh).unwrap();
+    let inc = zblob::build_tree_from(src.path(), "s3", &small_cdc(), &fresh, Some(&base)).unwrap();
+    assert_eq!(
+        inc.root_hash, base.root_hash,
+        "an incremental build must produce the same identity as a full one"
+    );
+    assert_eq!(inc.entries, base.entries);
+
+    // A parent cut with different CDC parameters is refused rather than
+    // silently producing an index whose chunks do not tile.
+    let other_cdc = CdcParams {
+        min: 4096,
+        avg: 16384,
+        max: 65536,
+        normalization: 2,
+        gear_seed: 7,
+    };
+    let err = zblob::build_tree_from(src.path(), "s4", &other_cdc, &fresh, Some(&base))
+        .expect_err("a mismatched parent must be refused");
+    assert!(
+        format!("{err}").contains("CDC parameters"),
+        "wrong diagnosis: {err}"
+    );
+
+    // A parent whose chunks are gone falls back to re-chunking rather than
+    // producing an index nobody can fetch.
+    let empty = MemoryStore::new();
+    let rebuilt =
+        zblob::build_tree_from(src.path(), "s5", &small_cdc(), &empty, Some(&base)).unwrap();
+    assert_eq!(rebuilt.root_hash, base.root_hash);
+    assert_eq!(
+        empty.hashes().unwrap().len(),
+        base.needed_chunks().len(),
+        "every chunk had to be re-made because none were present"
+    );
+}

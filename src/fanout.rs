@@ -42,7 +42,26 @@ pub fn fanout_key(prefix: &str, id: &str) -> String {
     format!("{prefix}/{id}/fanout")
 }
 
-/// One sample of the fanout stream.
+/// One sample of the fanout stream: a version-first struct, like every other
+/// control message in the crate.
+///
+/// It used to be a bare `(u16, FanoutFrame)` tuple with no encoding tag, which
+/// made this the only part of the crate breaking the crate's own wire rules —
+/// and left the receiver relying on decode failure to reject foreign samples.
+#[derive(Serialize, Deserialize)]
+struct FanoutMessage {
+    /// Wire schema version (first field; postcard is positional).
+    version: u16,
+    /// The frame itself.
+    frame: FanoutFrame,
+}
+
+/// The payload of one fanout sample.
+///
+/// **postcard is positional, so this enum's variants are identified by
+/// order.** Adding one anywhere but the end, or reordering, is a silent wire
+/// break that no version field would catch — the decode would succeed and mean
+/// something else. Append only, and bump `WIRE_VERSION` when you do.
 #[derive(Serialize, Deserialize)]
 enum FanoutFrame {
     /// Frame 0: the manifest.
@@ -67,6 +86,30 @@ pub struct FanoutConfig {
     /// Receiver-side policy when `dest` already exists (default
     /// [`Overwrite::Refuse`], matching `download_to`).
     pub overwrite: Overwrite,
+    /// Bytes of **unverified** pre-manifest frames a receiver will buffer
+    /// while waiting for the manifest (default 16 MiB).
+    ///
+    /// A receiver that joins mid-stream sees slices before the manifest that
+    /// would let it verify them, so it holds them. That buffer is filled by an
+    /// unauthenticated publisher with data nothing has checked yet, and the
+    /// manifest need never arrive — so it is the one number here that is
+    /// purely a receiver-side defence, and 256 MiB (the old value) is far more
+    /// than a defence should cost. Frames beyond the cap are dropped and
+    /// recovered from the publisher's replay.
+    pub max_early_bytes: usize,
+    /// Largest blob a receiver will accept from a fanout manifest
+    /// (default 1 TiB), matching `BlobClientBuilder::max_blob_size`.
+    ///
+    /// Was hard-coded, so a receiver could not decline an implausible one.
+    pub max_blob_size: u64,
+    /// Slice samples the publisher retains for late joiners (default 4096).
+    ///
+    /// The cache is what makes a late joiner work, so it cannot be zero — but
+    /// it used to be "every slice of the blob", which pins the whole blob plus
+    /// its outboard in the publisher's memory for as long as the handle lives.
+    /// On the embedded producers this fleet has, that is the wrong default.
+    /// A joiner that arrives after eviction re-requests what it missed.
+    pub cache_samples: usize,
 }
 
 impl Default for FanoutConfig {
@@ -75,18 +118,21 @@ impl Default for FanoutConfig {
             heartbeat: Duration::from_millis(500),
             stall_timeout: Duration::from_secs(30),
             overwrite: Overwrite::default(),
+            max_early_bytes: 16 * 1024 * 1024,
+            max_blob_size: 1 << 40,
+            cache_samples: 4096,
         }
     }
 }
 
-/// How many pre-manifest slice frames a receiver will buffer (and their total
-/// byte cap) while waiting for the manifest frame. Frames beyond the cap are
-/// dropped; heartbeat recovery re-delivers samples the *transport* missed but
-/// not ones the application discarded, so a receiver that joins mid-stream
-/// may need the publisher's cache replay (which the initial history query
-/// performs) to fill what it dropped here.
+/// How many pre-manifest slice frames a receiver will buffer while waiting for
+/// the manifest frame; the byte cap is
+/// [`FanoutConfig::max_early_bytes`]. Frames beyond either cap are dropped;
+/// heartbeat recovery re-delivers samples the *transport* missed but not ones
+/// the application discarded, so a receiver that joins mid-stream may need the
+/// publisher's cache replay (which the initial history query performs) to fill
+/// what it dropped here.
 const EARLY_SLICE_MAX_FRAMES: usize = 512;
-const EARLY_SLICE_MAX_BYTES: usize = 256 * 1024 * 1024;
 
 /// Keeps a fanout publication (and its replay cache) alive.
 pub struct FanoutHandle {
@@ -158,7 +204,12 @@ pub async fn fanout_file(
             // Bulk rollout yields to telemetry on shared links (see
             // `BlobClientBuilder::priority`).
             .priority(Priority::DataLow)
-            .cache(CacheConfig::default().max_samples(count as usize + 1))
+            // Bounded: retaining every slice would pin the whole blob in the
+            // publisher's memory for the handle's lifetime.
+            .cache(
+                CacheConfig::default()
+                    .max_samples(cfg.cache_samples.max(1).min(count as usize + 1)),
+            )
             .sample_miss_detection(MissDetectionConfig::default().heartbeat(cfg.heartbeat))
             // Liveliness token: lets subscribers' `detect_late_publishers`
             // notice this publisher (re)appearing and re-query its history.
@@ -167,10 +218,11 @@ pub async fn fanout_file(
             .map_err(BlobError::zenoh)?;
 
         publisher
-            .put(crate::wire::encode(&(
-                crate::wire::WIRE_VERSION,
-                FanoutFrame::Manifest(task_manifest.clone()),
-            ))?)
+            .put(crate::wire::encode(&FanoutMessage {
+                version: crate::wire::WIRE_VERSION,
+                frame: FanoutFrame::Manifest(task_manifest.clone()),
+            })?)
+            .encoding(crate::wire::ENC_FANOUT)
             .await
             .map_err(BlobError::zenoh)?;
 
@@ -191,10 +243,11 @@ pub async fn fanout_file(
             .map_err(|e| BlobError::Protocol(format!("encode task: {e}")))?;
             reader = r;
             publisher
-                .put(crate::wire::encode(&(
-                    crate::wire::WIRE_VERSION,
-                    FanoutFrame::Slice { index, bao: slice? },
-                ))?)
+                .put(crate::wire::encode(&FanoutMessage {
+                    version: crate::wire::WIRE_VERSION,
+                    frame: FanoutFrame::Slice { index, bao: slice? },
+                })?)
+                .encoding(crate::wire::ENC_FANOUT)
                 .await
                 .map_err(BlobError::zenoh)?;
         }
@@ -276,18 +329,23 @@ pub async fn receive_fanout(
                 }));
             }
         };
-        let Ok((version, frame)) =
-            crate::wire::decode::<(u16, FanoutFrame)>(&sample.payload().to_bytes())
-        else {
-            continue;
-        };
-        if version != crate::wire::WIRE_VERSION {
+        // Filter on the encoding tag *before* decoding, like every other
+        // receive path in the crate. Relying on decode failure to reject a
+        // foreign sample is the "opaque error deep in a transfer" failure mode
+        // v2 removed everywhere else — and this was the one place it survived.
+        if sample.encoding().to_string() != crate::wire::ENC_FANOUT {
             continue;
         }
-        match frame {
+        let Ok(msg) = crate::wire::decode::<FanoutMessage>(&sample.payload().to_bytes()) else {
+            continue;
+        };
+        if msg.version != crate::wire::WIRE_VERSION {
+            continue;
+        }
+        match msg.frame {
             FanoutFrame::Manifest(m) => {
                 let verdict = m
-                    .validate(1 << 40)
+                    .validate(cfg.max_blob_size)
                     .and_then(|()| {
                         if m.id != id {
                             return Err(BlobError::Protocol(format!(
@@ -328,7 +386,7 @@ pub async fn receive_fanout(
             }
             FanoutFrame::Slice { index, bao } => {
                 if early.len() < EARLY_SLICE_MAX_FRAMES
-                    && early_bytes + bao.len() <= EARLY_SLICE_MAX_BYTES
+                    && early_bytes + bao.len() <= cfg.max_early_bytes
                 {
                     early_bytes += bao.len();
                     early.push((index, bao));
