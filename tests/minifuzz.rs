@@ -2,7 +2,7 @@
 //! decoder: adversarial bytes must produce errors, never panics. Real
 //! libFuzzer targets live in `fuzz/`; these run on every `cargo test`.
 
-use zblob::{Hash, Manifest, TreeIndex, parse_ranges, wire};
+use zblob::{BlobId, Hash, HashAlgo, Manifest, TreeIndex, parse_ranges, wire};
 
 /// xorshift64 byte stream (no rand dependency, reproducible).
 struct Rng(u64);
@@ -93,13 +93,13 @@ fn wire_decoders_never_panic_on_garbage() {
     // Truncations of a *valid* encoding must error, not panic.
     let m = Manifest {
         version: wire::WIRE_VERSION,
-        id: "fuzz".into(),
+        id: BlobId::new("fuzz").unwrap(),
         filename: Some("f".into()),
         total_len: 123_456,
         chunk_size: 65_536,
         root: Hash::of(b"x"),
         created_ms: 1,
-        ext: Vec::new(),
+        ext: zblob::wire::Ext::new(),
     };
     let full = wire::encode(&m).unwrap();
     for cut in 0..full.len() {
@@ -127,8 +127,8 @@ fn index_validation_never_panics_on_hostile_paths() {
         ];
         let index = TreeIndex {
             version: wire::WIRE_VERSION,
-            id: "fuzz".into(),
-            algo: Hash::ALGO.into(),
+            id: BlobId::new("fuzz").unwrap(),
+            algo: HashAlgo::Blake3,
             cdc: zblob::CdcParams::default(),
             entries,
             root_hash: Hash::of(b"whatever"),

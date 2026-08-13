@@ -19,7 +19,7 @@ use std::time::Duration;
 
 use common::{open_session, pseudo_random, unique_prefix};
 use zblob::{
-    BlobClient, BlobError, CancelToken, DownloadRequest, Hash, MIN_CHUNK_SIZE, Manifest,
+    BlobClient, BlobError, BlobId, CancelToken, DownloadRequest, Hash, MIN_CHUNK_SIZE, Manifest,
     RetryPolicy, manifest_key, parse_ranges, slice_key,
     wire::{self, ENC_MANIFEST, ENC_SLICE},
 };
@@ -120,13 +120,13 @@ async fn slice_reply_mutations_never_yield_wrong_bytes() {
         let prefix = unique_prefix();
         let manifest = Manifest {
             version: wire::WIRE_VERSION,
-            id: "hostile".into(),
+            id: BlobId::new("hostile").unwrap(),
             filename: None,
             total_len: data.len() as u64,
             chunk_size: MIN_CHUNK_SIZE,
             root,
             created_ms: 0,
-            ext: Vec::new(),
+            ext: zblob::wire::Ext::new(),
         };
         let count = manifest.chunks().unwrap().count();
 
@@ -272,91 +272,91 @@ async fn manifest_reply_mutations_are_survivable() {
             "wrong_version",
             Manifest {
                 version: 99,
-                id: "m".into(),
+                id: BlobId::new("m").unwrap(),
                 filename: None,
                 total_len: data.len() as u64,
                 chunk_size: MIN_CHUNK_SIZE,
                 root,
                 created_ms: 0,
-                ext: Vec::new(),
+                ext: zblob::wire::Ext::new(),
             },
         ),
         (
             "huge_total_len",
             Manifest {
                 version: wire::WIRE_VERSION,
-                id: "m".into(),
+                id: BlobId::new("m").unwrap(),
                 filename: None,
                 total_len: u64::MAX,
                 chunk_size: MIN_CHUNK_SIZE,
                 root,
                 created_ms: 0,
-                ext: Vec::new(),
+                ext: zblob::wire::Ext::new(),
             },
         ),
         (
             "zero_chunk_size",
             Manifest {
                 version: wire::WIRE_VERSION,
-                id: "m".into(),
+                id: BlobId::new("m").unwrap(),
                 filename: None,
                 total_len: 1024,
                 chunk_size: 0,
                 root,
                 created_ms: 0,
-                ext: Vec::new(),
+                ext: zblob::wire::Ext::new(),
             },
         ),
         (
             "unaligned_chunk_size",
             Manifest {
                 version: wire::WIRE_VERSION,
-                id: "m".into(),
+                id: BlobId::new("m").unwrap(),
                 filename: None,
                 total_len: 1024,
                 chunk_size: MIN_CHUNK_SIZE + 1,
                 root,
                 created_ms: 0,
-                ext: Vec::new(),
+                ext: zblob::wire::Ext::new(),
             },
         ),
         (
             "traversal_filename",
             Manifest {
                 version: wire::WIRE_VERSION,
-                id: "m".into(),
+                id: BlobId::new("m").unwrap(),
                 filename: Some("../../../etc/pwned".into()),
                 total_len: data.len() as u64,
                 chunk_size: MIN_CHUNK_SIZE,
                 root,
                 created_ms: 0,
-                ext: Vec::new(),
+                ext: zblob::wire::Ext::new(),
             },
         ),
         (
             "wrong_id",
             Manifest {
                 version: wire::WIRE_VERSION,
-                id: "someone-else".into(),
+                id: BlobId::new("someone-else").unwrap(),
                 filename: None,
                 total_len: data.len() as u64,
                 chunk_size: MIN_CHUNK_SIZE,
                 root,
                 created_ms: 0,
-                ext: Vec::new(),
+                ext: zblob::wire::Ext::new(),
             },
         ),
         (
             "empty_claim",
             Manifest {
                 version: wire::WIRE_VERSION,
-                id: "m".into(),
+                id: BlobId::new("m").unwrap(),
                 filename: None,
                 total_len: 0,
                 chunk_size: MIN_CHUNK_SIZE,
                 root,
                 created_ms: 0,
-                ext: Vec::new(),
+                ext: zblob::wire::Ext::new(),
             },
         ),
     ];
@@ -453,24 +453,24 @@ async fn a_hostile_responder_cannot_deny_an_honest_one() {
                     "garbage" => vec![0xFF; 40],
                     "wrong-id" => wire::encode(&Manifest {
                         version: wire::WIRE_VERSION,
-                        id: "not-contested".into(),
+                        id: BlobId::new("not-contested").unwrap(),
                         filename: None,
                         total_len: 4096,
                         chunk_size: MIN_CHUNK_SIZE,
                         root: Hash::of(b"nope"),
                         created_ms: 0,
-                        ext: Vec::new(),
+                        ext: zblob::wire::Ext::new(),
                     })
                     .unwrap(),
                     _ => wire::encode(&Manifest {
                         version: wire::WIRE_VERSION,
-                        id: "contested".into(),
+                        id: BlobId::new("contested").unwrap(),
                         filename: None,
                         total_len: 4096,
                         chunk_size: MIN_CHUNK_SIZE,
                         root: Hash::of(b"substituted"),
                         created_ms: 0,
-                        ext: Vec::new(),
+                        ext: zblob::wire::Ext::new(),
                     })
                     .unwrap(),
                 };

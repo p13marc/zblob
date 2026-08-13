@@ -31,6 +31,7 @@ use crate::chunk::TransferChunks;
 use crate::client::Overwrite;
 use crate::error::{BlobError, Result};
 use crate::hash::Hash;
+use crate::id::BlobId;
 use crate::manifest::{BlobSpec, Manifest};
 use crate::obs::{TransferStats, zdebug};
 use crate::prefix::{QueryPrefix, ServePrefix};
@@ -173,7 +174,7 @@ pub async fn fanout_file(
     let count = chunks.count();
     let manifest = Manifest {
         version: crate::wire::WIRE_VERSION,
-        id: spec.id.clone(),
+        id: BlobId::new(spec.id.clone())?,
         filename: spec.filename,
         total_len,
         chunk_size: spec.chunk_size,
@@ -181,7 +182,7 @@ pub async fn fanout_file(
         created_ms: spec.created_ms,
         // A publisher has no per-query limits to advertise: fanout is a
         // publication, not a query surface.
-        ext: Vec::new(),
+        ext: crate::wire::Ext::new(),
     };
     manifest.validate(u64::MAX)?;
 

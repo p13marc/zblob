@@ -8,8 +8,8 @@ use std::time::Duration;
 
 use common::{content_hash, open_session, pseudo_random, unique_prefix};
 use zblob::{
-    BlobClient, BlobError, BlobServer, BlobSpec, CancelToken, DownloadRequest, MIN_CHUNK_SIZE,
-    MemoryBlobSource, Progress, ProgressSink, RetryPolicy,
+    BlobClient, BlobError, BlobId, BlobServer, BlobSpec, CancelToken, DownloadRequest,
+    MIN_CHUNK_SIZE, MemoryBlobSource, Progress, ProgressSink, RetryPolicy,
 };
 
 fn test_client(session: Arc<zenoh::Session>, prefix: &str) -> BlobClient {
@@ -156,13 +156,13 @@ async fn cancel_is_observed_while_stalled_on_a_silent_peer() {
     let data = pseudo_random(MIN_CHUNK_SIZE as usize * 8, 0xDEAD);
     let manifest = Manifest {
         version: wire::WIRE_VERSION,
-        id: "stalled".into(),
+        id: BlobId::new("stalled").unwrap(),
         filename: None,
         total_len: data.len() as u64,
         chunk_size: MIN_CHUNK_SIZE,
         root: content_hash(&data),
         created_ms: 0,
-        ext: Vec::new(),
+        ext: zblob::wire::Ext::new(),
     };
 
     let q = session

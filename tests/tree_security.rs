@@ -9,8 +9,8 @@ use std::time::Duration;
 
 use common::{open_session, unique_prefix};
 use zblob::{
-    BlobError, CancelToken, CdcParams, ContentStore, DownloadRequest, Entry, Hash, MemoryStore,
-    TreeClient, TreeIndex, TreeServer, build_tree, wire,
+    BlobError, BlobId, CancelToken, CdcParams, ContentStore, DownloadRequest, Entry, Hash,
+    HashAlgo, MemoryStore, TreeClient, TreeIndex, TreeServer, build_tree, wire,
 };
 
 fn small_cdc() -> CdcParams {
@@ -76,8 +76,8 @@ async fn fake_tree_server(
 fn index_for(id: &str, entries: Vec<Entry>) -> TreeIndex {
     let mut idx = TreeIndex {
         version: wire::WIRE_VERSION,
-        id: id.into(),
-        algo: Hash::ALGO.into(),
+        id: BlobId::new(id).unwrap(),
+        algo: HashAlgo::Blake3,
         cdc: small_cdc(),
         entries,
         root_hash: Hash::of(b"placeholder"),
@@ -96,7 +96,7 @@ async fn zip_slip_index_rejected_nothing_written() {
     // A chunk of "evil" content, referenced by entries that try to escape.
     let evil = b"owned".to_vec();
     let evil_hash = Hash::of(&evil);
-    let chunk_key = zblob::store_key(&store_prefix, Hash::ALGO, &evil_hash);
+    let chunk_key = zblob::store_key(&store_prefix, HashAlgo::Blake3, &evil_hash);
 
     let outer_abs = tempfile::tempdir().unwrap();
     let abs_escape = outer_abs.path().join("evil.txt");
@@ -452,7 +452,7 @@ async fn wrong_content_chunk_ignored() {
         }],
     );
     // Serve *corrupted* bytes under the good hash's key.
-    let chunk_key = zblob::store_key(&store_prefix, Hash::ALGO, &good_hash);
+    let chunk_key = zblob::store_key(&store_prefix, HashAlgo::Blake3, &good_hash);
     let srv = fake_tree_server(
         session.clone(),
         tree_prefix.clone(),
@@ -502,7 +502,7 @@ async fn existing_directory_is_not_silently_destroyed() {
 
     let payload = b"replacement".to_vec();
     let payload_hash = Hash::of(&payload);
-    let chunk_key = zblob::store_key(&store_prefix, Hash::ALGO, &payload_hash);
+    let chunk_key = zblob::store_key(&store_prefix, HashAlgo::Blake3, &payload_hash);
     // A file entry named exactly like a directory the caller already has.
     let index = index_for(
         "clobber",
@@ -599,7 +599,7 @@ async fn setid_bits_are_masked_unless_requested() {
 
     let payload = b"#!/bin/sh\nid\n".to_vec();
     let payload_hash = Hash::of(&payload);
-    let chunk_key = zblob::store_key(&store_prefix, Hash::ALGO, &payload_hash);
+    let chunk_key = zblob::store_key(&store_prefix, HashAlgo::Blake3, &payload_hash);
     let index = index_for(
         "setuid",
         vec![Entry::File {
@@ -692,7 +692,7 @@ async fn preexisting_symlink_cannot_be_traversed() {
 
     let payload = b"attacker data".to_vec();
     let payload_hash = Hash::of(&payload);
-    let chunk_key = zblob::store_key(&store_prefix, Hash::ALGO, &payload_hash);
+    let chunk_key = zblob::store_key(&store_prefix, HashAlgo::Blake3, &payload_hash);
 
     // Case A: hardlink whose target path traverses the pre-existing symlink.
     let hardlink_index = index_for(
@@ -787,7 +787,7 @@ async fn an_over_long_chunk_reply_is_skipped_not_fatal() {
 
     let payload = b"small".to_vec();
     let payload_hash = Hash::of(&payload);
-    let chunk_key = zblob::store_key(&store_prefix, Hash::ALGO, &payload_hash);
+    let chunk_key = zblob::store_key(&store_prefix, HashAlgo::Blake3, &payload_hash);
     let index = index_for(
         "bloat",
         vec![Entry::File {

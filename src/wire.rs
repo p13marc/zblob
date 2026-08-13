@@ -55,25 +55,146 @@ pub const ENC_FANOUT: &str = "zblob/fanout;v=3";
 ///
 /// Deliberately **not** on the slice or chunk path, which stays exactly as
 /// tight as it is: this exists so metadata can grow, not so the bulk path can.
-pub type Ext = Vec<(u16, Vec<u8>)>;
+/// A growth point is also an allocation the peer chooses the size of. As a
+/// bare `Vec<(u16, Vec<u8>)>` nothing bounded it — not `Manifest::validate`,
+/// not the descriptor validators — so a manifest could carry as many
+/// extensions of whatever length a sender liked, on the one message every
+/// client fetches before it decides anything. Deserialization now enforces
+/// [`MAX_FIELDS`](Ext::MAX_FIELDS) and
+/// [`MAX_VALUE_LEN`](Ext::MAX_VALUE_LEN); the limits are generous against the
+/// two extensions that exist and small against an attack.
+///
+/// Wire-transparent: it serializes exactly as the `Vec` it replaced.
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(try_from = "Vec<(u16, Vec<u8>)>", into = "Vec<(u16, Vec<u8>)>")]
+pub struct Ext(Vec<(u16, Vec<u8>)>);
+
+impl Ext {
+    /// Most extension fields one message may carry.
+    pub const MAX_FIELDS: usize = 16;
+
+    /// Longest single extension value, in bytes.
+    pub const MAX_VALUE_LEN: usize = 256;
+
+    /// An empty extension list.
+    #[must_use]
+    pub fn new() -> Self {
+        Ext(Vec::new())
+    }
+
+    /// Wrap a field list, enforcing the bounds.
+    ///
+    /// # Errors
+    ///
+    /// [`BlobError::MalformedMessage`] if there are too many fields or one is
+    /// too long.
+    pub fn from_fields(fields: Vec<(u16, Vec<u8>)>) -> Result<Self> {
+        if fields.len() > Self::MAX_FIELDS {
+            return Err(BlobError::MalformedMessage(format!(
+                "extension list has {} fields, over the cap of {}",
+                fields.len(),
+                Self::MAX_FIELDS
+            )));
+        }
+        if let Some((id, v)) = fields.iter().find(|(_, v)| v.len() > Self::MAX_VALUE_LEN) {
+            return Err(BlobError::MalformedMessage(format!(
+                "extension {id} carries {} bytes, over the cap of {}",
+                v.len(),
+                Self::MAX_VALUE_LEN
+            )));
+        }
+        Ok(Ext(fields))
+    }
+
+    /// The raw value of extension `id`, if present. Duplicates take the first.
+    #[must_use]
+    pub fn get(&self, id: u16) -> Option<&[u8]> {
+        self.0
+            .iter()
+            .find(|(k, _)| *k == id)
+            .map(|(_, v)| v.as_slice())
+    }
+
+    /// Read a `u32` extension value, if present and well-formed.
+    #[must_use]
+    pub fn get_u32(&self, id: u16) -> Option<u32> {
+        Some(u32::from_le_bytes(self.get(id)?.try_into().ok()?))
+    }
+
+    /// Read a `u64` extension value, if present and well-formed.
+    #[must_use]
+    pub fn get_u64(&self, id: u16) -> Option<u64> {
+        Some(u64::from_le_bytes(self.get(id)?.try_into().ok()?))
+    }
+
+    /// Set a `u32` extension value, replacing any existing one.
+    ///
+    /// # Errors
+    ///
+    /// [`BlobError::MalformedMessage`] if this would exceed
+    /// [`MAX_FIELDS`](Self::MAX_FIELDS).
+    pub fn set_u32(&mut self, id: u16, value: u32) -> Result<()> {
+        self.set(id, value.to_le_bytes().to_vec())
+    }
+
+    /// Set a `u64` extension value, replacing any existing one.
+    ///
+    /// # Errors
+    ///
+    /// As [`set_u32`](Self::set_u32).
+    pub fn set_u64(&mut self, id: u16, value: u64) -> Result<()> {
+        self.set(id, value.to_le_bytes().to_vec())
+    }
+
+    /// Set a raw extension value, replacing any existing one.
+    ///
+    /// # Errors
+    ///
+    /// [`BlobError::MalformedMessage`] if it would exceed either cap.
+    pub fn set(&mut self, id: u16, value: Vec<u8>) -> Result<()> {
+        let mut fields = std::mem::take(&mut self.0);
+        fields.retain(|(k, _)| *k != id);
+        fields.push((id, value));
+        *self = Ext::from_fields(fields)?;
+        Ok(())
+    }
+
+    /// Number of extension fields.
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.0.len()
+    }
+
+    /// Whether there are no extension fields.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+
+    /// Iterate over `(id, value)` pairs in wire order.
+    pub fn iter(&self) -> impl Iterator<Item = (u16, &[u8])> {
+        self.0.iter().map(|(k, v)| (*k, v.as_slice()))
+    }
+}
+
+impl TryFrom<Vec<(u16, Vec<u8>)>> for Ext {
+    type Error = BlobError;
+    fn try_from(v: Vec<(u16, Vec<u8>)>) -> Result<Self> {
+        Ext::from_fields(v)
+    }
+}
+
+impl From<Ext> for Vec<(u16, Vec<u8>)> {
+    fn from(e: Ext) -> Self {
+        e.0
+    }
+}
 
 /// Extension id: the server's `max_chunks_per_query`, as a little-endian `u32`.
 pub const EXT_MAX_CHUNKS_PER_QUERY: u16 = 1;
 
 /// Extension id: the server's `max_blob_size`, as a little-endian `u64`.
 pub const EXT_MAX_BLOB_SIZE: u16 = 2;
-
-/// Read a `u32` extension value, if present and well-formed.
-pub fn ext_u32(ext: &Ext, id: u16) -> Option<u32> {
-    let (_, v) = ext.iter().find(|(k, _)| *k == id)?;
-    Some(u32::from_le_bytes(v.as_slice().try_into().ok()?))
-}
-
-/// Read a `u64` extension value, if present and well-formed.
-pub fn ext_u64(ext: &Ext, id: u16) -> Option<u64> {
-    let (_, v) = ext.iter().find(|(k, _)| *k == id)?;
-    Some(u64::from_le_bytes(v.as_slice().try_into().ok()?))
-}
 
 /// A set of content addresses a client is asking about: the request body of
 /// the tier-2 batch fetch and the tier-2 chunk probe.
@@ -241,7 +362,7 @@ pub struct IndexDescriptor {
     /// The snapshot's identity — what the reassembled index must recompute to.
     pub root: Hash,
     /// Hash algorithm of `index_chunks`.
-    pub algo: String,
+    pub algo: crate::hash::HashAlgo,
     /// The encoded index, in order.
     ///
     /// Cut at a **fixed** size, not by CDC: the CDC parameters live *inside*
@@ -259,12 +380,6 @@ impl IndexDescriptor {
     pub fn validate(&self, max_index_bytes: usize) -> Result<()> {
         if self.version != WIRE_VERSION {
             return Err(BlobError::UnsupportedVersion(self.version));
-        }
-        if self.algo != Hash::ALGO {
-            return Err(BlobError::MalformedMessage(format!(
-                "index descriptor uses unsupported algo {}",
-                self.algo
-            )));
         }
         if self.index_chunks.is_empty() {
             return Err(BlobError::MalformedMessage(

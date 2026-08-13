@@ -10,7 +10,7 @@
 //! It was one until 0.3, and the flag itself worked — but a flag can only be
 //! *polled*, and every poll in this crate sat after a blocking receive:
 //!
-//! ```ignore
+//! ```text
 //! while let Ok(reply) = replies.recv_async().await {
 //!     if cancel.is_cancelled() { .. }   // never reached until a reply arrives
 //! ```

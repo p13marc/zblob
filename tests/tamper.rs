@@ -11,7 +11,7 @@ use std::time::Duration;
 
 use common::{open_session, pseudo_random, unique_prefix};
 use zblob::{
-    BlobClient, BlobError, BlobServer, BlobSpec, CancelToken, DownloadRequest, Hash,
+    BlobClient, BlobError, BlobId, BlobServer, BlobSpec, CancelToken, DownloadRequest, Hash,
     MIN_CHUNK_SIZE, MemoryBlobSource, RetryPolicy, manifest_key, parse_ranges, slice_key,
     wire::{ENC_MANIFEST, ENC_SLICE, encode},
 };
@@ -85,13 +85,13 @@ async fn tampered_slice_dropped_alone_and_healed() {
     let ob = common::bao::outboard(&data);
     let manifest = zblob::Manifest {
         version: zblob::wire::WIRE_VERSION,
-        id: "blob-t".into(),
+        id: BlobId::new("blob-t").unwrap(),
         filename: None,
         total_len: data.len() as u64,
         chunk_size: chunk,
         root: ob.root.into(),
         created_ms: 0,
-        ext: Vec::new(),
+        ext: zblob::wire::Ext::new(),
     };
     let root: Hash = ob.root.into();
 
@@ -184,13 +184,13 @@ async fn manifest_id_mismatch_rejected() {
     let ob = common::bao::outboard(&data);
     let manifest = zblob::Manifest {
         version: zblob::wire::WIRE_VERSION,
-        id: "other-blob".into(), // not what the client asked for
+        id: BlobId::new("other-blob").unwrap(), // not what the client asked for
         filename: None,
         total_len: data.len() as u64,
         chunk_size: MIN_CHUNK_SIZE,
         root: ob.root.into(),
         created_ms: 0,
-        ext: Vec::new(),
+        ext: zblob::wire::Ext::new(),
     };
 
     let (srv_session, srv_prefix) = (session.clone(), prefix.clone());

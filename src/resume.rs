@@ -26,6 +26,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::error::Result;
 use crate::hash::Hash;
+use crate::id::BlobId;
 use crate::manifest::Manifest;
 use crate::obs::zwarn;
 use crate::paths::fsync_dir;
@@ -39,7 +40,7 @@ pub(crate) struct ResumeState {
     /// Sidecar schema version (first field; postcard is positional).
     version: u16,
     /// The blob id this partial belongs to.
-    id: String,
+    id: BlobId,
     /// The BLAKE3 bao root (resume binding — see module docs).
     root: Hash,
     /// Total blob length (must match the manifest to reuse the partial).
@@ -213,13 +214,13 @@ mod properties {
     fn manifest_for(chunk_count: u32) -> Manifest {
         Manifest {
             version: WIRE_VERSION,
-            id: "prop".into(),
+            id: BlobId::new("prop").unwrap(),
             filename: None,
             total_len: DEFAULT_CHUNK_SIZE as u64 * chunk_count as u64,
             chunk_size: DEFAULT_CHUNK_SIZE,
             root: Hash::of(b"prop"),
             created_ms: 0,
-            ext: Vec::new(),
+            ext: crate::wire::Ext::new(),
         }
     }
 
@@ -343,13 +344,13 @@ mod tests {
     fn manifest(chunks: u32) -> Manifest {
         Manifest {
             version: WIRE_VERSION,
-            id: "blob".into(),
+            id: BlobId::new("blob").unwrap(),
             filename: None,
             total_len: DEFAULT_CHUNK_SIZE as u64 * chunks as u64,
             chunk_size: DEFAULT_CHUNK_SIZE,
             root: Hash::of(b"data"),
             created_ms: 0,
-            ext: Vec::new(),
+            ext: crate::wire::Ext::new(),
         }
     }
 

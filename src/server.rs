@@ -17,6 +17,7 @@ use tokio::sync::{Notify, RwLock, Semaphore};
 
 use crate::chunk::TransferChunks;
 use crate::error::{BlobError, Result};
+use crate::id::BlobId;
 use crate::manifest::{BlobSpec, Manifest, validate_id};
 use crate::obs::{zdebug, zwarn};
 use crate::prefix::ServePrefix;
@@ -274,10 +275,10 @@ impl Default for ServerConfig {
 struct Inner {
     session: Arc<zenoh::Session>,
     prefix: ServePrefix,
-    registry: RwLock<HashMap<String, Registered>>,
+    registry: RwLock<HashMap<BlobId, Registered>>,
     inflight: Arc<Semaphore>,
     cfg: ServerConfig,
-    pushes: tokio::sync::Mutex<HashMap<String, PushEntry>>,
+    pushes: tokio::sync::Mutex<HashMap<BlobId, PushEntry>>,
 }
 
 /// Serves registered blobs over a Zenoh queryable at `<prefix>/**`.
@@ -502,7 +503,7 @@ impl BlobServer {
         let chunks = TransferChunks::new(spec.chunk_size, total_len)?;
         let manifest = Manifest {
             version: crate::wire::WIRE_VERSION,
-            id: spec.id.clone(),
+            id: BlobId::new(spec.id.clone())?,
             filename: spec.filename,
             total_len,
             chunk_size: spec.chunk_size,
@@ -510,16 +511,18 @@ impl BlobServer {
             created_ms: spec.created_ms,
             // Advertise this server's limits so a client with different
             // defaults clamps to them instead of having its queries rejected.
-            ext: vec![
-                (
+            ext: {
+                let mut ext = crate::wire::Ext::new();
+                ext.set_u32(
                     crate::wire::EXT_MAX_CHUNKS_PER_QUERY,
-                    self.inner.cfg.max_chunks_per_query.to_le_bytes().to_vec(),
-                ),
-                (
+                    self.inner.cfg.max_chunks_per_query,
+                )?;
+                ext.set_u64(
                     crate::wire::EXT_MAX_BLOB_SIZE,
-                    push_max_blob_size(&self.inner.cfg).to_le_bytes().to_vec(),
-                ),
-            ],
+                    push_max_blob_size(&self.inner.cfg),
+                )?;
+                ext
+            },
         };
         // Replacing an id's content is refused, matching the push path — which
         // goes to considerable lengths to prevent exactly this hijack
@@ -532,7 +535,7 @@ impl BlobServer {
         // genuinely replacing content is `unregister` then register, which
         // says what it means.
         let mut registry = self.inner.registry.write().await;
-        if let Some(existing) = registry.get(&spec.id) {
+        if let Some(existing) = registry.get(spec.id.as_str()) {
             if existing.manifest.root == manifest.root {
                 return Ok(manifest);
             }
@@ -545,7 +548,7 @@ impl BlobServer {
         zdebug!(id = %manifest.id, total_len, root = %manifest.root, "blob registered");
         let fingerprint = source.fingerprint();
         registry.insert(
-            spec.id,
+            manifest.id.clone(),
             Registered {
                 manifest: manifest.clone(),
                 chunks,
@@ -664,7 +667,7 @@ async fn serve_one(inner: &Inner, query: zenoh::query::Query) -> Result<()> {
     // don't hold the registry lock across the stream.
     let (manifest, chunks, source, outboard, registered_fingerprint) = {
         let reg = inner.registry.read().await;
-        match reg.get(&id) {
+        match reg.get(id.as_str()) {
             Some(r) => (
                 r.manifest.clone(),
                 r.chunks,
@@ -1007,7 +1010,7 @@ async fn push_offer_inner(inner: &Inner, query: &zenoh::query::Query, key_id: &s
 }
 
 /// Best-effort removal of evicted pushes' spool files.
-async fn cleanup_spool(push: &PushConfig, evicted: &[String]) {
+async fn cleanup_spool(push: &PushConfig, evicted: &[BlobId]) {
     for id in evicted {
         let part = push_part_path(push, id);
         let _ = tokio::fs::remove_file(&part).await;

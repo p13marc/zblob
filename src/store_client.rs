@@ -23,7 +23,7 @@ use zenoh::query::ConsolidationMode;
 
 use crate::compress::{MAX_UNPACKED, unpack};
 use crate::error::{BlobError, Result};
-use crate::hash::Hash;
+use crate::hash::{Hash, HashAlgo};
 use crate::prefix::QueryPrefix;
 use crate::store_key;
 use crate::tree::ChunkRef;
@@ -133,7 +133,7 @@ impl StoreClient {
     /// substitution and corruption are both impossible past this point. Fails
     /// with [`BlobError::NotFound`] if nobody answers acceptably.
     pub async fn fetch_chunk(&self, hash: &Hash) -> Result<Vec<u8>> {
-        let key = store_key(self.prefix.as_str(), Hash::ALGO, hash);
+        let key = store_key(self.prefix.as_str(), HashAlgo::Blake3, hash);
         let (bytes, _) = fetch_one_chunk(
             &self.session,
             &key,
@@ -248,7 +248,7 @@ impl StoreClient {
     /// The length is enforced exactly, and bounds the reply *before* it is
     /// unframed, so a holder cannot pick the allocation.
     pub async fn fetch_chunk_sized(&self, hash: &Hash, len: u32) -> Result<Vec<u8>> {
-        let key = store_key(self.prefix.as_str(), Hash::ALGO, hash);
+        let key = store_key(self.prefix.as_str(), HashAlgo::Blake3, hash);
         let (bytes, _) = fetch_one_chunk(
             &self.session,
             &key,
@@ -284,7 +284,7 @@ pub(crate) async fn batch_query(
         wanted.iter().map(|c| (c.hash, c.len)).collect();
     let want = WantList::new(wanted.iter().map(|c| c.hash).collect());
     let replies = session
-        .get(crate::store_batch_key(store_prefix, Hash::ALGO))
+        .get(crate::store_batch_key(store_prefix, HashAlgo::Blake3))
         .payload(crate::wire::encode(&want)?)
         // The replies land on each chunk's own key, which does not intersect
         // this one. Without this the *server* refuses them, once per chunk.
@@ -344,7 +344,7 @@ pub(crate) async fn probe_chunks(
     }
     let want = WantList::new(hashes.to_vec());
     let replies = session
-        .get(crate::store_have_key(store_prefix, Hash::ALGO))
+        .get(crate::store_have_key(store_prefix, HashAlgo::Blake3))
         .payload(crate::wire::encode(&want)?)
         .consolidation(ConsolidationMode::None)
         .priority(priority)

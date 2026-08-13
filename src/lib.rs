@@ -74,6 +74,7 @@ mod error;
 pub mod fanout;
 pub mod gc;
 mod hash;
+mod id;
 mod manifest;
 mod obs;
 mod paths;
@@ -98,7 +99,9 @@ pub use compress::ChunkCompression;
 #[cfg(feature = "encryption")]
 pub use crypt::StoreKey;
 pub use error::{BlobError, ErrorKind, Result};
+pub use hash::HashAlgo;
 pub use hash::{Hash, HashParseError};
+pub use id::BlobId;
 pub use manifest::{BlobSpec, Manifest};
 pub use obs::TransferStats;
 pub use prefix::{QueryPrefix, ServePrefix};
@@ -332,7 +335,7 @@ pub fn frame_chunk(bytes: &[u8], compression: ChunkCompression) -> Result<Vec<u8
 
 /// Key of a content-addressed chunk (Tier 2): `<prefix>/<algo>/<hex>`. Immutable,
 /// so it is safe to cache fleet-wide.
-pub fn store_key(prefix: &str, algo: &str, hash: &Hash) -> String {
+pub fn store_key(prefix: &str, algo: HashAlgo, hash: &Hash) -> String {
     format!("{prefix}/{algo}/{hash}")
 }
 
@@ -390,7 +393,7 @@ pub const STORE_HAVE: &str = "have";
 /// `<prefix>/<algo>/**` would also carry those replies, and would make every
 /// router-hosted storage in range dump its entire content store in answer to
 /// one query.
-pub fn store_batch_key(prefix: &str, algo: &str) -> String {
+pub fn store_batch_key(prefix: &str, algo: HashAlgo) -> String {
     format!("{prefix}/{algo}/{STORE_BATCH}")
 }
 
@@ -400,7 +403,7 @@ pub fn store_batch_key(prefix: &str, algo: &str) -> String {
 /// The reply is one bit per entry, so its size is a function of the question
 /// rather than of the objects asked about. That is what makes this safe to
 /// fan out across origins where a tier-2 *fetch* is not.
-pub fn store_have_key(prefix: &str, algo: &str) -> String {
+pub fn store_have_key(prefix: &str, algo: HashAlgo) -> String {
     format!("{prefix}/{algo}/{STORE_HAVE}")
 }
 

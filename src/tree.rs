@@ -42,8 +42,8 @@ use crate::chunk::CdcParams;
 use crate::client::DownloadRequest;
 use crate::compress::{ChunkCompression, pack};
 use crate::error::{BlobError, Result};
-use crate::hash::Hash;
-use crate::manifest::validate_id;
+use crate::hash::{Hash, HashAlgo};
+use crate::id::BlobId;
 use crate::obs::{TransferStats, zdebug};
 use crate::paths::{
     assert_parent_within, create_dir_confined, sanitize_rel_path, sanitize_symlink_target,
@@ -129,9 +129,9 @@ pub struct TreeIndex {
     /// Wire schema version (first field; postcard is positional).
     pub version: u16,
     /// Snapshot id (a single key segment).
-    pub id: String,
-    /// Hash algorithm name (`"blake3"` in v2).
-    pub algo: String,
+    pub id: BlobId,
+    /// Hash algorithm the chunk references are addressed under.
+    pub algo: HashAlgo,
     /// The content-defined-chunking parameters this snapshot was cut with.
     /// Producers sharing a store must share these for dedup to work.
     pub cdc: CdcParams,
@@ -292,30 +292,29 @@ impl TreeIndex {
     /// The id is not part of the root digest, so re-keying never invalidates
     /// the index.
     pub fn keyed_by_root(mut self) -> Self {
-        self.id = self.root_hash.to_string();
+        // A hex digest is always a legal id, so this cannot fail.
+        self.id = BlobId::new(self.root_hash.to_string())
+            .expect("a hex root hash is a valid single key segment");
         self
     }
 
     /// Whether this index is keyed by its own root (see
     /// [`keyed_by_root`](Self::keyed_by_root)).
     pub fn is_content_addressed(&self) -> bool {
-        self.id == self.root_hash.to_string()
+        self.id.as_str() == self.root_hash.to_string()
     }
 
-    /// Validate an index received from the network: schema version, algorithm,
-    /// CDC parameters, id, every entry path/target (traversal-safe), file
-    /// size↔chunk consistency, and that `root_hash` matches the entries.
+    /// Validate an index received from the network: schema version, CDC
+    /// parameters, every entry path/target (traversal-safe), file size↔chunk
+    /// consistency, and that `root_hash` matches the entries.
+    ///
+    /// The id and the hash algorithm are *not* checked here — they cannot be
+    /// wrong. [`BlobId`] and [`HashAlgo`] refuse to decode from anything this
+    /// crate could not use, so an index that exists has already passed both.
     pub fn validate(&self) -> Result<()> {
         if self.version != WIRE_VERSION {
             return Err(BlobError::UnsupportedVersion(self.version));
         }
-        if self.algo != Hash::ALGO {
-            return Err(BlobError::MalformedMessage(format!(
-                "unsupported algo: {}",
-                self.algo
-            )));
-        }
-        validate_id(&self.id)?;
         self.cdc.validate()?;
         // Two entries claiming one path let a snapshot destroy its own output
         // (and, with `Entry::Dir` first, turn a directory into a file). The
@@ -453,8 +452,7 @@ pub fn build_tree_from(
     parent: Option<&TreeIndex>,
 ) -> Result<TreeIndex> {
     cdc.validate()?;
-    let id = id.into();
-    validate_id(&id)?;
+    let id = BlobId::new(id.into())?;
     // Index the parent's file entries by path for O(1) lookup during the walk.
     let mut reusable: HashMap<&str, &Entry> = HashMap::new();
     if let Some(parent) = parent {
@@ -477,7 +475,7 @@ pub fn build_tree_from(
     let index = TreeIndex {
         version: WIRE_VERSION,
         id,
-        algo: Hash::ALGO.to_string(),
+        algo: HashAlgo::Blake3,
         cdc: *cdc,
         entries,
         root_hash,
@@ -717,7 +715,7 @@ struct TreeInner {
     store_prefix: ServePrefix,
     tree_prefix: ServePrefix,
     store: Arc<dyn ContentStore>,
-    index: tokio::sync::RwLock<std::collections::HashMap<String, Registered>>,
+    index: tokio::sync::RwLock<std::collections::HashMap<BlobId, Registered>>,
     index_shard_threshold: usize,
     inflight: Arc<Semaphore>,
     compression: ChunkCompression,
@@ -774,10 +772,10 @@ fn shard_index(
     Ok(crate::wire::IndexDescriptor {
         version: WIRE_VERSION,
         root,
-        algo: Hash::ALGO.to_string(),
+        algo: HashAlgo::Blake3,
         index_chunks: chunks,
         index_len: encoded.len() as u64,
-        ext: Vec::new(),
+        ext: crate::wire::Ext::new(),
     })
 }
 
@@ -1025,7 +1023,7 @@ async fn serve_chunk_query(inner: &TreeInner, query: zenoh::query::Query) -> Res
                     // replying with it makes the answer unattributable and
                     // uncacheable. A reply must say who is answering.
                     .reply(
-                        store_key(inner.store_prefix.as_str(), Hash::ALGO, &hash),
+                        store_key(inner.store_prefix.as_str(), HashAlgo::Blake3, &hash),
                         packed,
                     )
                     .encoding(ENC_CHUNK)
@@ -1100,7 +1098,7 @@ async fn serve_chunk_batch(inner: &TreeInner, query: zenoh::query::Query) -> Res
                 .iter()
                 .filter_map(|h| match store.get(h) {
                     Ok(Some(bytes)) => match pack(&bytes, compression) {
-                        Ok(framed) => Some(Ok((store_key(&prefix, Hash::ALGO, h), framed))),
+                        Ok(framed) => Some(Ok((store_key(&prefix, HashAlgo::Blake3, h), framed))),
                         // Framing failed for a chunk we hold. Silently dropping it
                         // would leave the client re-asking forever with nothing on
                         // either side to explain it.
@@ -1144,7 +1142,7 @@ async fn serve_chunk_probe(inner: &TreeInner, query: zenoh::query::Query) -> Res
     query
         // Our own key: a probe exists to be attributed (see the chunk reply).
         .reply(
-            crate::store_have_key(inner.store_prefix.as_str(), Hash::ALGO),
+            crate::store_have_key(inner.store_prefix.as_str(), HashAlgo::Blake3),
             encode(&bits)?,
         )
         .encoding(crate::wire::ENC_HAVEBITS)
@@ -1465,7 +1463,7 @@ impl TreeClient {
             let bytes = match got.remove(&c.hash) {
                 Some(b) => b,
                 None => {
-                    let key = store_key(self.store_prefix.as_str(), Hash::ALGO, &c.hash);
+                    let key = store_key(self.store_prefix.as_str(), HashAlgo::Blake3, &c.hash);
                     crate::store_client::fetch_one_chunk(
                         &self.session,
                         &key,
@@ -1500,7 +1498,8 @@ impl TreeClient {
         &self,
         id: &str,
     ) -> Result<Vec<(QueryPrefix, crate::wire::TreeProbe)>> {
-        validate_id(id)?;
+        let id = BlobId::new(id)?;
+        let id = id.as_str();
         let replies = self
             .session
             .get(crate::tree_have_key(self.tree_prefix.as_str(), id))
@@ -1568,7 +1567,8 @@ impl TreeClient {
         id: &str,
         expected_root: Option<Hash>,
     ) -> Result<TreeIndex> {
-        validate_id(id)?;
+        let id = BlobId::new(id)?;
+        let id = id.as_str();
         let key = tree_key(self.tree_prefix.as_str(), id);
         let replies = self
             .session
@@ -1896,7 +1896,7 @@ impl TreeClient {
                 stats.queries += 1;
                 let session = self.session.clone();
                 let hash = chunk.hash;
-                let key = store_key(self.store_prefix.as_str(), Hash::ALGO, &hash);
+                let key = store_key(self.store_prefix.as_str(), HashAlgo::Blake3, &hash);
                 let timeout = self.cfg.query_timeout;
                 let priority = self.cfg.priority;
                 let store = store.clone();
@@ -2211,8 +2211,8 @@ mod tests {
             let root_hash = root_digest(&entries).unwrap();
             let index = TreeIndex {
                 version: WIRE_VERSION,
-                id: "x".into(),
-                algo: Hash::ALGO.into(),
+                id: BlobId::new("x").unwrap(),
+                algo: HashAlgo::Blake3,
                 cdc: CdcParams::default(),
                 entries,
                 root_hash,
@@ -2240,8 +2240,8 @@ mod tests {
             let root_hash = root_digest(&entries).unwrap();
             let index = TreeIndex {
                 version: WIRE_VERSION,
-                id: "x".into(),
-                algo: Hash::ALGO.into(),
+                id: BlobId::new("x").unwrap(),
+                algo: HashAlgo::Blake3,
                 cdc: CdcParams::default(),
                 entries,
                 root_hash,
@@ -2262,8 +2262,8 @@ mod tests {
         let root_hash = root_digest(&entries).unwrap();
         let index = TreeIndex {
             version: WIRE_VERSION,
-            id: "x".into(),
-            algo: Hash::ALGO.into(),
+            id: BlobId::new("x").unwrap(),
+            algo: HashAlgo::Blake3,
             cdc: CdcParams::default(),
             entries,
             root_hash,

@@ -24,6 +24,7 @@ use crate::cancel::CancelToken;
 use crate::chunk::{MIN_CHUNK_SIZE, TransferChunks};
 use crate::error::{BlobError, Result};
 use crate::hash::Hash;
+use crate::id::BlobId;
 use crate::manifest::{BlobSpec, Manifest, validate_id};
 use crate::obs::{TransferStats, zdebug};
 use crate::prefix::QueryPrefix;
@@ -749,7 +750,7 @@ impl BlobClient {
         let chunks = TransferChunks::new(spec.chunk_size, total_len)?;
         let manifest = Manifest {
             version: crate::wire::WIRE_VERSION,
-            id: spec.id.clone(),
+            id: BlobId::new(spec.id.clone())?,
             filename: spec.filename,
             total_len,
             chunk_size: spec.chunk_size,
@@ -757,7 +758,7 @@ impl BlobClient {
             created_ms: spec.created_ms,
             // The uploader has nothing to advertise; the *receiver* is the one
             // with limits, and it states them in its offer reply.
-            ext: Vec::new(),
+            ext: crate::wire::Ext::new(),
         };
         manifest.validate(u64::MAX)?;
 

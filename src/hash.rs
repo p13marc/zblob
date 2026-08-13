@@ -15,13 +15,79 @@ use std::str::FromStr;
 
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
+/// The hash algorithm a message or key names.
+///
+/// One variant today. It exists as a type rather than a `String` because
+/// `algo` is a wire field: as a string, `TreeIndex.algo` accepted anything and
+/// was checked — if someone called `validate()` — against `Hash::ALGO`, and
+/// the eight key builders took an `algo: &str` every caller passed the same
+/// constant to. As an enum, an index naming an algorithm this crate cannot
+/// verify fails to decode, which is the same answer one step earlier and
+/// without a convention holding it up.
+///
+/// It serializes as the bare name (`"blake3"`), so this is a source break and
+/// not a wire break. `#[non_exhaustive]` because adding an algorithm must not
+/// break a downstream `match`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, Serialize, Deserialize)]
+#[serde(try_from = "String", into = "String")]
+#[non_exhaustive]
+pub enum HashAlgo {
+    /// BLAKE3 — the crate-wide algorithm since wire v2.
+    #[default]
+    Blake3,
+}
+
+impl HashAlgo {
+    /// The wire/key name.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            HashAlgo::Blake3 => "blake3",
+        }
+    }
+}
+
+impl fmt::Display for HashAlgo {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+impl FromStr for HashAlgo {
+    type Err = crate::error::BlobError;
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "blake3" => Ok(HashAlgo::Blake3),
+            other => Err(crate::error::BlobError::MalformedMessage(format!(
+                "unsupported hash algorithm {other:?}"
+            ))),
+        }
+    }
+}
+
+impl TryFrom<String> for HashAlgo {
+    type Error = crate::error::BlobError;
+    fn try_from(s: String) -> Result<Self, Self::Error> {
+        s.parse()
+    }
+}
+
+impl From<HashAlgo> for String {
+    fn from(a: HashAlgo) -> String {
+        a.as_str().to_string()
+    }
+}
+
 /// A 32-byte content hash, rendered as lowercase hex on the wire and in keys.
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
 pub struct Hash([u8; 32]);
 
 impl Hash {
     /// The wire/key name of the crate's hash algorithm.
-    pub const ALGO: &'static str = "blake3";
+    ///
+    /// Equal to `HashAlgo::Blake3.as_str()`; kept as a `&str` constant because
+    /// it is compared against raw key segments, which are strings.
+    pub const ALGO: &'static str = HashAlgo::Blake3.as_str();
 
     /// BLAKE3 hash of `data` in one shot.
     pub fn of(data: &[u8]) -> Hash {

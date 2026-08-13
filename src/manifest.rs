@@ -13,6 +13,7 @@ use serde::{Deserialize, Serialize};
 use crate::chunk::TransferChunks;
 use crate::error::{BlobError, Result};
 use crate::hash::Hash;
+use crate::id::BlobId;
 use crate::wire::WIRE_VERSION;
 
 /// Describes a single blob: identity, size, chunking, and BLAKE3 root.
@@ -27,8 +28,9 @@ pub struct Manifest {
     /// Must equal [`WIRE_VERSION`].
     pub version: u16,
     /// Opaque caller-chosen id (e.g. a ULID). Appears in the blob key, so it
-    /// must be a single, non-empty key segment.
-    pub id: String,
+    /// must be a single, non-empty key segment — which [`BlobId`] enforces at
+    /// deserialization, not at validation time.
+    pub id: BlobId,
     /// **Advisory** file name. This crate never joins it to any path — the
     /// caller chooses every destination (`download_to`) — because a remote
     /// party must not pick where bytes land (the v1 path-traversal vector).
@@ -65,7 +67,6 @@ impl Manifest {
         if self.version != WIRE_VERSION {
             return Err(BlobError::UnsupportedVersion(self.version));
         }
-        validate_id(&self.id)?;
         TransferChunks::validate_chunk_size(self.chunk_size)?;
         if self.total_len > max_blob_size {
             return Err(BlobError::InvalidManifest(format!(
@@ -92,12 +93,12 @@ impl Manifest {
     /// with `InvalidRanges` and nothing to explain it. Documented behaviour is
     /// not a protocol.
     pub fn max_chunks_per_query(&self) -> Option<u32> {
-        crate::wire::ext_u32(&self.ext, crate::wire::EXT_MAX_CHUNKS_PER_QUERY)
+        self.ext.get_u32(crate::wire::EXT_MAX_CHUNKS_PER_QUERY)
     }
 
     /// The server's advertised `max_blob_size`, if it said.
     pub fn max_blob_size(&self) -> Option<u64> {
-        crate::wire::ext_u64(&self.ext, crate::wire::EXT_MAX_BLOB_SIZE)
+        self.ext.get_u64(crate::wire::EXT_MAX_BLOB_SIZE)
     }
 
     /// How many transfer chunks this manifest describes.
@@ -132,30 +133,11 @@ impl Manifest {
     }
 }
 
-/// A blob id must be a single non-empty Zenoh key segment of sane length: no
-/// `/` or `\` (ids are joined into spool/tag file names), no wildcard/param
-/// characters, no `..`, and **no leading `@`**.
-///
-/// The `@` rule is not cosmetic: Zenoh treats a segment beginning with `@` as
-/// *verbatim*, and `**` does not match it. A server declares its queryable on
-/// `<prefix>/**`, so an id like `@thing` would register successfully and then
-/// never be servable — every download would time out as `NotFound` with
-/// nothing in any log to explain it. Reject it at the door instead.
-/// (`x@y` is fine; only the leading position is special.)
+/// Validate a bare `&str` id (see [`BlobId`], which is the same rules as a
+/// type). Used where an id arrives as a caller argument rather than in a
+/// decoded message.
 pub(crate) fn validate_id(id: &str) -> Result<()> {
-    let ok = !id.is_empty()
-        && id.len() <= 200
-        && id != ".."
-        && !id.starts_with('@')
-        && !id.contains(['/', '\\', '*', '?', '#', '$'])
-        && !id.chars().any(char::is_whitespace);
-    if ok {
-        Ok(())
-    } else {
-        Err(BlobError::InvalidManifest(format!(
-            "id {id:?} is not a valid single key segment"
-        )))
-    }
+    BlobId::new(id).map(|_| ())
 }
 
 /// Caller-side parameters for registering a blob: everything in the
@@ -215,13 +197,13 @@ mod tests {
     fn manifest() -> Manifest {
         Manifest {
             version: WIRE_VERSION,
-            id: "abc".into(),
+            id: BlobId::new("abc").unwrap(),
             filename: Some("f.bin".into()),
             total_len: DEFAULT_CHUNK_SIZE as u64 * 2 + 100,
             chunk_size: DEFAULT_CHUNK_SIZE,
             root: Hash::of(b"whatever"),
             created_ms: 42,
-            ext: Vec::new(),
+            ext: crate::wire::Ext::new(),
         }
     }
 
@@ -269,8 +251,31 @@ mod tests {
         assert!(m.validate(1024 * 1024).is_err());
     }
 
+    /// A hostile id is refused by *decoding*, one step earlier than
+    /// `validate()` — which is the point of [`BlobId`]: nothing has to
+    /// remember to call anything.
+    ///
+    /// The message is built as a positional tuple of the manifest's field
+    /// types, which postcard encodes byte-for-byte like the struct. That is
+    /// also the documented way for an adversarial test to send a manifest a
+    /// `BlobId` could not hold, so this exercises the escape hatch too.
     #[test]
-    fn bad_ids_rejected() {
+    fn bad_ids_are_refused_at_decode_not_at_validate() {
+        let m = manifest();
+        let encode_with = |id: &str| {
+            crate::wire::encode(&(
+                m.version,
+                id.to_string(),
+                m.filename.clone(),
+                m.total_len,
+                m.chunk_size,
+                m.root,
+                m.created_ms,
+                m.ext.clone(),
+            ))
+            .unwrap()
+        };
+
         for bad in [
             "",
             "a/b",
@@ -282,12 +287,18 @@ mod tests {
             "a\\b",
             "@",
         ] {
-            let m = Manifest {
-                id: bad.into(),
-                ..manifest()
-            };
-            assert!(m.validate(u64::MAX).is_err(), "id {bad:?}");
+            assert!(
+                crate::wire::decode::<Manifest>(&encode_with(bad)).is_err(),
+                "id {bad:?} decoded"
+            );
         }
+
+        // Discriminating power: the identical construction with a legal id
+        // decodes to the manifest it was built from, so the rejections above
+        // are about the id and not about the hand-rolled framing.
+        let decoded = crate::wire::decode::<Manifest>(&encode_with("good-id")).unwrap();
+        assert_eq!(decoded.id, "good-id");
+        assert_eq!(decoded.root, m.root);
     }
 
     /// The `@` rule exists because Zenoh's `**` does not match verbatim

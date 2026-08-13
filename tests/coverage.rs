@@ -8,7 +8,7 @@ use std::time::Duration;
 
 use common::{content_hash, open_session, pseudo_random, unique_prefix};
 use zblob::{
-    BlobClient, BlobServer, BlobSpec, CancelToken, DownloadRequest, MIN_CHUNK_SIZE,
+    BlobClient, BlobId, BlobServer, BlobSpec, CancelToken, DownloadRequest, MIN_CHUNK_SIZE,
     MemoryBlobSource, Progress, RetryPolicy,
 };
 
@@ -677,20 +677,21 @@ async fn a_client_clamps_to_the_server_s_advertised_cap() {
 fn unknown_extension_ids_are_skipped() {
     let mut m = zblob::Manifest {
         version: zblob::wire::WIRE_VERSION,
-        id: "x".into(),
+        id: BlobId::new("x").unwrap(),
         filename: None,
         total_len: 1024,
         chunk_size: MIN_CHUNK_SIZE,
         root: zblob::Hash::of(b"x"),
         created_ms: 0,
-        ext: vec![
+        ext: zblob::wire::Ext::from_fields(vec![
             (60_000, b"from a future version".to_vec()),
             (
                 zblob::wire::EXT_MAX_CHUNKS_PER_QUERY,
                 7u32.to_le_bytes().to_vec(),
             ),
             (60_001, Vec::new()),
-        ],
+        ])
+        .unwrap(),
     };
     m.validate(u64::MAX)
         .expect("unknown ids must not invalidate");
@@ -702,6 +703,35 @@ fn unknown_extension_ids_are_skipped() {
     assert_eq!(m.max_blob_size(), None, "absent ids report absent");
 
     // A known id carrying the wrong width is ignored rather than misread.
-    m.ext = vec![(zblob::wire::EXT_MAX_CHUNKS_PER_QUERY, vec![1, 2])];
+    m.ext =
+        zblob::wire::Ext::from_fields(vec![(zblob::wire::EXT_MAX_CHUNKS_PER_QUERY, vec![1, 2])])
+            .unwrap();
     assert_eq!(m.max_chunks_per_query(), None);
+
+    // The bounds are enforced by decoding, not by remembering to check: a
+    // manifest whose extension list is over either cap does not exist.
+    assert!(
+        zblob::wire::Ext::from_fields(
+            (0..=zblob::wire::Ext::MAX_FIELDS as u16)
+                .map(|i| (i, Vec::new()))
+                .collect()
+        )
+        .is_err(),
+        "too many fields must be refused"
+    );
+    assert!(
+        zblob::wire::Ext::from_fields(vec![(1, vec![0u8; zblob::wire::Ext::MAX_VALUE_LEN + 1])])
+            .is_err(),
+        "an oversized value must be refused"
+    );
+    // Discriminating power: exactly at each cap is accepted.
+    assert!(
+        zblob::wire::Ext::from_fields(
+            (0..zblob::wire::Ext::MAX_FIELDS as u16)
+                .map(|i| (i, vec![0u8; zblob::wire::Ext::MAX_VALUE_LEN]))
+                .collect()
+        )
+        .is_ok(),
+        "the caps themselves must be legal"
+    );
 }

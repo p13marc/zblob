@@ -26,7 +26,7 @@ use zenoh::query::ConsolidationMode;
 
 use crate::compress::{ChunkCompression, pack};
 use crate::error::{BlobError, Result};
-use crate::hash::Hash;
+use crate::hash::{Hash, HashAlgo};
 use crate::prefix::ServePrefix;
 use crate::store::ContentStore;
 use crate::tree::TreeIndex;
@@ -48,7 +48,7 @@ pub async fn publish_chunk(
 ) -> Result<()> {
     session
         .put(
-            store_key(store_prefix.as_str(), Hash::ALGO, hash),
+            store_key(store_prefix.as_str(), HashAlgo::Blake3, hash),
             pack(bytes, compression)?,
         )
         .encoding(ENC_CHUNK)
@@ -232,7 +232,7 @@ pub async fn publish_snapshot(
         probes.extend(
             picked
                 .into_iter()
-                .map(|i| store_key(store_prefix.as_str(), Hash::ALGO, &needed[i])),
+                .map(|i| store_key(store_prefix.as_str(), HashAlgo::Blake3, &needed[i])),
         );
     }
 

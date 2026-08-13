@@ -9,8 +9,9 @@ use std::time::Duration;
 
 use common::{content_hash, open_session, pseudo_random, unique_prefix};
 use zblob::{
-    BlobClient, BlobError, BlobServer, BlobSpec, CancelToken, DownloadRequest, MIN_CHUNK_SIZE,
-    MemoryBlobSource, Progress, ProgressSink, RetryPolicy, manifest_key, parse_ranges, slice_key,
+    BlobClient, BlobError, BlobId, BlobServer, BlobSpec, CancelToken, DownloadRequest,
+    MIN_CHUNK_SIZE, MemoryBlobSource, Progress, ProgressSink, RetryPolicy, manifest_key,
+    parse_ranges, slice_key,
     wire::{ENC_MANIFEST, ENC_SLICE, encode},
 };
 
@@ -137,13 +138,13 @@ async fn middle_hole_is_refetched_as_a_range() {
     let ob = common::bao::outboard(&data);
     let manifest = zblob::Manifest {
         version: zblob::wire::WIRE_VERSION,
-        id: "holey".into(),
+        id: BlobId::new("holey").unwrap(),
         filename: None,
         total_len: data.len() as u64,
         chunk_size: chunk,
         root: ob.root.into(),
         created_ms: 0,
-        ext: Vec::new(),
+        ext: zblob::wire::Ext::new(),
     };
 
     let pinned_root = manifest.root;
