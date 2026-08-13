@@ -998,6 +998,118 @@ pub fn build_tree_from(
       and it belongs in a property test over generated edits.
 EOF
 
+# ------------------------------------------ decisions taken while building ----
+
+comment 52 <<'EOF'
+**Option A is not implementable as written. Decision: neither A nor B.**
+
+The issue offers "make it real" (servers answer their actual bitfield, plus a
+striping scheduler) or "delete it", and recommends A on the grounds that the
+push spool is a genuine partial holder. It is a genuine partial *holding*. It
+cannot be served.
+
+A tier-1 reply is a **bao slice**: the chunk's bytes plus the sibling hashes
+proving them against the root. Those siblings are hashes of *other* subtrees,
+so producing one requires the whole blob — which is exactly why the outboard is
+computed at registration and at `finalize_push`, and never from a partial
+spool. A holder with part of a blob can serve no verified slice of it at all.
+Advertising a partial tier-1 holding would send clients after chunks they can
+never obtain.
+
+This was found by implementing A: the partial holders reported availability,
+the striping client dutifully assigned them ranges, and every range came back
+empty.
+
+**What shipped instead:**
+
+- **The striping scheduler**, which was the actual prize. `download_striped`
+  addresses each range to one holder's concrete prefix, so a chunk crosses the
+  wire once instead of once per replica — Zenoh cannot cancel remote replies in
+  flight, so the old "ask a shared key and discard duplicates" cost N× the
+  bandwidth for N replicas. Endgame duplication for the tail; per-holder
+  rejection accounting drops a persistently bad peer from the rotation. The
+  test asserts the byte count, since a version that asked everyone and threw
+  the duplicates away would pass anything weaker.
+- **Tier-1 availability stays all-or-nothing**, now documented as a property of
+  bao rather than left looking unimplemented, with a test pinning it — because
+  "have the push spool report its bitfield" is the obvious improvement and it
+  is the lie the constraint forbids.
+- **Partial possession lives on tier 2**, where it is real: a `ContentStore`
+  holds whatever subset it holds and each chunk is verified against its own
+  address rather than a whole-object root. That is what `StoreClient::probe`
+  reports (#49).
+
+So the half-state the issue rightly objects to is gone, without inventing a
+capability the integrity model cannot back.
+EOF
+
+comment 54 <<'EOF'
+**Decision: keep the feature, fix the framing, leave the normative question to
+the RFC.** (Option A, minus the part this repo cannot decide.)
+
+Adoption is still zero and every registry entry still excludes it, so nothing
+here argues for promotion. But the framing defects were real and a wire bump is
+the moment to fix them, whatever the RFC later says:
+
+- samples are **version-first structs** carrying **`ENC_FANOUT`**, and the
+  receiver filters on the tag *before* decoding instead of relying on decode
+  failure to reject foreign samples — the "opaque error deep in a transfer"
+  mode v2 removed everywhere else, surviving in this one place;
+- `FanoutFrame`'s postcard-positional variant ordering is now documented as
+  append-only, since adding a variant anywhere else is a silent wire break no
+  version field would catch;
+- the publisher cached **every** slice for the handle's lifetime — the whole
+  blob plus outboard resident, on producers that are frequently embedded. Now
+  `FanoutConfig::cache_samples` (default 4096); a joiner arriving after
+  eviction re-requests what it missed;
+- the receiver buffered **256 MiB** of unverified pre-manifest frames from an
+  unauthenticated publisher, for a manifest that need never arrive. Now
+  `max_early_bytes` (default 16 MiB);
+- the manifest size cap was hard-coded at 1 TiB, so a receiver could not
+  decline an implausible one. Now `max_blob_size`.
+
+Whether §2.2 keeps naming it is a zenkey decision (`marcpardo/zenkey#146`), and
+the code is honest either way now. The README states the feature's status
+rather than leaving it inferable only from a TOML comment downstream.
+EOF
+
+comment 55 <<'EOF'
+**Decided by measurement: 256 KiB, as proposed.** The issue asked for a bench
+rather than a guess; here it is.
+
+`tests/chunk_size.rs` encodes every bao slice for 8 MiB of incompressible data
+at each size — so the header overhead is measured, not modelled — and applies
+the fragment-loss model on top:
+
+```
+  chunk   slices   header      wire bytes / useful byte
+                             p=0      p=1%     p=5%
+    64K      128    0.977%   1.0098   1.0200   1.0629
+   128K       64    0.635%   1.0063   1.0268   1.1151
+   256K       32    0.488%   1.0049   1.0461   1.2337   <- new default
+   512K       16    0.427%   1.0043   1.0884   1.5138   <- old default
+  1024K        8    0.403%   1.0040   1.1792   2.2812
+  4096K        2    0.391%   1.0039   1.9100  26.7536
+```
+
+Two effects pull against each other: a bao slice carries parent hashes, so
+smaller chunks put proportionally more overhead on the wire; but Zenoh
+fragments over 64 KiB and a dropped fragment discards the whole message, so a
+chunk survives with probability `(1-p)^ceil(S/64KiB)`.
+
+256 KiB is the knee — the first effect has flattened (0.488% against a
+best-possible 0.391%) and the second has not taken off. Moving there from
+512 KiB costs **0.06% on a clean link** and saves **4 points at 1% loss and 28
+points at 5%**. Going on to 128 KiB saves roughly half as much again while
+doubling the slice count.
+
+The reasoning is in `DEFAULT_CHUNK_SIZE`'s doc comment, so the number is not
+folklore. The test asserts the *shape* of the result — overhead falls with
+size, loss cost rises with size, the default is few enough fragments and near
+enough the clean-link optimum — so it stays meaningful if the measurement moves
+rather than pinning numbers that would just need updating.
+EOF
+
 echo
 echo "done."
 (( APPLY )) || echo "(dry run — re-run with --apply and FORGEJO_TOKEN set)"

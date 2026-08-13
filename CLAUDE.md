@@ -5,7 +5,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 ## What this is
 
 `zblob` is a single-crate Cargo workspace: generic, resumable, chunked blob and
-directory transfer over Zenoh — **wire v2**: BLAKE3 + bao verified streaming,
+directory transfer over Zenoh — **wire v3**: BLAKE3 + bao verified streaming,
 range-set resume, postcard control messages, content-addressed directory trees.
 It carries no application-specific types. It graduated from the ZenSight
 monorepo in 2026-07 (formerly the in-tree `zenoh-blob` crate); ZenSight
@@ -55,7 +55,7 @@ cross-platform coverage becomes a requirement, decide it explicitly: provision
 mingw on the runner for `x86_64-pc-windows-gnu` compile checks, or re-enable a
 GitHub matrix on purpose.
 
-## Architecture (wire v2)
+## Architecture (wire v3)
 
 Both tiers share the primitives: `hash.rs` (BLAKE3-only `Hash`), `verify.rs`
 (bao outboard/slice encode + verified decode — the integrity core), `wire.rs`
@@ -71,7 +71,7 @@ optional tracing).
 to build the bao outboard (mem, or sibling `.obao4` file for huge blobs) and
 derives the manifest — a served manifest can't disagree with the bytes. A
 download is a manifest GET then range-set slice GETs
-(`?v=2&ranges=…`, `ConsolidationMode::None`, explicit timeout, retry with
+(`?ranges=…`, `ConsolidationMode::None`, explicit timeout, retry with
 backoff); every reply is a self-verifying bao slice checked against the
 (pinnable) root *before* hitting the `.part` — no final hash pass, tampered
 slices are dropped alone. The server also answers `…/have` availability
@@ -100,7 +100,51 @@ replay history; every receiver verifies).
 
 All key expressions are built through the helpers in `lib.rs` (`manifest_key`,
 `slice_key`, `slice_selector`, `availability_key`, `push_*_key`, `store_key`,
-`tree_key`, `parse_id`, `parse_ranges`) — don't format keys ad hoc.
+`store_batch_key`, `store_have_key`, `tree_key`, `tree_have_key`, `parse_id`,
+`parse_tier2_tail`, `parse_ranges`) — don't format keys ad hoc. Prefixes are
+typed by role (`ServePrefix` / `QueryPrefix`, `prefix.rs`); a server cannot be
+built on a wildcard because there is no value to build it from.
+
+### What v3 added, and the two traps in it
+
+- **Batched tier-2 fetch** (`<store>/<algo>/batch`, want-list payload). Replies
+  come back on each chunk's *own* key, which is **disjoint** from the batch
+  key — so the query must set `accept_replies(ReplyKeyExpr::Any)`, and without
+  it Zenoh refuses each reply **on the server**. Do not "simplify" this into a
+  wildcard request key: `<store>/<algo>/**` would make every router-hosted
+  storage in range dump its entire content store in answer to one query.
+- **A batch is not answered by storages.** A storage serves by key and has
+  nothing at `…/batch`, so the per-chunk fallback after each round is what
+  keeps `docs/router-storage.md`'s publish-then-exit tier working. Don't drop it.
+- **Tier-2 probes** (`…/<algo>/have`, `<tree>/<id>/have`) reply with a size
+  that is a function of the *question*, never of the objects — that is the
+  whole reason tier 2 may have a probe at all under RFC 07 §3.
+- **Servers reply on their own key, not `query.key_expr()`.** Against a
+  concrete GET they are the same; against a wildcard-origin one the query names
+  every origin, so replying with it makes answers unattributable and
+  uncacheable.
+- **Large indices only** are sharded into the store and served as an
+  `IndexDescriptor`; small ones go whole. An index costs ~0.05–0.10% of its
+  payload, so a descriptor on every fetch would add a round trip for nothing.
+
+### Three things that are *not* bugs
+
+Each was proposed, investigated, and rejected on evidence. Don't re-litigate
+without new measurements.
+
+1. **An unknown id does not cost a query timeout** (~1 ms, measured; see
+   `an_unknown_id_fails_fast_not_on_the_timeout`). A Zenoh query finalizes when
+   its matching queryables complete, and completing without replying is
+   immediate. Silence is how a server says "not mine", and it is what lets
+   several servers share one prefix. No negative-reply message is needed.
+2. **Tier-1 availability is all-or-nothing by construction.** A bao slice
+   carries the sibling hashes proving it against the root, and those require
+   the whole blob — so a partial holder can serve no verified slice at all.
+   Having an in-flight push advertise its resume bitfield is the obvious
+   improvement and it is a lie. Partial possession is real on *tier 2*, and
+   that is what `StoreClient::probe` reports.
+3. **The default chunk size is measured, not chosen.** See
+   `DEFAULT_CHUNK_SIZE`'s doc table and `tests/chunk_size.rs`.
 
 ### Three facts the design relies on (from `lib.rs`)
 

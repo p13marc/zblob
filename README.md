@@ -21,7 +21,7 @@ Zenoh already gives you — multi-reply queryables, a reliable transport, and
 `CongestionControl::Block` backpressure — so you don't fork a file-sync tool to
 get it.
 
-## The integrity model (wire v2)
+## The integrity model (wire v3)
 
 A blob's identity is its **BLAKE3 bao root**. Every transfer chunk travels as a
 *bao slice*: the bytes plus the parent hashes proving them against that root.
@@ -34,7 +34,7 @@ root (`DownloadRequest::pinned`) and a server cannot substitute content at all.
 
 **Tier 1 — single blob.** One queryable serves every blob under a key prefix.
 A download is a manifest GET, then range-set slice GETs
-(`?v=2&ranges=0-5,9,12-20`): the client persists a chunk bitfield next to the
+(`?ranges=0-5,9,12-20`): the client persists a chunk bitfield next to the
 `.part` file and re-queries exactly its holes, so resume, retry, and
 arbitrary-hole fetch are the same code path. Memory stays `O(chunk_size)`
 regardless of blob size and arrival order.
