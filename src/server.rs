@@ -672,8 +672,25 @@ async fn serve_one(inner: &Inner, query: zenoh::query::Query) -> Result<()> {
         return Err(e);
     }
 
-    // Availability request: which chunks can this server serve? A registered
-    // blob is always complete here, but the protocol supports partial holders.
+    // Availability: which chunks can this server actually serve?
+    //
+    // All of them, and that is not a placeholder — it is the only answer tier 1
+    // can honestly give. A slice is a *bao* slice: the chunk's bytes plus the
+    // sibling hashes proving them against the root. Those siblings are hashes
+    // of other subtrees, so producing one requires the whole blob. A holder
+    // with part of a blob cannot serve any verified slice of it, which is why
+    // the outboard is computed at registration and at `finalize_push` — never
+    // from a partial spool.
+    //
+    // So partial holders are not expressible on tier 1, and an endpoint that
+    // claimed otherwise would advertise chunks no client could obtain. What
+    // this endpoint is genuinely for is *who has this blob at all*, which is
+    // what `BlobClient::download_striped` uses to spread a transfer.
+    //
+    // Tier 2 is where partial possession is real — a `ContentStore` holds
+    // whatever subset it holds, and each chunk is verified against its own
+    // address rather than against a whole-object root. That is what
+    // `StoreClient::probe` reports.
     if key_str.ends_with("/have") {
         let avail = Availability::full(chunks.count());
         query

@@ -528,6 +528,136 @@ impl BlobClient {
         result
     }
 
+    /// Download `req`, **striping** its chunks across the given holders.
+    ///
+    /// The ordinary [`download_to`](Self::download_to) asks one key expression
+    /// and takes whoever answers. With several replicas that is
+    /// multi-*responder* tolerance rather than multi-*source* transfer: reply
+    /// consolidation is off, so every matching holder sends every requested
+    /// slice and the client discards the duplicates — *after* they have
+    /// crossed the wire. Zenoh cannot cancel remote replies in flight, so N
+    /// replicas cost N times the bandwidth.
+    ///
+    /// This addresses each range to exactly one holder's concrete prefix, so
+    /// each range crosses the wire once. Holders that reported an
+    /// [`Availability`] only receive ranges they claim to have; stragglers at
+    /// the end are duplicated to a second holder, which is BitTorrent's
+    /// endgame and the standard answer to one slow peer holding up a transfer.
+    ///
+    /// Get `holders` from [`probe`](Self::probe). With fewer than two this
+    /// degrades to `download_to`, which is the right thing rather than an
+    /// error.
+    pub async fn download_striped(
+        &self,
+        req: &DownloadRequest,
+        dest: &Path,
+        holders: &[BlobProbe],
+        sink: &dyn ProgressSink,
+        cancel: &CancelToken,
+    ) -> Result<TransferStats> {
+        if holders.len() < 2 {
+            return self.download_to(req, dest, sink, cancel).await;
+        }
+        let guard = ActiveGuard::acquire(&self.active, dest)?;
+        let result = self
+            .download_striped_inner(req, dest, holders, sink, cancel)
+            .await;
+        drop(guard);
+        if let Err(e) = &result
+            && !matches!(e, BlobError::Cancelled { .. })
+        {
+            sink.emit(Progress::Failed {
+                error: e.to_string(),
+            });
+        }
+        result
+    }
+
+    async fn download_striped_inner(
+        &self,
+        req: &DownloadRequest,
+        dest: &Path,
+        holders: &[BlobProbe],
+        sink: &dyn ProgressSink,
+        cancel: &CancelToken,
+    ) -> Result<TransferStats> {
+        let started_at = tokio::time::Instant::now();
+        if self.cfg.overwrite == Overwrite::Refuse && tokio::fs::try_exists(dest).await? {
+            return Err(BlobError::DestinationExists(dest.to_path_buf()));
+        }
+        // Every holder must agree on the content, or "striping" would be
+        // splicing two different blobs together.
+        let manifest = holders[0].manifest.clone();
+        if let Some(expected) = req.expected_root
+            && manifest.root != expected
+        {
+            return Err(BlobError::RootMismatch {
+                expected,
+                actual: manifest.root,
+            });
+        }
+        if holders.iter().any(|h| h.manifest.root != manifest.root) {
+            return Err(BlobError::Protocol(
+                "holders disagree about this blob's root; probe again and pick one set".into(),
+            ));
+        }
+        let chunks = manifest.chunks()?;
+        let count = chunks.count();
+
+        if let Some(parent) = dest.parent()
+            && !parent.as_os_str().is_empty()
+        {
+            tokio::fs::create_dir_all(parent).await?;
+        }
+        let part = part_path(dest);
+        let existing_len = tokio::fs::metadata(&part).await.map(|m| m.len()).ok();
+        let mut state = match ResumeState::load(&part).await {
+            Some(s) if s.matches(&manifest, count) && existing_len == Some(manifest.total_len) => {
+                sink.emit(Progress::Resumed {
+                    received: s.received(),
+                    total: count,
+                });
+                s
+            }
+            _ => {
+                let file = tokio::fs::File::create(&part).await?;
+                file.set_len(manifest.total_len).await?;
+                let fresh = ResumeState::fresh(&manifest, count);
+                fresh.save_atomic(&part).await?;
+                sink.emit(Progress::Started {
+                    total_len: manifest.total_len,
+                    chunk_count: count,
+                });
+                fresh
+            }
+        };
+        let mut file = tokio::fs::OpenOptions::new()
+            .write(true)
+            .open(&part)
+            .await?;
+        let mut stats = TransferStats {
+            chunks_resumed: state.received(),
+            ..Default::default()
+        };
+        self.fill_holes_striped(
+            &manifest, &chunks, holders, &mut file, &mut state, &part, sink, cancel, &mut stats,
+        )
+        .await?;
+
+        file.sync_data().await?;
+        drop(file);
+        if self.cfg.overwrite == Overwrite::Refuse && tokio::fs::try_exists(dest).await? {
+            return Err(BlobError::DestinationExists(dest.to_path_buf()));
+        }
+        tokio::fs::rename(&part, dest).await?;
+        ResumeState::remove(&part).await;
+        sink.emit(Progress::Completed {
+            path: dest.to_path_buf(),
+        });
+        stats.elapsed = started_at.elapsed();
+        Ok(stats)
+    }
+
     /// Ask every responder which chunks of `id` it holds. Returns one
     /// [`Availability`] per reply — with replicated servers this is how a
     /// caller sees the swarm (with reply consolidation disabled, ordinary
@@ -1124,6 +1254,196 @@ impl BlobClient {
         Ok(())
     }
 
+    /// One striping round: partition the outstanding holes across holders,
+    /// query each holder for only its share, and write whatever verifies.
+    #[allow(clippy::too_many_arguments)]
+    async fn fill_holes_striped(
+        &self,
+        manifest: &Manifest,
+        chunks: &TransferChunks,
+        holders: &[BlobProbe],
+        file: &mut tokio::fs::File,
+        state: &mut ResumeState,
+        part: &Path,
+        sink: &dyn ProgressSink,
+        cancel: &CancelToken,
+        stats: &mut TransferStats,
+    ) -> Result<()> {
+        let count = chunks.count();
+        let root: blake3::Hash = manifest.root.into();
+        let total_len = manifest.total_len;
+        let mut bytes_received: u64 = (0..count)
+            .filter(|i| state.is_set(*i))
+            .map(|i| chunks.len_of(i) as u64)
+            .sum();
+        let mut no_progress = 0u32;
+        // Per-holder rejection tally: a peer that keeps sending unusable
+        // replies is dropped from the rotation rather than re-raced forever.
+        let mut rejects: Vec<u32> = vec![0; holders.len()];
+        let budget = manifest
+            .max_chunks_per_query()
+            .map_or(self.cfg.max_chunks_per_query, |served| {
+                self.cfg.max_chunks_per_query.min(served)
+            })
+            .max(1);
+
+        while !state.is_complete(count) {
+            if cancel.is_cancelled() {
+                return Self::persist_cancel(file, state, Some(part), sink, count).await;
+            }
+            let before = state.received();
+
+            // Which holders are still worth asking?
+            let live: Vec<usize> = (0..holders.len())
+                .filter(|i| rejects[*i] < self.cfg.retry.max_attempts.max(1) * 8)
+                .collect();
+            if live.is_empty() {
+                return Err(BlobError::Incomplete {
+                    received: state.received(),
+                    total: count,
+                });
+            }
+
+            // Deal the outstanding chunks out, round-robin, skipping a holder
+            // that says it does not have one. The last few are duplicated to a
+            // second holder — endgame mode: one slow peer must not hold up the
+            // tail of an otherwise finished transfer.
+            let missing: Vec<u32> = (0..count).filter(|i| !state.is_set(*i)).collect();
+            let endgame = missing.len() <= live.len().max(2) * 2;
+            let mut assignment: Vec<Vec<u32>> = vec![Vec::new(); holders.len()];
+            let mut cursor = 0usize;
+            for &idx in missing.iter().take(budget as usize * live.len()) {
+                let mut dealt = 0;
+                let copies = if endgame { 2.min(live.len()) } else { 1 };
+                while dealt < copies {
+                    let h = live[cursor % live.len()];
+                    cursor += 1;
+                    let claims = holders[h]
+                        .availability
+                        .as_ref()
+                        .is_none_or(|a| a.is_set(idx));
+                    if claims && assignment[h].len() < budget as usize {
+                        assignment[h].push(idx);
+                        dealt += 1;
+                    }
+                    // Give up on this chunk for this round if nobody claims it.
+                    if cursor.is_multiple_of(live.len()) && dealt == 0 {
+                        break;
+                    }
+                }
+            }
+
+            // Ask each holder for its share, concurrently; verified leaves come
+            // back over a channel so the file stays under one writer.
+            type Verified = (u32, Vec<(u64, Vec<u8>)>, usize, u32);
+            let (tx, mut rx) = tokio::sync::mpsc::channel::<Verified>(live.len() * 2);
+            let mut tasks = tokio::task::JoinSet::new();
+            for h in live.iter().copied() {
+                let indices = std::mem::take(&mut assignment[h]);
+                if indices.is_empty() {
+                    continue;
+                }
+                let ranges = coalesce(&indices);
+                let selector = slice_selector(holders[h].origin.as_str(), &manifest.id, &ranges);
+                let session = self.session.clone();
+                let timeout = self.cfg.query_timeout;
+                let priority = self.cfg.priority;
+                let chunks = *chunks;
+                let tx = tx.clone();
+                tasks.spawn(async move {
+                    let Ok(replies) = session
+                        .get(&selector)
+                        .consolidation(ConsolidationMode::None)
+                        .priority(priority)
+                        .timeout(timeout)
+                        .await
+                    else {
+                        return;
+                    };
+                    while let Ok(reply) = replies.recv_async().await {
+                        let Ok(sample) = reply.result() else { continue };
+                        if sample.encoding().to_string() != ENC_SLICE {
+                            continue;
+                        }
+                        let Some(index) = parse_slice_index(sample.key_expr().as_str()) else {
+                            continue;
+                        };
+                        let mut leaves: Vec<(u64, Vec<u8>)> = Vec::new();
+                        let ok = verify::decode_slice(
+                            &root,
+                            total_len,
+                            verify::chunk_range(chunks.byte_range(index)),
+                            &sample.payload().to_bytes(),
+                            |off, data| {
+                                leaves.push((off, data.to_vec()));
+                                Ok(())
+                            },
+                        )
+                        .is_ok();
+                        let msg = if ok {
+                            (index, leaves, h, 0)
+                        } else {
+                            (index, Vec::new(), h, 1)
+                        };
+                        if tx.send(msg).await.is_err() {
+                            return;
+                        }
+                    }
+                });
+            }
+            drop(tx);
+
+            while let Some((index, leaves, holder, rejected)) = rx.recv().await {
+                if rejected > 0 {
+                    rejects[holder] += rejected;
+                    stats.rejected += rejected;
+                    continue;
+                }
+                if index >= count || state.is_set(index) {
+                    continue; // an endgame duplicate that lost the race
+                }
+                for (off, data) in leaves {
+                    file.write_leaf(off, &data).await?;
+                }
+                if state.mark(index) {
+                    bytes_received += chunks.len_of(index) as u64;
+                    stats.chunks_fetched += 1;
+                    stats.bytes_fetched += chunks.len_of(index) as u64;
+                    sink.emit(Progress::Chunk {
+                        index,
+                        received: state.received(),
+                        total: count,
+                        bytes_received,
+                    });
+                }
+            }
+            tasks.shutdown().await;
+            stats.queries += live.len() as u64;
+            file.commit().await?;
+            state.save_atomic(part).await?;
+
+            if state.is_complete(count) {
+                break;
+            }
+            if state.received() == before {
+                no_progress += 1;
+                stats.retries += 1;
+                if no_progress >= self.cfg.retry.max_attempts {
+                    return Err(BlobError::Incomplete {
+                        received: state.received(),
+                        total: count,
+                    });
+                }
+                tokio::time::sleep(self.cfg.retry.backoff(no_progress - 1)).await;
+            } else {
+                no_progress = 0;
+            }
+        }
+        file.commit().await?;
+        state.save_atomic(part).await?;
+        Ok(())
+    }
+
     async fn persist_cancel<T: SliceTarget>(
         file: &mut T,
         state: &ResumeState,
@@ -1183,6 +1503,20 @@ where
         self.0.flush().await?;
         Ok(())
     }
+}
+
+/// Turn a sorted list of chunk indices into the coalesced half-open spans the
+/// `ranges` selector grammar wants.
+fn coalesce(indices: &[u32]) -> Vec<std::ops::Range<u32>> {
+    let mut out: Vec<std::ops::Range<u32>> = Vec::new();
+    for &i in indices {
+        match out.last_mut() {
+            Some(last) if last.end == i => last.end = i + 1,
+            _ => out.push(i..i + 1),
+        }
+    }
+    out.truncate(MAX_RANGE_SPANS);
+    out
 }
 
 /// RAII entry in a client's active-destination set.
