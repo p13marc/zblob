@@ -247,6 +247,49 @@ impl TreeIndex {
             .collect()
     }
 
+    /// The entry at `path`, if the snapshot has one.
+    ///
+    /// Paths are as the index spells them: relative, `/`-separated, no
+    /// leading slash. A snapshot's entries are ordered but not indexed, so
+    /// this is a linear scan — fine for a lookup, wrong for a loop over many
+    /// paths, which should build a map from [`entries`](Self::entries) once.
+    #[must_use]
+    pub fn entry(&self, path: &str) -> Option<&Entry> {
+        self.entries.iter().find(|e| e.path() == path)
+    }
+
+    /// Every entry, in depth-first order.
+    #[must_use]
+    pub fn entries(&self) -> &[Entry] {
+        &self.entries
+    }
+
+    /// The file entries only, as `(path, size, chunks)`.
+    ///
+    /// A caller wanting to know what a snapshot *contains* — to show it, to
+    /// diff it, to fetch one thing out of it — had to match `Entry` itself and
+    /// skip the four non-file variants.
+    pub fn files(&self) -> impl Iterator<Item = (&str, u64, &[ChunkRef])> {
+        self.entries.iter().filter_map(|e| match e {
+            Entry::File {
+                path, size, chunks, ..
+            } => Some((path.as_str(), *size, chunks.as_slice())),
+            _ => None,
+        })
+    }
+
+    /// The chunks making up the file at `path`, in order.
+    ///
+    /// `None` if there is no such entry or it is not a file. This is what
+    /// [`TreeClient::fetch_file`] fetches.
+    #[must_use]
+    pub fn file_chunks(&self, path: &str) -> Option<&[ChunkRef]> {
+        match self.entry(path)? {
+            Entry::File { chunks, .. } => Some(chunks),
+            _ => None,
+        }
+    }
+
     /// Total size in bytes of all file entries (the reconstructed tree's payload).
     pub fn total_size(&self) -> u64 {
         self.entries
@@ -937,6 +980,26 @@ impl TreeServer {
             .await
             .insert(index.id.clone(), Registered { index, sharded });
         Ok(())
+    }
+
+    /// The snapshot ids this server currently serves.
+    pub async fn registered(&self) -> Vec<BlobId> {
+        self.inner.index.read().await.keys().cloned().collect()
+    }
+
+    /// The index this server serves for `id`, if any.
+    pub async fn index(&self, id: &str) -> Option<TreeIndex> {
+        self.inner
+            .index
+            .read()
+            .await
+            .get(id)
+            .map(|r| r.index.clone())
+    }
+
+    /// Whether `id` is currently served.
+    pub async fn serves(&self, id: &str) -> bool {
+        self.inner.index.read().await.contains_key(id)
     }
 
     /// Drop a previously-registered snapshot index by id (e.g. on TTL expiry). The
@@ -1713,6 +1776,88 @@ impl TreeClient {
             sink: None,
             cancel: None,
         }
+    }
+
+    /// Fetch **one file** out of a snapshot, without materializing the tree.
+    ///
+    /// Resolves the index, looks `path` up in it, fetches only that file's
+    /// chunks (reusing anything `store` already holds, and putting what it
+    /// fetches back), and returns the assembled bytes.
+    ///
+    /// This is the capability a snapshot most obviously implies and did not
+    /// have: a caller wanting one config file out of a 4 GiB tree had to
+    /// download the whole tree to a scratch directory and read one path out of
+    /// it. Everything it needs already existed — the index knows the chunk
+    /// list, the store client knows how to fetch chunks — nothing joined them.
+    ///
+    /// Chunks are verified against their content address exactly as
+    /// [`download_tree`](Self::download_tree) verifies them, and `size` from
+    /// the index is enforced, so a peer cannot answer with more bytes than the
+    /// snapshot said the file has.
+    ///
+    /// # Errors
+    ///
+    /// [`BlobError::NotFound`] if the snapshot has no such path or the entry
+    /// is not a regular file.
+    pub async fn fetch_file(
+        &self,
+        req: &DownloadRequest,
+        path: &str,
+        store: &Arc<dyn ContentStore>,
+    ) -> Result<Vec<u8>> {
+        let index = self
+            .fetch_index_matching(&req.id, req.expected_root)
+            .await?;
+        let Some(chunks) = index.file_chunks(path) else {
+            return Err(BlobError::NotFound(format!(
+                "snapshot {:?} has no file at {path:?}",
+                index.id
+            )));
+        };
+        let size: u64 = chunks.iter().map(|c| u64::from(c.len)).sum();
+        if size > self.cfg.max_tree_bytes {
+            return Err(BlobError::InvalidManifest(format!(
+                "file {path:?} totals {size} bytes, over the configured limit of {}",
+                self.cfg.max_tree_bytes
+            )));
+        }
+
+        // Fetch what is missing into the store, then assemble from it. Going
+        // through the store rather than keeping fetched chunks in hand is what
+        // makes a second `fetch_file` over an overlapping file free, and what
+        // makes this share a cache with `download_tree`.
+        let wanted: Vec<ChunkRef> = chunks.to_vec();
+        self.fetch_missing(
+            &wanted,
+            store,
+            crate::client::NO_PROGRESS,
+            &CancelToken::new(),
+            wanted.len() as u32,
+        )
+        .await?;
+
+        let store = store.clone();
+        tokio::task::spawn_blocking(move || -> Result<Vec<u8>> {
+            let mut out = Vec::with_capacity(size as usize);
+            for c in &wanted {
+                let bytes = store
+                    .get(&c.hash)?
+                    .ok_or(BlobError::CorruptStore { hash: c.hash })?;
+                // The store is content-addressed, so this can only fail if the
+                // store itself is wrong — but the whole file is assembled from
+                // it, so checking here is what keeps that from becoming the
+                // caller's problem silently.
+                if bytes.len() as u32 != c.len {
+                    return Err(BlobError::ChunkLengthMismatch {
+                        expected: c.len,
+                        actual: bytes.len() as u32,
+                    });
+                }
+                out.extend_from_slice(&bytes);
+            }
+            Ok(out)
+        })
+        .await?
     }
 
     async fn run_download_tree(

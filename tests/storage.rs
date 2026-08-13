@@ -17,7 +17,7 @@ use std::time::Duration;
 
 use common::{isolated_config, unique_prefix};
 use zblob::{
-    CdcParams, ContentStore, DownloadRequest, MemoryStore, TreeClient, build_tree, publish_snapshot,
+    CdcParams, ContentStore, DownloadRequest, MemoryStore, Publisher, TreeClient, build_tree,
 };
 
 /// A minimal stand-in for `zenoh-plugin-storage-manager`: retain PUTs on a key
@@ -87,20 +87,15 @@ async fn publish_to_storage_then_download_without_server() {
 
     // The settle phase inside publish_snapshot read-backs the index + sampled
     // chunks — when it returns Ok, a client can fetch immediately (no sleeps).
-    publish_snapshot(
-        &session,
-        &common::serve(store_prefix.clone()),
-        &common::serve(tree_prefix.clone()),
-        &index,
-        &producer_store,
-        zblob::ChunkCompression::default(),
+    Publisher::new(&session, common::serve(store_prefix.clone()))
+        .snapshots(common::serve(tree_prefix.clone()))
         // Every chunk, not a sample: the point of this test is that the
         // producer can exit and the snapshot is genuinely retrievable.
-        zblob::SettleCoverage::All,
-        Duration::from_secs(10),
-    )
-    .await
-    .expect("publish snapshot");
+        .coverage(zblob::SettleCoverage::All)
+        .settle(Duration::from_secs(10))
+        .publish(&index, &producer_store)
+        .await
+        .expect("publish snapshot");
 
     // The producer is "gone": only the storage answers from here on.
     let client_dir = tempfile::tempdir().unwrap();
@@ -169,18 +164,13 @@ async fn publish_snapshot_exports_only_the_snapshot() {
     std::fs::write(private_src.path().join("private.bin"), &secret).unwrap();
     let private = build_tree(private_src.path(), "private", &cdc, &producer_store).unwrap();
 
-    publish_snapshot(
-        &session,
-        &common::serve(store_prefix.clone()),
-        &common::serve(tree_prefix.clone()),
-        &published,
-        &producer_store,
-        zblob::ChunkCompression::default(),
-        zblob::SettleCoverage::All,
-        Duration::from_secs(10),
-    )
-    .await
-    .expect("publish snapshot");
+    Publisher::new(&session, common::serve(store_prefix.clone()))
+        .snapshots(common::serve(tree_prefix.clone()))
+        .coverage(zblob::SettleCoverage::All)
+        .settle(Duration::from_secs(10))
+        .publish(&published, &producer_store)
+        .await
+        .expect("publish snapshot");
 
     // The published snapshot's chunks are in the storage (discriminating
     // power: without this, the assertion below would hold for an empty

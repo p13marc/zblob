@@ -110,10 +110,7 @@ pub use manifest::{BlobSpec, Manifest};
 pub use obs::TransferStats;
 pub use prefix::{QueryPrefix, ServePrefix};
 pub use progress::{Progress, ProgressSink};
-pub use publish::{
-    SettleCoverage, publish_chunk, publish_index, publish_snapshot, publish_snapshot_chunks,
-    publish_store,
-};
+pub use publish::{Publisher, SettleCoverage, SnapshotPublisher};
 pub use server::{
     BlobServer, BlobServerBuilder, BlobSource, ErrorCallback, FileBlobSource, MemoryBlobSource,
     PushConfig, PushPolicy, ReadAtSize, ServerHandle, SourceFingerprint,

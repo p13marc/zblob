@@ -588,6 +588,35 @@ impl BlobServer {
         Ok(manifest)
     }
 
+    /// The ids this server currently serves.
+    ///
+    /// A server was write-only: you could register and unregister, and had no
+    /// way to ask what it held — so every caller that needed to answer "is
+    /// this still served?" kept a shadow copy of the registry and hoped it
+    /// stayed in step.
+    pub async fn registered(&self) -> Vec<BlobId> {
+        self.inner.registry.read().await.keys().cloned().collect()
+    }
+
+    /// The manifest this server serves for `id`, if any.
+    ///
+    /// The same value a client would get from a manifest GET, without the
+    /// round trip — useful to a producer that wants to publish `(id, root)`
+    /// after registering.
+    pub async fn manifest(&self, id: &str) -> Option<Manifest> {
+        self.inner
+            .registry
+            .read()
+            .await
+            .get(id)
+            .map(|r| r.manifest.clone())
+    }
+
+    /// Whether `id` is currently served.
+    pub async fn serves(&self, id: &str) -> bool {
+        self.inner.registry.read().await.contains_key(id)
+    }
+
     /// Stop serving blob `id` (e.g. after its TTL expires).
     pub async fn unregister(&self, id: &str) {
         self.inner.registry.write().await.remove(id);

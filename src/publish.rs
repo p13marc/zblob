@@ -13,7 +13,7 @@
 //!
 //! **Durability caveat**: a resolved `put` means the sample was handed to the
 //! transport, *not* that a storage retained it — and index/chunk keys may land
-//! on different storages with no ordering guarantee. [`publish_snapshot`]
+//! on different storages with no ordering guarantee. [`SnapshotPublisher::publish`]
 //! therefore finishes with a **read-back settle phase**: it GETs the index and
 //! a sample of chunk keys until they answer (or `settle` expires), so "publish
 //! returned Ok" means "a client can fetch this now".
@@ -39,7 +39,7 @@ use crate::{store_key, tree_key};
 /// in the self-describing container frame (`0x00` + raw bytes, or a zstd
 /// frame when `compression` says so) — the same framing `TreeServer` puts on
 /// the wire. Idempotent — re-PUTting an identical chunk is a no-op.
-pub async fn publish_chunk(
+async fn publish_chunk(
     session: &zenoh::Session,
     store_prefix: &ServePrefix,
     hash: &Hash,
@@ -70,7 +70,7 @@ pub async fn publish_chunk(
 /// Scoped to the snapshot, not to the store: a store commonly holds chunks
 /// from other snapshots — and, on a shared machine, other tenants' — while the
 /// storage being published into is typically fleet-wide.
-pub async fn publish_snapshot_chunks(
+async fn publish_snapshot_chunks(
     session: &zenoh::Session,
     store_prefix: &ServePrefix,
     index: &TreeIndex,
@@ -91,10 +91,10 @@ pub async fn publish_snapshot_chunks(
 /// published. Stops at the first PUT error.
 ///
 /// This publishes whatever the store happens to hold, which is rarely what a
-/// snapshot publisher wants — prefer [`publish_snapshot_chunks`]. It stays for
+/// snapshot publisher wants — prefer [`SnapshotPublisher::chunks_for`]. It stays for
 /// the case where a store *is* the unit being replicated (mirroring a whole
 /// content store to a router).
-pub async fn publish_store(
+async fn publish_store(
     session: &zenoh::Session,
     store_prefix: &ServePrefix,
     store: &Arc<dyn ContentStore>,
@@ -145,7 +145,7 @@ async fn publish_hashes(
 /// PUT a tree index into the storage at `<tree_prefix>/<id>`. A
 /// [`crate::TreeClient`] with the matching `tree_prefix` then GETs it like any
 /// other index.
-pub async fn publish_index(
+async fn publish_index(
     session: &zenoh::Session,
     tree_prefix: &ServePrefix,
     index: &TreeIndex,
@@ -170,6 +170,7 @@ pub async fn publish_index(
 /// test for *did the storage receive anything at all*; it cannot detect
 /// individual losses in between.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum SettleCoverage {
     /// Probe the index plus at most `n` chunk keys, spread deterministically
     /// across the snapshot (first, last, and an even stride between).
@@ -199,7 +200,7 @@ impl Default for SettleCoverage {
 /// [`SettleCoverage::All`] when the producer is about to exit and the
 /// snapshot has to be there.
 #[allow(clippy::too_many_arguments)]
-pub async fn publish_snapshot(
+async fn publish_snapshot(
     session: &zenoh::Session,
     store_prefix: &ServePrefix,
     tree_prefix: &ServePrefix,
@@ -268,4 +269,190 @@ async fn probe_key(session: &zenoh::Session, key: &str) -> Result<bool> {
         }
     }
     Ok(false)
+}
+
+/// Publishes content-addressed chunks into a storage under one prefix.
+///
+/// The five `publish_*` free functions this replaces shared four parameters
+/// and differed by one, and the widest of them took **eight** — session,
+/// two prefixes, index, store, compression, coverage and settle — in an
+/// order nothing but the compiler could keep straight. A publisher is
+/// configured once and then asked to publish things.
+///
+/// A `Publisher` alone can only publish chunks. Publishing a *snapshot* also
+/// needs a tree prefix, so [`snapshots`](Self::snapshots) produces a
+/// [`SnapshotPublisher`] that has one — rather than an optional field that
+/// makes `publish` fail at runtime on a publisher that could never have
+/// worked.
+#[derive(Debug, Clone)]
+pub struct Publisher {
+    session: zenoh::Session,
+    store_prefix: ServePrefix,
+    compression: ChunkCompression,
+}
+
+impl Publisher {
+    /// A publisher writing chunks under `store_prefix`, uncompressed.
+    #[must_use]
+    pub fn new(session: &zenoh::Session, store_prefix: ServePrefix) -> Self {
+        Publisher {
+            session: session.clone(),
+            store_prefix,
+            compression: ChunkCompression::default(),
+        }
+    }
+
+    /// Compress chunks at rest with `compression` (default: none).
+    ///
+    /// Chunks are self-describing containers, so a reader handles either.
+    #[must_use]
+    pub fn compression(mut self, compression: ChunkCompression) -> Self {
+        self.compression = compression;
+        self
+    }
+
+    /// Also publish tree indices, under `tree_prefix`.
+    #[must_use]
+    pub fn snapshots(self, tree_prefix: ServePrefix) -> SnapshotPublisher {
+        SnapshotPublisher {
+            chunks: self,
+            tree_prefix,
+            coverage: SettleCoverage::default(),
+            settle: Duration::from_secs(10),
+        }
+    }
+
+    /// The prefix chunks are published under.
+    #[must_use]
+    pub fn store_prefix(&self) -> &ServePrefix {
+        &self.store_prefix
+    }
+
+    /// PUT one chunk. Idempotent — re-PUTting identical bytes is a no-op.
+    pub async fn chunk(&self, hash: &Hash, bytes: &[u8]) -> Result<()> {
+        publish_chunk(
+            &self.session,
+            &self.store_prefix,
+            hash,
+            bytes,
+            self.compression,
+        )
+        .await
+    }
+
+    /// PUT the named chunks out of `store`. Returns how many were published;
+    /// a hash the store does not hold is skipped.
+    pub async fn chunks(&self, hashes: &[Hash], store: &Arc<dyn ContentStore>) -> Result<u32> {
+        publish_hashes(
+            &self.session,
+            &self.store_prefix,
+            hashes,
+            store,
+            self.compression,
+        )
+        .await
+    }
+
+    /// PUT **every** chunk in `store`. Returns how many were published.
+    ///
+    /// This publishes whatever the store happens to hold, which is rarely
+    /// what a snapshot publisher wants — prefer
+    /// [`SnapshotPublisher::chunks_for`]. It stays for the case where a store
+    /// *is* the unit being replicated (mirroring a whole content store to a
+    /// router).
+    pub async fn store(&self, store: &Arc<dyn ContentStore>) -> Result<u32> {
+        publish_store(&self.session, &self.store_prefix, store, self.compression).await
+    }
+}
+
+/// A [`Publisher`] that also publishes tree indices — see
+/// [`Publisher::snapshots`].
+///
+/// Derefs to `Publisher`, so the chunk methods are all available here too.
+#[derive(Debug, Clone)]
+pub struct SnapshotPublisher {
+    chunks: Publisher,
+    tree_prefix: ServePrefix,
+    coverage: SettleCoverage,
+    settle: Duration,
+}
+
+impl std::ops::Deref for SnapshotPublisher {
+    type Target = Publisher;
+    fn deref(&self) -> &Publisher {
+        &self.chunks
+    }
+}
+
+impl SnapshotPublisher {
+    /// How much of a published snapshot [`publish`](Self::publish) reads back
+    /// (default: [`SettleCoverage::Sample(8)`](SettleCoverage::Sample)).
+    #[must_use]
+    pub fn coverage(mut self, coverage: SettleCoverage) -> Self {
+        self.coverage = coverage;
+        self
+    }
+
+    /// How long [`publish`](Self::publish) waits for the read-back to settle
+    /// (default: 10 s).
+    #[must_use]
+    pub fn settle(mut self, settle: Duration) -> Self {
+        self.settle = settle;
+        self
+    }
+
+    /// The prefix indices are published under.
+    #[must_use]
+    pub fn tree_prefix(&self) -> &ServePrefix {
+        &self.tree_prefix
+    }
+
+    /// PUT a tree index at `<tree_prefix>/<id>`, without its chunks. A
+    /// [`crate::TreeClient`] with the matching prefix then GETs it like any
+    /// other index.
+    pub async fn index(&self, index: &TreeIndex) -> Result<()> {
+        publish_index(&self.chunks.session, &self.tree_prefix, index).await
+    }
+
+    /// PUT exactly the chunks `index` references (not the whole store).
+    /// Returns how many were published.
+    pub async fn chunks_for(
+        &self,
+        index: &TreeIndex,
+        store: &Arc<dyn ContentStore>,
+    ) -> Result<u32> {
+        publish_snapshot_chunks(
+            &self.chunks.session,
+            &self.chunks.store_prefix,
+            index,
+            store,
+            self.chunks.compression,
+        )
+        .await
+    }
+
+    /// Publish a whole snapshot — chunks then index — then **verify by
+    /// reading back** (see the module docs) within the settle budget. After
+    /// this resolves the producer may exit.
+    ///
+    /// Note what the read-back can and cannot tell you. Any responder counts,
+    /// so a `TreeServer` running on the same prefix answers the probes and the
+    /// phase reports success without a storage having retained anything —
+    /// which is easy to arrange accidentally in development. And under
+    /// [`SettleCoverage::Sample`] the unprobed chunks are simply unknown. Use
+    /// [`SettleCoverage::All`] when the producer is about to exit and the
+    /// snapshot has to be there.
+    pub async fn publish(&self, index: &TreeIndex, store: &Arc<dyn ContentStore>) -> Result<()> {
+        publish_snapshot(
+            &self.chunks.session,
+            &self.chunks.store_prefix,
+            &self.tree_prefix,
+            index,
+            store,
+            self.chunks.compression,
+            self.coverage,
+            self.settle,
+        )
+        .await
+    }
 }

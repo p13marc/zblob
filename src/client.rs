@@ -38,6 +38,7 @@ use crate::{
 
 /// What to do when the destination path already exists at completion time.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[non_exhaustive]
 pub enum Overwrite {
     /// Fail with [`BlobError::DestinationExists`]. The default.
     ///
@@ -163,6 +164,7 @@ impl DownloadRequest {
 
 /// Where a staged download landed, from [`BlobClient::download_staged`].
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub struct Staged {
     /// The file, named by the blob's id inside the directory you gave.
     pub path: PathBuf,
@@ -179,6 +181,7 @@ pub struct Staged {
 
 /// What one origin said about a blob, from [`BlobClient::probe`].
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub struct BlobProbe {
     /// The prefix that answered — pass it to a [`BlobClient`] to fetch from
     /// this holder specifically.

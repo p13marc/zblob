@@ -94,6 +94,43 @@ pub struct TransferStats {
     pub elapsed: Duration,
 }
 
+/// Adding stats sums every counter and the elapsed time.
+///
+/// A caller that fetches a snapshot in several calls — a resume, or a tree
+/// download after a probe — has no other way to report the whole operation,
+/// and was left summing seven fields by hand.
+impl std::ops::AddAssign<&TransferStats> for TransferStats {
+    fn add_assign(&mut self, rhs: &TransferStats) {
+        self.bytes_fetched += rhs.bytes_fetched;
+        self.chunks_fetched += rhs.chunks_fetched;
+        self.chunks_resumed += rhs.chunks_resumed;
+        self.rejected += rhs.rejected;
+        self.retries += rhs.retries;
+        self.queries += rhs.queries;
+        self.elapsed += rhs.elapsed;
+    }
+}
+
+impl std::ops::AddAssign for TransferStats {
+    fn add_assign(&mut self, rhs: TransferStats) {
+        *self += &rhs;
+    }
+}
+
+impl std::ops::Add for TransferStats {
+    type Output = TransferStats;
+    fn add(mut self, rhs: TransferStats) -> TransferStats {
+        self += &rhs;
+        self
+    }
+}
+
+impl std::iter::Sum for TransferStats {
+    fn sum<I: Iterator<Item = TransferStats>>(iter: I) -> TransferStats {
+        iter.fold(TransferStats::default(), |acc, s| acc + s)
+    }
+}
+
 impl TransferStats {
     /// Average fetch throughput in bytes/second (0 if nothing was fetched).
     pub fn throughput_bps(&self) -> u64 {

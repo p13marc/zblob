@@ -273,3 +273,152 @@ fn chunk_containers_round_trip_through_the_public_api() {
     assert!(zblob::unframe_chunk(&[0xEE, 1, 2, 3]).is_err());
     assert!(zblob::unframe_chunk(&[]).is_err());
 }
+
+/// One file out of a snapshot, without materializing the tree.
+///
+/// The capability a snapshot most obviously implies and did not have: a
+/// caller wanting one config file out of a large tree had to download the
+/// whole thing to a scratch directory and read one path out of it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn fetch_file_pulls_one_path_and_only_its_chunks() {
+    use zblob::TreeClient;
+
+    let session = open_session().await;
+    let store_prefix = unique_prefix();
+    let tree_prefix = unique_prefix();
+
+    // Three files; only the middle one is asked for.
+    let src = tempfile::tempdir().unwrap();
+    let wanted = common::pseudo_random(40_000, 11);
+    let bulk_a = common::pseudo_random(200_000, 12);
+    let bulk_b = common::pseudo_random(200_000, 13);
+    std::fs::create_dir(src.path().join("etc")).unwrap();
+    std::fs::write(src.path().join("etc/app.conf"), &wanted).unwrap();
+    std::fs::write(src.path().join("big-a.bin"), &bulk_a).unwrap();
+    std::fs::write(src.path().join("big-b.bin"), &bulk_b).unwrap();
+
+    let cdc = small_cdc();
+    let producer: Arc<dyn ContentStore> = Arc::new(MemoryStore::new());
+    let index = build_tree(src.path(), "snap", &cdc, &producer).unwrap();
+    let expected_root = index.root_hash;
+
+    // The index alone answers "what is in here" — no fetching involved.
+    let paths: Vec<&str> = index.files().map(|(p, _, _)| p).collect();
+    assert!(paths.contains(&"etc/app.conf"), "index lists {paths:?}");
+    let (_, listed_size, listed_chunks) = index
+        .files()
+        .find(|(p, _, _)| *p == "etc/app.conf")
+        .expect("the file must be listed");
+    assert_eq!(listed_size, wanted.len() as u64);
+    assert_eq!(listed_chunks, index.file_chunks("etc/app.conf").unwrap());
+    assert!(
+        index.file_chunks("etc").is_none(),
+        "a directory is not a file"
+    );
+    assert!(index.file_chunks("nope").is_none());
+
+    let server = TreeServer::new(
+        &session,
+        common::serve(store_prefix.clone()),
+        common::serve(tree_prefix.clone()),
+        producer.clone(),
+    );
+    server.register(index.clone()).await.unwrap();
+    let handle = server.spawn().await.unwrap();
+
+    let consumer: Arc<dyn ContentStore> = Arc::new(MemoryStore::new());
+    let client = TreeClient::new(
+        &session,
+        common::query(&store_prefix),
+        common::query(&tree_prefix),
+    );
+
+    let got = client
+        .fetch_file(
+            &DownloadRequest::pinned("snap", expected_root),
+            "etc/app.conf",
+            &consumer,
+        )
+        .await
+        .expect("fetch one file");
+    assert_eq!(got, wanted, "wrong bytes");
+
+    // Only that file's chunks were pulled: the two 200 KB files are absent
+    // from the consumer's store. Without this the test would pass against an
+    // implementation that fetched the whole snapshot.
+    let held = consumer.hashes().unwrap();
+    let wanted_chunks = index.file_chunks("etc/app.conf").unwrap().len();
+    assert_eq!(
+        held.len(),
+        wanted_chunks,
+        "expected exactly the file's {wanted_chunks} chunks, got {}",
+        held.len()
+    );
+    let all = index.needed_chunks().len();
+    assert!(
+        all > wanted_chunks * 2,
+        "fixture must have far more chunks than the fetched file ({all} vs {wanted_chunks})"
+    );
+
+    // A second fetch of the same file is served entirely from the store.
+    let again = client
+        .fetch_file(
+            &DownloadRequest::pinned("snap", expected_root),
+            "etc/app.conf",
+            &consumer,
+        )
+        .await
+        .unwrap();
+    assert_eq!(again, wanted);
+
+    // A path the snapshot does not have is NotFound, not a hang or a panic.
+    let err = client
+        .fetch_file(&DownloadRequest::new("snap"), "etc/absent.conf", &consumer)
+        .await
+        .unwrap_err();
+    assert!(matches!(err, zblob::BlobError::NotFound(_)), "{err}");
+
+    handle.shutdown().await.unwrap();
+    session.close().await.unwrap();
+}
+
+/// A server can be asked what it serves. It used to be write-only, so every
+/// caller needing this kept a shadow copy of the registry.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn servers_report_what_they_serve() {
+    let session = open_session().await;
+    let prefix = unique_prefix();
+
+    let server = BlobServer::new(&session, common::serve(prefix.clone()));
+    assert!(server.registered().await.is_empty());
+    assert!(!server.serves("art-1").await);
+    assert!(server.manifest("art-1").await.is_none());
+
+    let manifest = server
+        .register_source(
+            BlobSpec::new("art-1").chunk_size(MIN_CHUNK_SIZE),
+            Arc::new(MemoryBlobSource::new(common::pseudo_random(8192, 20))),
+        )
+        .await
+        .unwrap();
+
+    assert!(server.serves("art-1").await);
+    assert_eq!(
+        server
+            .registered()
+            .await
+            .iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>(),
+        vec!["art-1".to_string()]
+    );
+    // The accessor agrees with what a client would fetch — that is the point
+    // of it, so it must not be a differently-derived value.
+    assert_eq!(server.manifest("art-1").await.unwrap(), manifest);
+
+    server.unregister("art-1").await;
+    assert!(!server.serves("art-1").await);
+    assert!(server.registered().await.is_empty());
+
+    session.close().await.unwrap();
+}
