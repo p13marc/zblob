@@ -8,10 +8,10 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use common::{content_hash, open_session, pseudo_random, unique_prefix};
+use zblob::keys::{manifest_key, parse_ranges, slice_key};
 use zblob::{
     BlobClient, BlobError, BlobId, BlobServer, BlobSpec, CancelToken, DownloadRequest,
-    MIN_CHUNK_SIZE, MemoryBlobSource, Progress, ProgressSink, RetryPolicy, manifest_key,
-    parse_ranges, slice_key,
+    MIN_CHUNK_SIZE, MemoryBlobSource, Progress, ProgressSink, RetryPolicy,
     wire::{ENC_MANIFEST, ENC_SLICE, encode},
 };
 

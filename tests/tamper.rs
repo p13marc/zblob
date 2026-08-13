@@ -10,9 +10,10 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use common::{open_session, pseudo_random, unique_prefix};
+use zblob::keys::{manifest_key, parse_ranges, slice_key};
 use zblob::{
     BlobClient, BlobError, BlobId, BlobServer, BlobSpec, DownloadRequest, Hash, MIN_CHUNK_SIZE,
-    MemoryBlobSource, RetryPolicy, manifest_key, parse_ranges, slice_key,
+    MemoryBlobSource, RetryPolicy,
     wire::{ENC_MANIFEST, ENC_SLICE, encode},
 };
 

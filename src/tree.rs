@@ -44,6 +44,7 @@ use crate::compress::{ChunkCompression, pack};
 use crate::error::{BlobError, Result};
 use crate::hash::{Hash, HashAlgo};
 use crate::id::BlobId;
+use crate::keys::{store_key, tree_key};
 use crate::obs::{TransferStats, zdebug};
 use crate::paths::{
     assert_parent_within, create_dir_confined, sanitize_rel_path, sanitize_symlink_target,
@@ -53,7 +54,6 @@ use crate::progress::{Progress, ProgressSink};
 use crate::server::{ErrorCallback, FifoQueryable, ServerHandle, report_error};
 use crate::store::ContentStore;
 use crate::wire::{ENC_CHUNK, ENC_INDEX, WIRE_VERSION, decode, encode};
-use crate::{store_key, tree_key};
 
 /// A reference to one content-addressed chunk.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -1085,18 +1085,18 @@ impl TreeServer {
 
 async fn serve_chunk_query(inner: &TreeInner, query: zenoh::query::Query) -> Result<()> {
     let key = query.key_expr().as_str().to_string();
-    let Some(tail) = crate::parse_tier2_tail(inner.store_prefix.as_str(), &key) else {
-        return Ok(()); // not one of our keys; ignore.
-    };
-    let [algo, last] = tail[..] else {
+    // Not one of our keys, or not the `<algo>/<x>` shape a store key has.
+    let Some(crate::keys::Tier2Tail::Two(algo, last)) =
+        crate::keys::parse_tier2_tail(inner.store_prefix.as_str(), &key)
+    else {
         return Ok(());
     };
     if algo != Hash::ALGO {
         return Ok(()); // foreign algorithm; not ours to answer.
     }
     match last {
-        crate::STORE_BATCH => serve_chunk_batch(inner, query).await,
-        crate::STORE_HAVE => serve_chunk_probe(inner, query).await,
+        crate::keys::STORE_BATCH => serve_chunk_batch(inner, query).await,
+        crate::keys::STORE_HAVE => serve_chunk_probe(inner, query).await,
         hex => {
             let Ok(hash) = hex.parse::<Hash>() else {
                 return Ok(()); // not a chunk address; ignore.
@@ -1237,7 +1237,7 @@ async fn serve_chunk_probe(inner: &TreeInner, query: zenoh::query::Query) -> Res
     query
         // Our own key: a probe exists to be attributed (see the chunk reply).
         .reply(
-            crate::store_have_key(inner.store_prefix.as_str(), HashAlgo::Blake3),
+            crate::keys::store_have_key(inner.store_prefix.as_str(), HashAlgo::Blake3),
             encode(&bits)?,
         )
         .encoding(&crate::wire::ENC_HAVEBITS)
@@ -1248,14 +1248,16 @@ async fn serve_chunk_probe(inner: &TreeInner, query: zenoh::query::Query) -> Res
 
 async fn serve_index_query(inner: &TreeInner, query: zenoh::query::Query) -> Result<()> {
     let key = query.key_expr().as_str().to_string();
-    let Some(tail) = crate::parse_tier2_tail(inner.tree_prefix.as_str(), &key) else {
+    let Some(tail) = crate::keys::parse_tier2_tail(inner.tree_prefix.as_str(), &key) else {
         return Ok(());
     };
-    let id = match tail[..] {
-        [id] => id,
+    let id = match tail {
+        crate::keys::Tier2Tail::One(id) => id,
         // `<tree_prefix>/<id>/have`: how much of this snapshot do you have?
-        [id, crate::STORE_HAVE] => return serve_tree_probe(inner, &query, id).await,
-        _ => return Ok(()),
+        crate::keys::Tier2Tail::Two(id, crate::keys::STORE_HAVE) => {
+            return serve_tree_probe(inner, &query, id).await;
+        }
+        crate::keys::Tier2Tail::Two(..) => return Ok(()),
     };
     let (payload, encoding) = {
         let registry = inner.index.read().await;
@@ -1316,7 +1318,7 @@ async fn serve_tree_probe(inner: &TreeInner, query: &zenoh::query::Query, id: &s
     query
         // Our own key, so a wildcard-origin probe can attribute the answer.
         .reply(
-            crate::tree_have_key(inner.tree_prefix.as_str(), id),
+            crate::keys::tree_have_key(inner.tree_prefix.as_str(), id),
             encode(&probe)?,
         )
         .encoding(&crate::wire::ENC_TREEPROBE)
@@ -1608,7 +1610,7 @@ impl TreeClient {
         let id = id.as_str();
         let replies = self
             .session
-            .get(crate::tree_have_key(self.tree_prefix.as_str(), id))
+            .get(crate::keys::tree_have_key(self.tree_prefix.as_str(), id))
             .consolidation(ConsolidationMode::None)
             .priority(self.cfg.priority)
             .timeout(self.cfg.query_timeout)
@@ -1630,7 +1632,7 @@ impl TreeClient {
             let Some(origin) = sample
                 .key_expr()
                 .as_str()
-                .strip_suffix(crate::STORE_HAVE)
+                .strip_suffix(crate::keys::STORE_HAVE)
                 .and_then(|k| k.strip_suffix('/'))
                 .and_then(|k| k.strip_suffix(id))
                 .and_then(|k| k.strip_suffix('/'))

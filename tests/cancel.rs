@@ -144,8 +144,9 @@ async fn delete_partial_clears_state() {
 /// can only be the token.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn cancel_is_observed_while_stalled_on_a_silent_peer() {
+    use zblob::Manifest;
+    use zblob::keys::manifest_key;
     use zblob::wire::{self, ENC_MANIFEST};
-    use zblob::{Manifest, manifest_key};
 
     let session = open_session().await;
     let prefix = unique_prefix();

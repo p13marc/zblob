@@ -16,8 +16,8 @@
 //!   content is verified against a root regardless of who answers.
 //!
 //! Both refuse `**`. That is not style: ids and tails are resolved
-//! *positionally* ([`parse_id`](crate::parse_id),
-//! [`parse_tier2_tail`](crate::parse_tier2_tail)), and `**` spans an unknown
+//! *positionally* ([`parse_id`](crate::keys::parse_id),
+//! [`parse_tier2_tail`](crate::keys::parse_tier2_tail)), and `**` spans an unknown
 //! number of segments, so no server could ever locate the id inside such a
 //! query. Allowing it would be a promise the protocol cannot keep — and it
 //! previously *was* allowed on one path, where it silently failed.
@@ -241,7 +241,7 @@ mod tests {
                 "{span:?} must not be servable"
             );
             assert_eq!(
-                crate::parse_id(span, &format!("{span}/A/manifest")),
+                crate::keys::parse_id(span, &format!("{span}/A/manifest")),
                 None,
                 "parse_id must not resolve an id past '**'"
             );

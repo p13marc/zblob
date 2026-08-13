@@ -23,8 +23,8 @@ use zenoh::query::ConsolidationMode;
 use crate::compress::{MAX_UNPACKED, unpack};
 use crate::error::{BlobError, Result};
 use crate::hash::{Hash, HashAlgo};
+use crate::keys::store_key;
 use crate::prefix::QueryPrefix;
-use crate::store_key;
 use crate::tree::ChunkRef;
 use crate::wire::ENC_CHUNK;
 use crate::wire::{HaveBits, WantList};
@@ -218,7 +218,7 @@ impl StoreClient {
                 // The reply key is `<origin>/<algo>/have`; the origin is what
                 // a caller needs in order to fetch from this holder.
                 let Some(origin) = key
-                    .strip_suffix(crate::STORE_HAVE)
+                    .strip_suffix(crate::keys::STORE_HAVE)
                     .and_then(|k| k.strip_suffix('/'))
                     .and_then(|k| k.strip_suffix(Hash::ALGO))
                     .and_then(|k| k.strip_suffix('/'))
@@ -288,7 +288,7 @@ pub(crate) async fn batch_query(
         wanted.iter().map(|c| (c.hash, c.len)).collect();
     let want = WantList::new(wanted.iter().map(|c| c.hash).collect());
     let replies = session
-        .get(crate::store_batch_key(store_prefix, HashAlgo::Blake3))
+        .get(crate::keys::store_batch_key(store_prefix, HashAlgo::Blake3))
         .payload(crate::wire::encode(&want)?)
         // The replies land on each chunk's own key, which does not intersect
         // this one. Without this the *server* refuses them, once per chunk.
@@ -316,8 +316,11 @@ pub(crate) fn accept_batch_reply(
     if !ENC_CHUNK.matches(sample.encoding()) {
         return None;
     }
-    let tail = crate::parse_tier2_tail(store_prefix, sample.key_expr().as_str())?;
-    let [algo, hex] = tail[..] else { return None };
+    let crate::keys::Tier2Tail::Two(algo, hex) =
+        crate::keys::parse_tier2_tail(store_prefix, sample.key_expr().as_str())?
+    else {
+        return None;
+    };
     if algo != Hash::ALGO {
         return None;
     }
@@ -348,7 +351,7 @@ pub(crate) async fn probe_chunks(
     }
     let want = WantList::new(hashes.to_vec());
     let replies = session
-        .get(crate::store_have_key(store_prefix, HashAlgo::Blake3))
+        .get(crate::keys::store_have_key(store_prefix, HashAlgo::Blake3))
         .payload(crate::wire::encode(&want)?)
         .consolidation(ConsolidationMode::None)
         .priority(priority)

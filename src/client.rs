@@ -25,16 +25,16 @@ use crate::chunk::{MIN_CHUNK_SIZE, TransferChunks};
 use crate::error::{BlobError, Result};
 use crate::hash::Hash;
 use crate::id::BlobId;
+use crate::keys::{
+    MAX_RANGE_SPANS, availability_key, manifest_key, push_offer_key, push_slice_key, slice_selector,
+};
 use crate::manifest::{BlobSpec, Manifest, validate_id};
 use crate::obs::{TransferStats, zdebug};
 use crate::prefix::QueryPrefix;
 use crate::progress::{Progress, ProgressSink};
 use crate::resume::ResumeState;
+use crate::verify;
 use crate::wire::{Availability, ENC_AVAIL, ENC_MANIFEST, ENC_PUSH, ENC_SLICE, decode};
-use crate::{
-    MAX_RANGE_SPANS, availability_key, manifest_key, push_offer_key, push_slice_key,
-    slice_selector, verify,
-};
 
 /// What to do when the destination path already exists at completion time.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]

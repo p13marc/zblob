@@ -176,7 +176,7 @@ async fn publish_snapshot_exports_only_the_snapshot() {
     // power: without this, the assertion below would hold for an empty
     // storage too).
     for hash in published.needed_chunks() {
-        let key = zblob::store_key(&store_prefix, zblob::HashAlgo::Blake3, &hash);
+        let key = zblob::keys::store_key(&store_prefix, zblob::HashAlgo::Blake3, &hash);
         assert!(
             probe(&session, &key).await,
             "the published snapshot must be retrievable: {key}"
@@ -184,7 +184,7 @@ async fn publish_snapshot_exports_only_the_snapshot() {
     }
     // The other snapshot's chunks are not.
     for hash in private.needed_chunks() {
-        let key = zblob::store_key(&store_prefix, zblob::HashAlgo::Blake3, &hash);
+        let key = zblob::keys::store_key(&store_prefix, zblob::HashAlgo::Blake3, &hash);
         assert!(
             !probe(&session, &key).await,
             "an unpublished snapshot's chunk leaked into the storage: {key}"

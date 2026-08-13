@@ -18,13 +18,13 @@ use tokio::sync::{Notify, RwLock, Semaphore};
 use crate::chunk::TransferChunks;
 use crate::error::{BlobError, Result};
 use crate::id::BlobId;
+use crate::keys::{manifest_key, parse_id, parse_ranges, slice_key};
 use crate::manifest::{BlobSpec, Manifest, validate_id};
 use crate::obs::{zdebug, zwarn};
 use crate::prefix::ServePrefix;
 use crate::resume::ResumeState;
 use crate::verify::{self, OutboardStore, ReadAtCursor};
 use crate::wire::{Availability, ENC_AVAIL, ENC_MANIFEST, ENC_PUSH, ENC_SLICE, encode};
-use crate::{manifest_key, parse_id, parse_ranges, slice_key};
 
 /// A positional, sized, thread-safe byte source: what a [`BlobSource`] opens.
 ///
@@ -789,7 +789,7 @@ async fn serve_one(inner: &Inner, query: zenoh::query::Query) -> Result<()> {
         let avail = Availability::full(chunks.count());
         query
             .reply(
-                crate::availability_key(inner.prefix.as_str(), id),
+                crate::keys::availability_key(inner.prefix.as_str(), id),
                 encode(&avail)?,
             )
             .encoding(&ENC_AVAIL)

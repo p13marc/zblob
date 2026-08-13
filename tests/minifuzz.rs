@@ -2,7 +2,8 @@
 //! decoder: adversarial bytes must produce errors, never panics. Real
 //! libFuzzer targets live in `fuzz/`; these run on every `cargo test`.
 
-use zblob::{BlobId, Hash, HashAlgo, Manifest, TreeIndex, parse_ranges, wire};
+use zblob::keys::parse_ranges;
+use zblob::{BlobId, Hash, HashAlgo, Manifest, TreeIndex, wire};
 
 /// xorshift64 byte stream (no rand dependency, reproducible).
 struct Rng(u64);
@@ -69,7 +70,7 @@ fn parse_ranges_never_panics_and_roundtrips() {
                 last = r.end;
             }
             // And re-format to the same accepted value.
-            let refmt = zblob::format_ranges(&ranges);
+            let refmt = zblob::keys::format_ranges(&ranges);
             assert_eq!(
                 parse_ranges(&format!("v=2&ranges={refmt}"), 1000, 512).unwrap(),
                 ranges

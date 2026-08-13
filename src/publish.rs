@@ -27,11 +27,11 @@ use zenoh::query::ConsolidationMode;
 use crate::compress::{ChunkCompression, pack};
 use crate::error::{BlobError, Result};
 use crate::hash::{Hash, HashAlgo};
+use crate::keys::{store_key, tree_key};
 use crate::prefix::ServePrefix;
 use crate::store::ContentStore;
 use crate::tree::TreeIndex;
 use crate::wire::{ENC_CHUNK, ENC_INDEX, encode};
-use crate::{store_key, tree_key};
 
 /// PUT one content-addressed chunk into the storage under `store_prefix`.
 ///

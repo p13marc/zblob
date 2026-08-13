@@ -74,3 +74,52 @@ impl<F: Fn(Progress) + Send + Sync> ProgressSink for F {
 impl ProgressSink for () {
     fn emit(&self, _progress: Progress) {}
 }
+
+/// A [`ProgressSink`] that forwards events onto a channel, from
+/// [`progress_channel`].
+///
+/// Sending never blocks and never fails the transfer: if the receiver is gone
+/// or the buffer is full, the event is dropped. Progress is advisory, and a
+/// slow UI must not be able to stall a download — which is the reason this
+/// exists as a type rather than as advice to write the closure yourself, since
+/// the obvious closure either blocks (`send().await` from a sync `emit`) or
+/// panics on a closed receiver.
+#[derive(Debug, Clone)]
+pub struct ChannelSink(tokio::sync::mpsc::Sender<Progress>);
+
+impl ProgressSink for ChannelSink {
+    fn emit(&self, progress: Progress) {
+        let _ = self.0.try_send(progress);
+    }
+}
+
+/// A [`ProgressSink`] and the receiver its events arrive on.
+///
+/// Both consumers of this crate are GUIs, and both wrote the same adapter:
+/// progress arrives on a synchronous `emit` from inside the transfer, and has
+/// to reach a widget that lives on another task.
+///
+/// ```
+/// # use zblob::{progress_channel, Progress, ProgressSink};
+/// # #[tokio::main(flavor = "current_thread")]
+/// # async fn main() {
+/// let (sink, mut events) = progress_channel(64);
+/// sink.emit(Progress::Verifying);
+/// drop(sink);
+///
+/// while let Some(event) = events.recv().await {
+///     // update the UI
+///     assert!(matches!(event, Progress::Verifying));
+/// }
+/// # }
+/// ```
+///
+/// `buffer` bounds how far behind the reader may fall before events start
+/// being dropped; 64 is plenty for a UI that repaints on each one, since every
+/// event carries absolute counts rather than deltas — a dropped `Chunk` costs
+/// a repaint, not a wrong total.
+#[must_use]
+pub fn progress_channel(buffer: usize) -> (ChannelSink, tokio::sync::mpsc::Receiver<Progress>) {
+    let (tx, rx) = tokio::sync::mpsc::channel(buffer.max(1));
+    (ChannelSink(tx), rx)
+}
