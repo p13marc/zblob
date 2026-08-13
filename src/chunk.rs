@@ -30,8 +30,40 @@ use crate::verify::GROUP_SIZE;
 pub const MIN_CHUNK_SIZE: u32 = 64 * 1024;
 /// Largest allowed transfer chunk size (4 MiB) — bounds per-reply RAM.
 pub const MAX_CHUNK_SIZE: u32 = 4 * 1024 * 1024;
-/// Default transfer chunk size (512 KiB = 32 bao verification groups).
-pub const DEFAULT_CHUNK_SIZE: u32 = 512 * 1024;
+/// Default transfer chunk size: **256 KiB** (16 bao verification groups, and
+/// four Zenoh fragments).
+///
+/// Chosen by measurement, not preference — see `tests/chunk_size.rs`, which
+/// prints this table by encoding real bao slices over 8 MiB of incompressible
+/// data and applying the fragment-loss model:
+///
+/// ```text
+///   chunk   slices   header      wire bytes / useful byte
+///                              p=0      p=1%     p=5%
+///     64K      128    0.977%   1.0098   1.0200   1.0629
+///    128K       64    0.635%   1.0063   1.0268   1.1151
+///    256K       32    0.488%   1.0049   1.0461   1.2337   <- default
+///    512K       16    0.427%   1.0043   1.0884   1.5138
+///   1024K        8    0.403%   1.0040   1.1792   2.2812
+///   4096K        2    0.391%   1.0039   1.9100  26.7536
+/// ```
+///
+/// Two effects pull against each other. A reply is a *bao slice* — the chunk
+/// plus the parent hashes proving it — so smaller chunks put proportionally
+/// more hash overhead on the wire. But Zenoh fragments anything over 64 KiB
+/// and **a dropped fragment discards the whole message**, so a chunk of `S`
+/// bytes survives with probability `(1-p)^ceil(S/64KiB)`: larger chunks fail
+/// more often and each failure costs more.
+///
+/// 256 KiB is where the first effect has flattened and the second has not yet
+/// taken off. Moving from 512 KiB costs 0.06% on a clean link and saves 4
+/// points at 1% fragment loss and 28 points at 5%; moving on to 128 KiB saves
+/// roughly half as much again while doubling the slice count. On the flaky
+/// embedded links this fleet actually has, that trade is not close.
+///
+/// This is a **default**, not a limit: raise it on a LAN, and the value is
+/// pinned in the manifest so both peers agree on whatever it is.
+pub const DEFAULT_CHUNK_SIZE: u32 = 256 * 1024;
 
 /// Fixed-size transfer-chunk arithmetic for one blob: `(chunk_size, total_len)`
 /// fully determine every chunk's index, byte range, and count.

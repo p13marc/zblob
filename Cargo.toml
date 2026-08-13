@@ -8,7 +8,7 @@ exclude = ["fuzz"]
 
 [package]
 name = "zblob"
-version = "0.2.0"
+version = "0.3.0"
 edition = "2024"
 rust-version = "1.97"
 license = "MIT"
@@ -26,8 +26,15 @@ zenoh = { version = "1.9", features = ["unstable"] }
 tokio = { version = "1", features = ["fs", "io-util", "rt", "sync", "macros", "time"] }
 serde = { version = "1", features = ["derive"] }
 thiserror = "2"
-fastcdc = "4"
-blake3 = "1.8"
+# Pinned to the patch, not just the major. 4.0.0 replaced a rounded log2 with
+# a floored one, which silently moved cut points for any non-power-of-two
+# `avg_size` — a consumer resolving it would compute a *different tree root for
+# identical bytes*, which is the one thing a content-addressed store must never
+# do. 4.0.1 restores 3.2.1's boundaries. It also downgraded size-bound
+# assert!s to debug_assert!s, so CdcParams::validate must be complete on its
+# own rather than backstopped.
+fastcdc = "4.0.1"
+blake3 = "1.8.6"
 bao-tree = { version = "0.16", default-features = false, features = ["fs", "validate"] }
 postcard = { version = "1.1", features = ["use-std"] }
 tempfile = "3"
@@ -50,6 +57,11 @@ encryption = ["dep:chacha20poly1305", "dep:zeroize"]
 [dev-dependencies]
 serde_json = "1"
 proptest = "1"
+# Used by tests/chunk_size.rs to encode real bao slices and measure their
+# overhead, rather than asserting a number nobody derived. Same versions the
+# library itself uses.
+bao-tree = { version = "0.16", default-features = false, features = ["fs", "validate"] }
+blake3 = "1.8"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "time"] }
 criterion = "0.5"
 

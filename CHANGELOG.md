@@ -3,6 +3,137 @@
 All notable changes to `zblob` are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/); versions follow SemVer.
 
+## [0.3.0] — unreleased "wire v3"
+
+**Breaking throughout.** v2 and v3 peers do not interoperate: every `ENC_*`
+tag is re-spelled and `WIRE_VERSION` is 3, so a mixed deployment fails closed
+rather than half-decoding. Source-breaking too — prefixes are typed now.
+
+**Chunk addresses do not change**, so existing `DirStore`s and router-hosted
+storages stay warm across the upgrade. Content is still BLAKE3 of the
+uncompressed bytes under the same key, with the same container framing. This
+is the opposite of the sha256→blake3 cut, which orphaned every cached chunk.
+See [`docs/MIGRATION-v3.md`](docs/MIGRATION-v3.md).
+
+### Security
+
+Four defects reachable from a hostile tree index, all on the tier-2
+materialization path, none caught by the existing adversarial suite:
+
+- **A hostile index could delete pre-existing subtrees of the destination.**
+  `remove_existing` called `remove_dir_all` for any entry landing on a
+  directory, so an entry named `Documents` recursively deleted
+  `<dest>/Documents`. Now refused unless `MaterializePolicy::replace_directories`.
+- **Index-supplied mode bits were applied raw, including setuid/setgid.** Now
+  masked to `0o0777` unless `MaterializePolicy::restore_setid`, as tar and
+  rsync do.
+- **Symlink confinement was defeatable by a chain within one index.** The
+  per-link lexical depth check cannot see that a component is itself a link the
+  same index declares. Containment is now decided over the whole index, under a
+  hop budget so a cycle errors rather than loops.
+- **AEAD nonce reuse** (`encryption` feature, compiled by nobody): the nonce
+  derived from `(key, chunk hash)`, but what is sealed is the *compression
+  container*, and `put` re-packs unconditionally — so re-putting a chunk under
+  a different compression setting reused the nonce. It now covers the
+  container. Reading is unaffected; `StoreKey` drops `Clone` and zeroizes.
+
+Also: `SECURITY.md` now states that **nothing gates reads** (delegated to
+Zenoh access control) and what materialization does to a destination — both
+previously unstated.
+
+### Scale
+
+- **Batched tier-2 fetch.** A snapshot cost one Zenoh query per chunk; it now
+  costs one per round of `batch_size` (default 256). Replies come back on each
+  chunk's own key — individually verifiable, individually cacheable — which
+  requires `accept_replies(ReplyKeyExpr::Any)` because those keys are disjoint
+  from the batch key. A holder answers only what it has; whatever a round
+  leaves unanswered falls back to per-chunk GETs, which is what keeps
+  router-hosted storages (that never answer a batch) working.
+- **A tier-2 probe**, so RFC 07 §2.5's probe-then-fetch is total across all
+  three key families: `…/<algo>/have` answers one bit per address asked,
+  `<tree>/<id>/have` four numbers whatever the snapshot's size.
+- **Large indices are sharded** into content-addressed chunks and served as an
+  `IndexDescriptor`; small ones are still served whole, since an index costs
+  0.05–0.10% of its payload and adding a round trip to every tree fetch would
+  fix a problem the common case does not have.
+- **`download_striped`** addresses each range to one holder, so a chunk crosses
+  the wire once instead of once per replica.
+- **`build_tree_from`** reuses a parent snapshot's chunk references for files
+  whose size and mtime are unchanged (restic's trick). Read the mtime caveat.
+- **The default chunk size is 256 KiB**, down from 512 KiB — chosen by
+  measurement (`tests/chunk_size.rs`), not preference.
+
+### API
+
+- **Typed prefixes**: `ServePrefix` (concrete) and `QueryPrefix` (wildcards
+  allowed, `**` never). The role rules were always right and enforced at call
+  time; now they are unrepresentable otherwise.
+- **`StoreClient`** — read the content-addressed store directly, with no tree.
+- **`TreeClient::fetch_index_by_root`** — inspect a snapshot with no store.
+- **`BlobClient::probe`** — one entry per holder, each naming its origin.
+- **`Manifest::chunk_count`** — the `div_ceil` two consumers were rewriting.
+- **`download_staged`** — the staging convention both GUIs reinvented.
+- **`frame_chunk` / `unframe_chunk`** — the §2.4 container, decodable from
+  outside the crate at last.
+- **`ext` on `Manifest`** — a trailing extension list, so an additive field
+  stops costing a wire break. First use: servers advertise their
+  `max_chunks_per_query` and clients clamp to it, instead of being rejected
+  with `InvalidRanges` and no way to discover why.
+- `TransferStats::queries`; `SettleCoverage` on `publish_snapshot`;
+  `MaterializePolicy`; `BlobSource::fingerprint`; `gc::TagRecord`.
+
+### Fixed
+
+- `publish_chunk`/`publish_index` set no congestion control, and publications
+  default to `Drop` — bulk PUTs into a storage were silently sheddable while
+  the sampled read-back still returned `Ok`. Both block now.
+- `publish_snapshot` published the whole local store, including other
+  snapshots' chunks, into what is typically a fleet-wide storage.
+- Chunk replies had no size bound before unframing (`MAX_UNPACKED` guarded only
+  the compressed arm), and the tree path threw away the length its own index
+  had already declared.
+- Tier 2 had no total-size cap: an index inside the 64 MiB limit could
+  reference tens of TiB.
+- Tier-2 chunks are re-hashed on the way *out* of the store, so a store that
+  corrupts them cannot produce a "verified" tree.
+- `build_tree` never validated its own output, so a source tree with an
+  absolute symlink built a snapshot every client rejects.
+- `TransferChunks::count()` truncated a `u64` to `u32` — an all-zero file could
+  be renamed into place as verified.
+- The push client treated any responder's `reply_err` as fatal, so a co-server
+  with push disabled could abort an upload another server had accepted.
+- Push handlers could return without replying, leaving the uploader to wait out
+  the timeout and then misdiagnose a validation failure as a missing server.
+- Re-registering an id with different content is refused, matching the push
+  path's hijack defence.
+- A registered source that changes on disk is diagnosed rather than making
+  every slice fail the client's verification forever.
+- Tier-2 keys are resolved positionally, so a wildcard-origin prefix is
+  answerable instead of validating and then failing silently.
+- Tier-2 replies carry the *server's* key, not the query's, so a
+  wildcard-origin query can attribute and cache them.
+- `Overwrite::Refuse` is checked before the transfer, not after.
+- `gc::TempTags` finally has a caller: `TreeClientBuilder::temp_tags`.
+- In-flight permits are taken before spawning, so queued tasks are bounded.
+- `Availability::count()` masks padding bits and validates its own length.
+- `fanout` samples are version-first structs with an `ENC_FANOUT` tag; its
+  publisher cache, receive buffer and manifest cap are bounded and configurable.
+- `fastcdc` pinned to `4.0.1`: 4.0.0 silently moved cut points for
+  non-power-of-two `avg_size`, which would compute a different tree root for
+  identical bytes.
+
+### Considered and rejected
+
+- **A negative reply for unknown ids** (#53). Premise measured and false: an
+  unknown id resolves in about a millisecond, not on the query timeout,
+  because a Zenoh query finalizes when its matching queryables complete.
+- **Partial tier-1 holders.** A bao slice's sibling hashes require the whole
+  blob, so a partial holder can serve no verified slice — advertising one would
+  send clients after chunks they can never obtain. Partial possession is real
+  on tier 2 and is what the new probe reports.
+- **A descriptor for every index.** Measurement said no; see above.
+
 ## [0.2.0] — 2026-07-29 "wire v2"
 
 A ground-up redesign of the wire protocol and integrity model
