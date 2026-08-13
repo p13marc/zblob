@@ -81,8 +81,13 @@ enum FanoutFrame {
 pub struct FanoutConfig {
     /// Publisher heartbeat period for sample-miss detection (default 500 ms).
     pub heartbeat: Duration,
-    /// Receiver-side stall timeout: give up if no useful frame arrives for
-    /// this long (default 30 s).
+    /// Receiver-side stall timeout: give up if no *progress* is made for this
+    /// long (default 30 s).
+    ///
+    /// Progress, not traffic. Bounding the wait for a sample instead would let
+    /// a publisher streaming frames a receiver rejects — junk, replays,
+    /// tampered slices — reset the timer forever, and a fanout receiver has no
+    /// second responder to fall back on.
     pub stall_timeout: Duration,
     /// Receiver-side policy when `dest` already exists (default
     /// [`Overwrite::Refuse`], matching `download_to`).
@@ -306,7 +311,20 @@ pub async fn receive_fanout(
     let mut early: Vec<(u32, Vec<u8>)> = Vec::new();
     let mut early_bytes = 0usize;
     let mut deferred_reject: Option<BlobError> = None;
+    // `stall_timeout` bounds the wait for *progress*, not the wait for a
+    // sample. Applying it only to `recv` let a publisher that streamed junk
+    // reset the timer on every frame and hold a receiver open indefinitely —
+    // and this is the one tier with no other exit, since there is no second
+    // responder to fall back on. Found by the adversarial test below, which
+    // hung rather than failing.
+    let last_progress = tokio::time::Instant::now();
     let (m, chunks, root) = loop {
+        if last_progress.elapsed() > cfg.stall_timeout {
+            return Err(deferred_reject.unwrap_or(BlobError::Incomplete {
+                received: 0,
+                total: 0,
+            }));
+        }
         if cancel.is_cancelled() {
             sink.emit(Progress::Cancelled {
                 received: 0,
@@ -455,7 +473,19 @@ pub async fn receive_fanout(
             )
             .await?;
         }
+        let mut last_progress = tokio::time::Instant::now();
+        let mut progressed = received;
         while received < count {
+            if received > progressed {
+                progressed = received;
+                last_progress = tokio::time::Instant::now();
+            } else if last_progress.elapsed() > cfg.stall_timeout {
+                // No *progress* within the budget — see phase A.
+                return Err(BlobError::Incomplete {
+                    received,
+                    total: count,
+                });
+            }
             if cancel.is_cancelled() {
                 sink.emit(Progress::Cancelled {
                     received,

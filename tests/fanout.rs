@@ -5,6 +5,7 @@
 
 mod common;
 
+use std::sync::Arc;
 use std::time::Duration;
 
 use common::{content_hash, open_session, pseudo_random, unique_prefix};
@@ -98,5 +99,206 @@ async fn fanout_reaches_live_and_late_subscribers() {
     assert_eq!(std::fs::read(&late_dest).unwrap(), data);
 
     handle.shutdown().await.unwrap();
+    session.close().await.unwrap();
+}
+
+/// Publish `frames` on the fanout key repeatedly until `done` fires.
+///
+/// A plain publisher has no history cache, so a single burst races the
+/// receiver's subscriber declaration and can be lost entirely — which made the
+/// first version of these tests vacuous in both directions: the tampered case
+/// "passed" because nothing arrived at all, and the honest control failed for
+/// the same reason. Re-publishing is safe: a fanout receiver ignores a frame
+/// it already has.
+async fn republish_until(
+    session: &zenoh::Session,
+    prefix: &str,
+    id: &str,
+    frames: Vec<Vec<u8>>,
+    done: Arc<std::sync::atomic::AtomicBool>,
+) {
+    use std::sync::atomic::Ordering;
+    use zblob::wire::ENC_FANOUT;
+
+    let publisher = session
+        .declare_publisher(zblob::fanout::fanout_key(prefix, id))
+        .congestion_control(zenoh::qos::CongestionControl::Block)
+        .await
+        .unwrap();
+    while !done.load(Ordering::Relaxed) {
+        for frame in &frames {
+            if done.load(Ordering::Relaxed) {
+                return;
+            }
+            let _ = publisher.put(frame.clone()).encoding(&ENC_FANOUT).await;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+}
+
+/// The frames a publisher would send for `data`, with `tamper` applied to
+/// every slice (`None` = honest).
+///
+/// `FanoutFrame` is private, so these are built positionally: postcard
+/// identifies enum variants by order, so `(version, variant, ..)` is
+/// byte-identical to the struct the real publisher sends. That is the same
+/// escape hatch `BlobId`'s module doc describes, and it is what lets an
+/// adversarial test send what the types forbid.
+fn hand_rolled_frames(
+    manifest: &zblob::Manifest,
+    data: &[u8],
+    tamper: Option<&str>,
+) -> Vec<Vec<u8>> {
+    use zblob::wire::{self, encode};
+
+    const FRAME_MANIFEST: u32 = 0;
+    const FRAME_SLICE: u32 = 1;
+
+    let ob = common::bao::outboard(data);
+    let mut out = vec![encode(&(wire::WIRE_VERSION, FRAME_MANIFEST, manifest)).unwrap()];
+    let count = manifest.chunks().unwrap().count();
+    for index in 0..count {
+        let mut bao = common::bao::slice(data, &ob, MIN_CHUNK_SIZE, index);
+        match tamper {
+            Some("flip") => {
+                let mid = bao.len() / 2;
+                bao[mid] ^= 0xFF;
+            }
+            Some("truncate") => bao.truncate(bao.len() / 2),
+            Some(_) => bao = vec![0xABu8; bao.len()],
+            None => {}
+        }
+        out.push(encode(&(wire::WIRE_VERSION, FRAME_SLICE, index, bao)).unwrap());
+    }
+    out
+}
+
+fn demo_manifest(data: &[u8]) -> zblob::Manifest {
+    zblob::Manifest {
+        version: zblob::wire::WIRE_VERSION,
+        id: zblob::BlobId::new("rollout").unwrap(),
+        filename: None,
+        total_len: data.len() as u64,
+        chunk_size: MIN_CHUNK_SIZE,
+        root: zblob::Hash::of(data),
+        created_ms: 0,
+        ext: zblob::wire::Ext::new(),
+    }
+}
+
+/// A hostile publisher on the fanout key must not make a receiver write wrong
+/// bytes.
+///
+/// "Every receiver verifies" is the claim that makes this tier safe to point
+/// at a fleet — a fanout has no query/reply handshake, so a receiver's only
+/// defence is the bao proof — and nothing tested it. Unlike the query tiers
+/// there is no honest replier to fall back on, so the required outcome is
+/// narrower: fail cleanly, and leave nothing at the destination.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_tampered_fanout_slice_is_never_written() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    for tamper in ["flip", "truncate", "garbage"] {
+        let session = open_session().await;
+        let prefix = unique_prefix();
+        let data = pseudo_random(MIN_CHUNK_SIZE as usize * 4, 88);
+        let manifest = demo_manifest(&data);
+        let root = manifest.root;
+
+        let dir = tempfile::tempdir().unwrap();
+        let dest = dir.path().join("out.bin");
+
+        let done = Arc::new(AtomicBool::new(false));
+        let pub_task = {
+            let (session, prefix, done) = (session.clone(), prefix.clone(), done.clone());
+            let frames = hand_rolled_frames(&manifest, &data, Some(tamper));
+            tokio::spawn(async move {
+                republish_until(&session, &prefix, "rollout", frames, done).await;
+            })
+        };
+
+        let outcome = receive_fanout(
+            &session,
+            &common::query(prefix.clone()),
+            "rollout",
+            Some(root),
+            &dest,
+            &(),
+            &CancelToken::new(),
+            FanoutConfig {
+                stall_timeout: Duration::from_secs(2),
+                ..Default::default()
+            },
+        )
+        .await;
+        done.store(true, Ordering::Relaxed);
+        let _ = pub_task.await;
+
+        assert!(
+            outcome.is_err(),
+            "{tamper}: a tampered fanout must not report success"
+        );
+        assert!(
+            !dest.exists(),
+            "{tamper}: nothing must be left at the destination"
+        );
+        // The partial goes too — fanout has no resume, so keeping one built
+        // from tampered frames would be worse than useless.
+        assert!(
+            !dest.with_extension("bin.part").exists(),
+            "{tamper}: no partial must survive"
+        );
+
+        session.close().await.unwrap();
+    }
+}
+
+/// Discriminating power for the test above: the identical harness publishing
+/// *honest* slices completes with the right bytes. Without this the rejection
+/// could be of the hand-rolled framing — or of nothing having arrived at all,
+/// which is exactly what the first version of these two tests did.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_same_hand_rolled_frames_succeed_when_honest() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    let session = open_session().await;
+    let prefix = unique_prefix();
+    let data = pseudo_random(MIN_CHUNK_SIZE as usize * 4, 89);
+    let manifest = demo_manifest(&data);
+    let root = manifest.root;
+
+    let dir = tempfile::tempdir().unwrap();
+    let dest = dir.path().join("out.bin");
+
+    let done = Arc::new(AtomicBool::new(false));
+    let pub_task = {
+        let (session, prefix, done) = (session.clone(), prefix.clone(), done.clone());
+        let frames = hand_rolled_frames(&manifest, &data, None);
+        tokio::spawn(async move {
+            republish_until(&session, &prefix, "rollout", frames, done).await;
+        })
+    };
+
+    let stats = receive_fanout(
+        &session,
+        &common::query(prefix.clone()),
+        "rollout",
+        Some(root),
+        &dest,
+        &(),
+        &CancelToken::new(),
+        FanoutConfig {
+            stall_timeout: Duration::from_secs(5),
+            ..Default::default()
+        },
+    )
+    .await
+    .expect("honest hand-rolled frames must be accepted");
+    done.store(true, Ordering::Relaxed);
+    let _ = pub_task.await;
+
+    assert_eq!(std::fs::read(&dest).unwrap(), data);
+    assert_eq!(stats.rejected, 0, "honest frames must not be rejected");
+
     session.close().await.unwrap();
 }
