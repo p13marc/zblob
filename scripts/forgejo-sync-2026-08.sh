@@ -1448,6 +1448,18 @@ not a rolling upgrade. All three consumers pin `zblob = "0.2.0"`:
       all off by default and all three consumers take default features.
 - [ ] Tag `v0.3.0`, publish to crates.io, then bump the consumers' pins.
 
+## Already done (2026-08-15 follow-up pass, not blocking the tag)
+
+- [x] `upload_source` shipped (`525c04e`) — the last additive API gap.
+- [x] Server + fanout-receiver adversarial suites shipped
+      (`9c6d6b4`/`dcf1d65`/`0ecd46a`); coverage of the weak files lifted
+      (fanout 77→92%, server 81→86%, publish 77→85%).
+- [x] A sixth defect found + fixed on that pass (fanout phase-B tag filter,
+      `2f67a49`).
+- [x] Dependencies updated on `main` (`10d579c`): chacha20poly1305 0.11,
+      criterion 0.8, blake3/thiserror patches, CI action pins. MSRV 1.97
+      holds. Renovate PR #38 auto-closes once main carries these.
+
 ## Not blocking, but worth deciding with it
 
 **Chunk addresses did not change.** Existing `DirStore`s and router-hosted
@@ -1456,7 +1468,19 @@ which orphaned every cached chunk. So a storage does not need draining, and
 the cut can be done per-peer as long as no peer talks v2 to a v3 peer.
 EOF
 
-create 'upload_source: the push path can only send a file' "${L_ENHANCEMENT}" <<'EOF'
+create_closed 'upload_source: the push path can only send a file' "${L_ENHANCEMENT}" <<'EOF'
+**Shipped 2026-08-15** (`main`, commit `525c04e`) — filed closed for the
+record. `BlobClient::upload_source(spec, Arc<dyn BlobSource>)` now exists,
+sharing the `Upload` builder with `upload_file` over a private `UploadSrc`
+enum; source uploads emit no `Progress::Completed` (no final path) and fail
+loudly if the source fingerprint changes between the hash pass and the send
+pass. `DynReadAt` moved to `pub(crate)` so the client can reuse it. No wire
+change; existing stores stay warm.
+
+Original report follows.
+
+---
+
 The crate is symmetric everywhere except here.
 
 | direction | from/to a file | from/to anything else |
@@ -1503,7 +1527,25 @@ implementation might not. Either keep one reader for the whole upload or
 document the requirement at `upload_source` too.
 EOF
 
-create 'Coverage floor: the error-reply paths in server.rs and fanout.rs' "${L_ENHANCEMENT}" <<'EOF'
+create_closed 'Coverage floor: the error-reply paths in server.rs and fanout.rs' "${L_ENHANCEMENT}" <<'EOF'
+**Done 2026-08-15** (`main`, commits `9c6d6b4` + `dcf1d65` + `0ecd46a`) —
+filed closed for the record. Two layer-3 adversarial suites now point the
+fixed oracle at the *server* and the fanout *receiver* (raw `session.get()`s,
+since the honest client discards error replies): `tests/hostile_server.rs`
+(malformed selectors, over-cap ranges, lying push offers, tampered slices,
+idle eviction, finalize root mismatch, a flipping push policy) and
+`tests/hostile_fanout.rs` (malformed manifests skipped, deferred-variant on
+stall, early-buffer caps, cancellation, TOCTOU). Plus misbehaving-storage
+tests in `tests/storage.rs`. Line coverage of the three weakest files:
+`fanout.rs` 77→92%, `server.rs` 81→86%, `publish.rs` 77→85%. Writing them
+found a sixth defect (see the fanout phase-B filter issue). What remains
+uncovered is genuine-fault I/O (spool renames, storage read failures) that
+needs fault injection, not a hostile peer.
+
+Original report follows.
+
+---
+
 `cargo llvm-cov --all-features` is **89.16% of lines** as of the 0.3.0
 pre-release review (it was 77.3% before it). That number is a floor to hold,
 not a target to game — the tests that moved it found seven real defects.
@@ -1536,6 +1578,39 @@ oracle the two existing hostile suites use. `tests/hostile_peer.rs` and
 points at a server.
 
 Not a blocker for 0.3.0.
+EOF
+
+create_closed 'Fanout phase B skipped the encoding-tag filter a co-publisher could bypass' \
+  "$L_BUG" "$L_SECURITY" <<'EOF'
+**Found and fixed 2026-08-15** (`main`, commit `2f67a49`) while writing the
+fanout receiver adversarial suite — filed closed for the record. The sixth
+0.3 defect, invisible from the scenario tests.
+
+`receive_fanout` phase A filters every sample on the `ENC_FANOUT` encoding
+tag *before* decoding — the comment above it even called this "the one place"
+the rule had been missing. It was half true: **phase B** (the slice loop)
+still decoded any payload that happened to parse (positionally, as
+`(u16, FanoutFrame)`), with no tag filter. So a co-publisher on the fanout
+key whose frames the front door would reject could inject them once the
+manifest was through.
+
+The bao proof still protected the *bytes* — a mistagged frame carrying wrong
+data fails verification — so this is not silent corruption. But a foreign
+sample must be rejected for what it *is*, not for failing deep inside a
+transfer (the "opaque error mid-transfer" failure mode v2 removed
+everywhere else). Fixed by applying the same `ENC_FANOUT.matches(...)` filter
+and `FanoutMessage` decode shape in phase B as phase A.
+
+Test-first: `tests/hostile_fanout.rs::phase_b_ignores_frames_phase_a_would_reject`
+publishes half the slices correctly tagged and half under
+`application/octet-stream`; on the old code the transfer completes (the bug),
+on the fix it stalls `Incomplete` at exactly the honest half. The same split,
+fully tagged, completes — so the failure is the filter, not the harness.
+
+Two lesser things fixed on the same pass: an unreachable `DestinationExists`
+early-return in the phase-B error path (removed; the real TOCTOU backstop is
+after the block and already preserves the `.part`), and a `Publisher::chunks`
+doc/behaviour mismatch (a missing hash is `NotFound`, not "skipped").
 EOF
 
 echo
