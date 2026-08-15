@@ -521,15 +521,21 @@ pub async fn receive_fanout(
                     });
                 }
             };
-            let Ok((version, frame)) =
-                crate::wire::decode::<(u16, FanoutFrame)>(&sample.payload().to_bytes())
-            else {
-                continue;
-            };
-            if version != crate::wire::WIRE_VERSION {
+            // Same rule as phase A: filter on the encoding tag *before*
+            // decoding. Phase B used to skip this, so a co-publisher whose
+            // frames the front door would reject could inject them once the
+            // manifest was through — the bao proof still protected the bytes,
+            // but a foreign sample must be rejected for what it is.
+            if !crate::wire::ENC_FANOUT.matches(sample.encoding()) {
                 continue;
             }
-            if let FanoutFrame::Slice { index, bao } = frame {
+            let Ok(msg) = crate::wire::decode::<FanoutMessage>(&sample.payload().to_bytes()) else {
+                continue;
+            };
+            if msg.version != crate::wire::WIRE_VERSION {
+                continue;
+            }
+            if let FanoutFrame::Slice { index, bao } = msg.frame {
                 apply_slice(
                     &m,
                     &chunks,
@@ -551,15 +557,13 @@ pub async fn receive_fanout(
     .await;
     drop(file);
     if let Err(e) = result {
-        // A destination that appeared while we were receiving is the TOCTOU
-        // backstop for the check at the top — and it must *keep* the finished
-        // `.part`, which is exactly what `Overwrite::Refuse` documents.
-        if matches!(e, BlobError::DestinationExists(_)) {
-            return Err(e);
-        }
         let _ = tokio::fs::remove_file(&part).await;
         return Err(e);
     }
+    // A destination that appeared while we were receiving: the TOCTOU
+    // backstop for the check at the top. Returning here — after the removal
+    // above, not through it — *keeps* the finished `.part`, which is exactly
+    // what `Overwrite::Refuse` documents ("nothing is lost").
     if cfg.overwrite == Overwrite::Refuse && tokio::fs::try_exists(dest).await? {
         return Err(BlobError::DestinationExists(dest.to_path_buf()));
     }

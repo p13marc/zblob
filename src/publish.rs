@@ -370,7 +370,9 @@ impl Publisher {
     }
 
     /// PUT the named chunks out of `store`. Returns how many were published;
-    /// a hash the store does not hold is skipped.
+    /// a hash the store does not hold is an error
+    /// ([`BlobError::NotFound`]) — the caller named it, so silently
+    /// publishing less than asked would make the count a lie.
     pub async fn chunks(&self, hashes: &[Hash], store: &Arc<dyn ContentStore>) -> Result<u32> {
         publish_hashes(
             &self.session,

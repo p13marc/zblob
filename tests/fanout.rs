@@ -8,6 +8,7 @@ mod common;
 use std::sync::Arc;
 use std::time::Duration;
 
+use common::fanout::{demo_manifest, hand_rolled_frames, republish_until};
 use common::{content_hash, open_session, pseudo_random, unique_prefix};
 use zblob::fanout::{FanoutConfig, fanout_file, receive_fanout};
 use zblob::{BlobSpec, CancelToken, MIN_CHUNK_SIZE};
@@ -100,90 +101,6 @@ async fn fanout_reaches_live_and_late_subscribers() {
 
     handle.shutdown().await.unwrap();
     session.close().await.unwrap();
-}
-
-/// Publish `frames` on the fanout key repeatedly until `done` fires.
-///
-/// A plain publisher has no history cache, so a single burst races the
-/// receiver's subscriber declaration and can be lost entirely — which made the
-/// first version of these tests vacuous in both directions: the tampered case
-/// "passed" because nothing arrived at all, and the honest control failed for
-/// the same reason. Re-publishing is safe: a fanout receiver ignores a frame
-/// it already has.
-async fn republish_until(
-    session: &zenoh::Session,
-    prefix: &str,
-    id: &str,
-    frames: Vec<Vec<u8>>,
-    done: Arc<std::sync::atomic::AtomicBool>,
-) {
-    use std::sync::atomic::Ordering;
-    use zblob::wire::ENC_FANOUT;
-
-    let publisher = session
-        .declare_publisher(zblob::fanout::fanout_key(prefix, id))
-        .congestion_control(zenoh::qos::CongestionControl::Block)
-        .await
-        .unwrap();
-    while !done.load(Ordering::Relaxed) {
-        for frame in &frames {
-            if done.load(Ordering::Relaxed) {
-                return;
-            }
-            let _ = publisher.put(frame.clone()).encoding(&ENC_FANOUT).await;
-        }
-        tokio::time::sleep(Duration::from_millis(50)).await;
-    }
-}
-
-/// The frames a publisher would send for `data`, with `tamper` applied to
-/// every slice (`None` = honest).
-///
-/// `FanoutFrame` is private, so these are built positionally: postcard
-/// identifies enum variants by order, so `(version, variant, ..)` is
-/// byte-identical to the struct the real publisher sends. That is the same
-/// escape hatch `BlobId`'s module doc describes, and it is what lets an
-/// adversarial test send what the types forbid.
-fn hand_rolled_frames(
-    manifest: &zblob::Manifest,
-    data: &[u8],
-    tamper: Option<&str>,
-) -> Vec<Vec<u8>> {
-    use zblob::wire::{self, encode};
-
-    const FRAME_MANIFEST: u32 = 0;
-    const FRAME_SLICE: u32 = 1;
-
-    let ob = common::bao::outboard(data);
-    let mut out = vec![encode(&(wire::WIRE_VERSION, FRAME_MANIFEST, manifest)).unwrap()];
-    let count = manifest.chunks().unwrap().count();
-    for index in 0..count {
-        let mut bao = common::bao::slice(data, &ob, MIN_CHUNK_SIZE, index);
-        match tamper {
-            Some("flip") => {
-                let mid = bao.len() / 2;
-                bao[mid] ^= 0xFF;
-            }
-            Some("truncate") => bao.truncate(bao.len() / 2),
-            Some(_) => bao = vec![0xABu8; bao.len()],
-            None => {}
-        }
-        out.push(encode(&(wire::WIRE_VERSION, FRAME_SLICE, index, bao)).unwrap());
-    }
-    out
-}
-
-fn demo_manifest(data: &[u8]) -> zblob::Manifest {
-    zblob::Manifest {
-        version: zblob::wire::WIRE_VERSION,
-        id: zblob::BlobId::new("rollout").unwrap(),
-        filename: None,
-        total_len: data.len() as u64,
-        chunk_size: MIN_CHUNK_SIZE,
-        root: zblob::Hash::of(data),
-        created_ms: 0,
-        ext: zblob::wire::Ext::new(),
-    }
 }
 
 /// A hostile publisher on the fanout key must not make a receiver write wrong

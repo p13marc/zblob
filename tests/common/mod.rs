@@ -98,3 +98,129 @@ pub fn query(p: impl Into<String>) -> zblob::QueryPrefix {
     let p = p.into();
     zblob::QueryPrefix::new(&p).unwrap_or_else(|e| panic!("test query prefix {p:?}: {e}"))
 }
+
+/// Hand-rolled fanout frames and a hostile/honest co-publisher, shared by
+/// `tests/fanout.rs` and `tests/hostile_fanout.rs`.
+#[cfg(feature = "fanout")]
+pub mod fanout {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::time::Duration;
+
+    use zblob::MIN_CHUNK_SIZE;
+    use zblob::wire::{self, encode};
+
+    /// `FanoutFrame` is private, so frames are built positionally: postcard
+    /// identifies enum variants by order, so `(version, variant, ..)` is
+    /// byte-identical to the struct the real publisher sends. That is the same
+    /// escape hatch `BlobId`'s module doc describes, and it is what lets an
+    /// adversarial test send what the types forbid.
+    pub const FRAME_MANIFEST: u32 = 0;
+    pub const FRAME_SLICE: u32 = 1;
+
+    /// The manifest frame for `manifest`, as the real publisher would send it.
+    pub fn manifest_frame(manifest: &zblob::Manifest) -> Vec<u8> {
+        encode(&(wire::WIRE_VERSION, FRAME_MANIFEST, manifest)).unwrap()
+    }
+
+    /// The slice frame carrying `bao` at `index`.
+    pub fn slice_frame(index: u32, bao: &[u8]) -> Vec<u8> {
+        encode(&(wire::WIRE_VERSION, FRAME_SLICE, index, bao)).unwrap()
+    }
+
+    /// The frames a publisher would send for `data`, with `tamper` applied to
+    /// every slice (`None` = honest).
+    pub fn hand_rolled_frames(
+        manifest: &zblob::Manifest,
+        data: &[u8],
+        tamper: Option<&str>,
+    ) -> Vec<Vec<u8>> {
+        let ob = super::bao::outboard(data);
+        let mut out = vec![manifest_frame(manifest)];
+        let count = manifest.chunks().unwrap().count();
+        for index in 0..count {
+            let mut bao = super::bao::slice(data, &ob, MIN_CHUNK_SIZE, index);
+            match tamper {
+                Some("flip") => {
+                    let mid = bao.len() / 2;
+                    bao[mid] ^= 0xFF;
+                }
+                Some("truncate") => bao.truncate(bao.len() / 2),
+                Some(_) => bao = vec![0xABu8; bao.len()],
+                None => {}
+            }
+            out.push(slice_frame(index, &bao));
+        }
+        out
+    }
+
+    /// A well-formed manifest for `data` under id `"rollout"` — the fields are
+    /// public, so a hostile test clones and corrupts what it needs.
+    pub fn demo_manifest(data: &[u8]) -> zblob::Manifest {
+        zblob::Manifest {
+            version: wire::WIRE_VERSION,
+            id: zblob::BlobId::new("rollout").unwrap(),
+            filename: None,
+            total_len: data.len() as u64,
+            chunk_size: MIN_CHUNK_SIZE,
+            root: zblob::Hash::of(data),
+            created_ms: 0,
+            ext: wire::Ext::new(),
+        }
+    }
+
+    /// Publish `frames` on the fanout key repeatedly until `done` fires.
+    ///
+    /// A plain publisher has no history cache, so a single burst races the
+    /// receiver's subscriber declaration and can be lost entirely — which made
+    /// the first version of the fanout tamper tests vacuous in both
+    /// directions: the tampered case "passed" because nothing arrived at all,
+    /// and the honest control failed for the same reason. Re-publishing is
+    /// safe: a fanout receiver ignores a frame it already has.
+    pub async fn republish_until(
+        session: &zenoh::Session,
+        prefix: &str,
+        id: &str,
+        frames: Vec<Vec<u8>>,
+        done: Arc<AtomicBool>,
+    ) {
+        republish_until_enc(
+            session,
+            prefix,
+            id,
+            frames,
+            done,
+            (&wire::ENC_FANOUT).into(),
+        )
+        .await;
+    }
+
+    /// [`republish_until`], but stamping every frame with `encoding` — a
+    /// mistagged co-publisher for tests of the tag-before-decode rule.
+    pub async fn republish_until_enc(
+        session: &zenoh::Session,
+        prefix: &str,
+        id: &str,
+        frames: Vec<Vec<u8>>,
+        done: Arc<AtomicBool>,
+        encoding: zenoh::bytes::Encoding,
+    ) {
+        let publisher = session
+            .declare_publisher(zblob::fanout::fanout_key(prefix, id))
+            .congestion_control(zenoh::qos::CongestionControl::Block)
+            .await
+            .unwrap();
+        while !done.load(Ordering::Relaxed) {
+            for frame in &frames {
+                if done.load(Ordering::Relaxed) {
+                    return;
+                }
+                let _ = publisher
+                    .put(frame.clone())
+                    .encoding(encoding.clone())
+                    .await;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    }
+}

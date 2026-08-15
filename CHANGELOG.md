@@ -147,6 +147,12 @@ unpublished.
 - **A hostile fanout publisher could hold a receiver open forever**, because
   `stall_timeout` bounded the wait for a *sample* rather than for progress.
   This is the one tier with no second responder to fall back on.
+- **Fanout phase B decoded frames without the encoding-tag filter** phase A
+  applies, so a co-publisher whose samples the front door would reject could
+  inject them into a transfer once the manifest was through. The bao proof
+  still protected the bytes; the filter-before-decode rule now holds on both
+  phases. (Found writing the adversarial receiver suite; its discriminating
+  test fails on the old code.)
 - **`TransferStats::queries` reported 0** for every ordinary single-origin
   download — it was incremented on the striped and tier-2 paths only.
 - **`SettleCoverage::Sample(k)` could probe `k + 1` keys**, one over its own
