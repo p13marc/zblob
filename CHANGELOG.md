@@ -211,7 +211,8 @@ unpublished.
 ## [0.2.0] — 2026-07-29 "wire v2"
 
 A ground-up redesign of the wire protocol and integrity model
-([analysis](docs/analysis-2026-07.md), epic #37). **Breaking throughout** —
+([design rationale](docs/design-decisions.md), epic #37). **Breaking
+throughout** —
 v1 and v2 peers do not interoperate (v2 renamed the reply keys so mixed
 deployments fail closed instead of corrupting).
 

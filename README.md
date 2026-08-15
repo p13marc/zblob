@@ -177,12 +177,23 @@ resume: an interrupted receiver starts over.
 
 ## Documentation
 
+The [`docs/`](docs/) directory is a full documentation set — start at
+[`docs/README.md`](docs/README.md):
+
+- [`docs/architecture.md`](docs/architecture.md) — the three tiers, the shared
+  primitives, and the invariants the design relies on, with diagrams.
+- [`docs/integrity-model.md`](docs/integrity-model.md),
+  [`docs/wire-protocol.md`](docs/wire-protocol.md),
+  [`docs/design-decisions.md`](docs/design-decisions.md) — the design papers:
+  the BLAKE3/bao core, the keyspace and wire, and the decisions taken and
+  rejected.
 - [`docs/router-storage.md`](docs/router-storage.md) — run a Zenoh router as
-  the fleet-wide Tier-2 chunk store: serverless transfers (the producer PUTs
-  and exits), fleet-wide dedup, survival across producer restarts.
-- [`docs/analysis-2026-07.md`](docs/analysis-2026-07.md) — the deep analysis
-  that motivated the v2 redesign, and the design rationale behind it.
-- [`CHANGELOG.md`](CHANGELOG.md) — including the full v1 → v2 migration notes.
+  the fleet-wide Tier-2 chunk store: serverless transfers, fleet-wide dedup,
+  survival across producer restarts.
+- [`docs/MIGRATION-v3.md`](docs/MIGRATION-v3.md) — porting a consumer from wire
+  v2 to v3.
+- [`CHANGELOG.md`](CHANGELOG.md) — including the full v1 → v2 → v3 migration
+  notes.
 - [`examples/`](examples/) — runnable end-to-end blob and tree transfers.
 
 ## Acknowledgements

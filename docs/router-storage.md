@@ -1,8 +1,8 @@
 # Router-hosted Tier-2 chunk store
 
 How to run a Zenoh **router** as the fleet-wide content store for `zblob`
-Tier-2 directory sync. Background: the [2026-07 analysis &
-redesign](analysis-2026-07.md) and the crate docs (`cargo doc`).
+Tier-2 directory sync. Background: [architecture.md](architecture.md), the
+[design decisions](design-decisions.md), and the crate docs (`cargo doc`).
 
 ## Why
 

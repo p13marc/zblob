@@ -57,6 +57,10 @@ GitHub matrix on purpose.
 
 ## Architecture (wire v3)
 
+The prose docs cover this in depth — `docs/architecture.md` (map + diagrams),
+`docs/integrity-model.md`, `docs/wire-protocol.md`, `docs/design-decisions.md`.
+This section is the terse in-repo version.
+
 Both tiers share the primitives: `hash.rs` (BLAKE3-only `Hash`), `verify.rs`
 (bao outboard/slice encode + verified decode — the integrity core), `wire.rs`
 (postcard + `Encoding` tags + `WIRE_VERSION`), `chunk.rs` (`TransferChunks`
