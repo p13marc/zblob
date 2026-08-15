@@ -68,7 +68,7 @@ const NONCE_CONTEXT: &str = "zblob v2 2026-07 store chunk nonce key";
 
 fn cipher_for(key: &StoreKey) -> XChaCha20Poly1305 {
     let k = Zeroizing::new(blake3::derive_key(CIPHER_CONTEXT, &key.0));
-    XChaCha20Poly1305::new(Key::from_slice(&*k))
+    XChaCha20Poly1305::new(&Key::from(*k))
 }
 
 /// Derive the sealing nonce from the key, the chunk address **and the exact
@@ -88,7 +88,7 @@ pub(crate) fn seal(key: &StoreKey, hash: &Hash, container: &[u8]) -> std::io::Re
     let nonce = nonce_for(key, hash, container);
     let ciphertext = cipher_for(key)
         .encrypt(
-            XNonce::from_slice(&nonce),
+            &XNonce::from(nonce),
             Payload {
                 msg: container,
                 aad: hash.as_bytes(),
@@ -111,7 +111,7 @@ pub(crate) fn open(key: &StoreKey, hash: &Hash, sealed: &[u8]) -> Option<Vec<u8>
     let (nonce, ciphertext) = rest.split_at(24);
     cipher_for(key)
         .decrypt(
-            XNonce::from_slice(nonce),
+            &XNonce::try_from(nonce).ok()?,
             Payload {
                 msg: ciphertext,
                 aad: hash.as_bytes(),

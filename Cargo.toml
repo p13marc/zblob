@@ -44,7 +44,7 @@ tempfile = "3"
 zstd = { version = "0.13", optional = true }
 tracing = { version = "0.1", optional = true }
 zenoh-ext = { version = "1.9", features = ["unstable"], optional = true }
-chacha20poly1305 = { version = "0.10", optional = true }
+chacha20poly1305 = { version = "0.11", optional = true }
 zeroize = { version = "1.9", features = ["zeroize_derive"], optional = true }
 
 [features]
@@ -66,7 +66,7 @@ proptest = "1"
 bao-tree = { version = "0.16", default-features = false, features = ["fs", "validate"] }
 blake3 = "1.8"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "test-util"] }
-criterion = "0.5"
+criterion = "0.8"
 
 [[bench]]
 name = "throughput"
