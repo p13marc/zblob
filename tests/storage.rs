@@ -17,7 +17,8 @@ use std::time::Duration;
 
 use common::{isolated_config, unique_prefix};
 use zblob::{
-    CdcParams, ContentStore, DownloadRequest, MemoryStore, Publisher, TreeClient, build_tree,
+    BlobError, CdcParams, ContentStore, DownloadRequest, MemoryStore, Publisher, TreeClient,
+    build_tree,
 };
 
 /// A minimal stand-in for `zenoh-plugin-storage-manager`: retain PUTs on a key
@@ -208,4 +209,219 @@ async fn probe(session: &zenoh::Session, key: &str) -> bool {
         }
     }
     false
+}
+
+/// A stand-in "storage" that answers every query with an error reply — the
+/// shape of a storage that is present but broken (permissions, a full disk).
+async fn spawn_error_storage(
+    session: &zenoh::Session,
+    root: String,
+) -> tokio::task::JoinHandle<()> {
+    let q = session
+        .declare_queryable(format!("{root}/**"))
+        .await
+        .unwrap();
+    tokio::spawn(async move {
+        while let Ok(query) = q.recv_async().await {
+            let _ = query.reply_err("storage is broken").await;
+        }
+    })
+}
+
+/// With no storage answering, the settle phase gives up with `NotSettled`
+/// rather than returning a success a consumer cannot honor.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn publish_without_storage_fails_notsettled() {
+    let session = Arc::new(zenoh::open(isolated_config()).await.unwrap());
+    let root = unique_prefix();
+    let store_prefix = format!("{root}/store");
+    let tree_prefix = format!("{root}/tree");
+
+    let cdc = CdcParams {
+        min: 2048,
+        avg: 8192,
+        max: 32768,
+        normalization: 2,
+        gear_seed: 0,
+    };
+    let src = tempfile::tempdir().unwrap();
+    std::fs::write(src.path().join("f.bin"), common::pseudo_random(40_000, 3)).unwrap();
+    let store: Arc<dyn ContentStore> = Arc::new(MemoryStore::new());
+    let index = build_tree(src.path(), "snap", &cdc, &store).unwrap();
+
+    // No storage is running: nothing will ever answer the read-back.
+    let err = Publisher::new(&session, common::serve(store_prefix))
+        .snapshots(common::serve(tree_prefix))
+        .coverage(zblob::SettleCoverage::All)
+        .settle(Duration::from_millis(300))
+        .publish(&index, &store)
+        .await
+        .expect_err("publish must not report success when nothing settled");
+    assert!(matches!(err, BlobError::NotSettled(_)), "{err}");
+
+    session.close().await.unwrap();
+}
+
+/// A storage that answers only with error replies never satisfies a probe, so
+/// the publish does not settle. Discriminating power: an honest storage on the
+/// same prefixes settles (covered by `publish_to_storage_then_download`).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn storage_answering_only_errors_never_settles() {
+    let session = Arc::new(zenoh::open(isolated_config()).await.unwrap());
+    let root = unique_prefix();
+    let store_prefix = format!("{root}/store");
+    let tree_prefix = format!("{root}/tree");
+    let storage = spawn_error_storage(&session, root.clone()).await;
+
+    let cdc = CdcParams {
+        min: 2048,
+        avg: 8192,
+        max: 32768,
+        normalization: 2,
+        gear_seed: 0,
+    };
+    let src = tempfile::tempdir().unwrap();
+    std::fs::write(src.path().join("f.bin"), common::pseudo_random(40_000, 4)).unwrap();
+    let store: Arc<dyn ContentStore> = Arc::new(MemoryStore::new());
+    let index = build_tree(src.path(), "snap", &cdc, &store).unwrap();
+
+    let err = Publisher::new(&session, common::serve(store_prefix))
+        .snapshots(common::serve(tree_prefix))
+        .coverage(zblob::SettleCoverage::All)
+        .settle(Duration::from_millis(300))
+        .publish(&index, &store)
+        .await
+        .expect_err("an error-only storage must not settle");
+    assert!(matches!(err, BlobError::NotSettled(_)), "{err}");
+
+    storage.abort();
+    session.close().await.unwrap();
+}
+
+/// `SettleCoverage::All` actually probes the chunks, not just the index: a
+/// storage that captures the index but drops every chunk PUT does not settle.
+/// The control is the full-storage test elsewhere in this file.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn index_present_but_chunks_missing_trips_settle_all() {
+    let session = Arc::new(zenoh::open(isolated_config()).await.unwrap());
+    let root = unique_prefix();
+    let store_prefix = format!("{root}/store");
+    let tree_prefix = format!("{root}/tree");
+
+    // Storage covers only the tree (index) range — chunk PUTs to the store
+    // range fall into the void, so the index settles but the chunks cannot.
+    let storage = spawn_storage(&session, tree_prefix.clone()).await;
+
+    let cdc = CdcParams {
+        min: 2048,
+        avg: 8192,
+        max: 32768,
+        normalization: 2,
+        gear_seed: 0,
+    };
+    let src = tempfile::tempdir().unwrap();
+    std::fs::write(src.path().join("f.bin"), common::pseudo_random(90_000, 5)).unwrap();
+    let store: Arc<dyn ContentStore> = Arc::new(MemoryStore::new());
+    let index = build_tree(src.path(), "snap", &cdc, &store).unwrap();
+    assert!(
+        !index.needed_chunks().is_empty(),
+        "the fixture must have chunks"
+    );
+
+    let err = Publisher::new(&session, common::serve(store_prefix))
+        .snapshots(common::serve(tree_prefix))
+        .coverage(zblob::SettleCoverage::All)
+        .settle(Duration::from_millis(500))
+        .publish(&index, &store)
+        .await
+        .expect_err("All coverage must catch missing chunks even when the index is present");
+    assert!(matches!(err, BlobError::NotSettled(_)), "{err}");
+
+    storage.abort();
+    session.close().await.unwrap();
+}
+
+/// Publishing a hash the store cannot return fails: `Ok(None)` for a named
+/// hash is `NotFound` (the caller asked for it), and an `Err` propagates as
+/// I/O rather than being swallowed.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_lying_store_yields_notfound_or_propagates_io() {
+    use zblob::Hash;
+
+    /// Returns `Ok(None)` for `blind`, otherwise defers to an inner store.
+    struct BlindStore {
+        inner: MemoryStore,
+        blind: Hash,
+    }
+    impl ContentStore for BlindStore {
+        fn has(&self, h: &Hash) -> std::io::Result<bool> {
+            self.inner.has(h)
+        }
+        fn get(&self, h: &Hash) -> std::io::Result<Option<Vec<u8>>> {
+            if *h == self.blind {
+                return Ok(None);
+            }
+            self.inner.get(h)
+        }
+        fn put(&self, h: &Hash, b: &[u8]) -> std::io::Result<()> {
+            self.inner.put(h, b)
+        }
+        fn remove(&self, h: &Hash) -> std::io::Result<bool> {
+            self.inner.remove(h)
+        }
+        fn for_each_hash(
+            &self,
+            f: &mut dyn FnMut(Hash) -> std::io::Result<()>,
+        ) -> std::io::Result<()> {
+            self.inner.for_each_hash(f)
+        }
+    }
+
+    /// Fails every read with an I/O error.
+    struct BrokenStore;
+    impl ContentStore for BrokenStore {
+        fn has(&self, _: &Hash) -> std::io::Result<bool> {
+            Err(std::io::Error::other("disk on fire"))
+        }
+        fn get(&self, _: &Hash) -> std::io::Result<Option<Vec<u8>>> {
+            Err(std::io::Error::other("disk on fire"))
+        }
+        fn put(&self, _: &Hash, _: &[u8]) -> std::io::Result<()> {
+            Ok(())
+        }
+        fn remove(&self, _: &Hash) -> std::io::Result<bool> {
+            Ok(false)
+        }
+        fn for_each_hash(
+            &self,
+            _: &mut dyn FnMut(Hash) -> std::io::Result<()>,
+        ) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    let session = Arc::new(zenoh::open(isolated_config()).await.unwrap());
+    let store_prefix = format!("{}/store", unique_prefix());
+    let bytes = common::pseudo_random(4096, 6);
+    let hash = Hash::of(&bytes);
+
+    // Ok(None) for a named hash → NotFound.
+    let inner = MemoryStore::new();
+    inner.put(&hash, &bytes).unwrap();
+    let blind: Arc<dyn ContentStore> = Arc::new(BlindStore { inner, blind: hash });
+    let err = Publisher::new(&session, common::serve(store_prefix.clone()))
+        .chunks(std::slice::from_ref(&hash), &blind)
+        .await
+        .expect_err("a blind store must yield NotFound");
+    assert!(matches!(err, BlobError::NotFound(_)), "{err}");
+
+    // Err → I/O error propagates, not swallowed as absence.
+    let broken: Arc<dyn ContentStore> = Arc::new(BrokenStore);
+    let err = Publisher::new(&session, common::serve(store_prefix))
+        .chunks(std::slice::from_ref(&hash), &broken)
+        .await
+        .expect_err("a broken store must propagate its error");
+    assert!(matches!(err, BlobError::Io(_)), "{err}");
+
+    session.close().await.unwrap();
 }
