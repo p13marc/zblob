@@ -40,6 +40,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
+use bao_tree::io::sync::Size;
 use tokio::io::{AsyncSeekExt, AsyncWriteExt, SeekFrom};
 use zenoh::qos::Priority;
 use zenoh::query::ConsolidationMode;
@@ -57,6 +58,7 @@ use crate::obs::{TransferStats, zdebug};
 use crate::prefix::QueryPrefix;
 use crate::progress::{Progress, ProgressSink};
 use crate::resume::ResumeState;
+use crate::server::{BlobSource, DynReadAt, ReadAtSize, SourceFingerprint};
 use crate::verify;
 use crate::wire::{Availability, ENC_AVAIL, ENC_MANIFEST, ENC_PUSH, ENC_SLICE, decode};
 
@@ -601,7 +603,40 @@ impl BlobClient {
         Upload {
             client: self,
             spec,
-            path: path.into(),
+            src: UploadSrc::Path(path.into()),
+            token: None,
+            sink: None,
+            cancel: None,
+        }
+    }
+
+    /// Upload (push) an arbitrary [`BlobSource`] — an in-memory buffer, a
+    /// generated artifact, anything positional — without staging it in a
+    /// file first. `.await` the returned [`Upload`] to run it.
+    ///
+    /// The read-side counterpart of
+    /// [`register_source`](crate::BlobServer::register_source): the same
+    /// trait a server registers from is what a client can push from, so a
+    /// caller holding bytes never pays them to disk just to send them.
+    /// Everything [`upload_file`](Self::upload_file) documents holds here
+    /// too, with two differences:
+    ///
+    /// - The source is opened twice (once to hash, once to send), so
+    ///   [`BlobSource::open`] must be cheap and reopenable — which the
+    ///   provided [`MemoryBlobSource`](crate::MemoryBlobSource) and
+    ///   [`FileBlobSource`](crate::FileBlobSource) both are. If the source
+    ///   reports a changed [`fingerprint`](BlobSource::fingerprint) between
+    ///   those passes, the upload fails with one clear error instead of the
+    ///   receiver silently rejecting every slice hashed from stale bytes.
+    /// - No [`Progress::Completed`] event is emitted: that event names the
+    ///   final *path* of an assembled artifact, and a source upload has
+    ///   none. The returned manifest is the completion signal; the last
+    ///   [`Progress::Chunk`] event carries the final counts.
+    pub fn upload_source(&self, spec: BlobSpec, source: Arc<dyn BlobSource>) -> Upload<'_> {
+        Upload {
+            client: self,
+            spec,
+            src: UploadSrc::Source(source),
             token: None,
             sink: None,
             cancel: None,
@@ -861,10 +896,10 @@ impl BlobClient {
     /// served by the receiver. Interrupted uploads resume: the server's offer
     /// reply names exactly the chunks it is still missing. Returns the
     /// manifest (distribute `(id, root)` to downloaders).
-    async fn run_upload_file(
+    async fn run_upload(
         &self,
         spec: BlobSpec,
-        path: PathBuf,
+        src: UploadSrc,
         token: Option<Vec<u8>>,
         sink: &dyn ProgressSink,
         cancel: &CancelToken,
@@ -881,15 +916,42 @@ impl BlobClient {
         }
 
         // Hash the source once: outboard + manifest, exactly like server-side
-        // registration.
-        let hash_path = path.clone();
-        let (outboard, total_len) =
-            tokio::task::spawn_blocking(move || -> std::io::Result<(MemOutboard, u64)> {
-                let file = std::fs::File::open(&hash_path)?;
-                let total_len = file.metadata()?.len();
-                Ok((verify::compute_outboard(file)?, total_len))
-            })
-            .await??;
+        // registration. For a `BlobSource`, snapshot its fingerprint *before*
+        // hashing: the slice pass reopens and re-reads the source later, and
+        // a source that mutates in between would produce slices the receiver
+        // rejects one by one, with nothing naming the actual culprit.
+        let (outboard, total_len, fingerprint) = match &src {
+            UploadSrc::Path(path) => {
+                let hash_path = path.clone();
+                let (ob, len) = tokio::task::spawn_blocking(
+                    move || -> std::io::Result<(MemOutboard, u64)> {
+                        let file = std::fs::File::open(&hash_path)?;
+                        let total_len = file.metadata()?.len();
+                        Ok((verify::compute_outboard(file)?, total_len))
+                    },
+                )
+                .await??;
+                (ob, len, None)
+            }
+            UploadSrc::Source(source) => {
+                let source = source.clone();
+                tokio::task::spawn_blocking(
+                    move || -> std::io::Result<(MemOutboard, u64, Option<SourceFingerprint>)> {
+                        let fingerprint = source.fingerprint();
+                        let reader = source.open()?;
+                        let total_len = reader
+                            .size()?
+                            .ok_or_else(|| std::io::Error::other("source has no known size"))?;
+                        let ob = verify::compute_outboard_sized(
+                            verify::ReadAtCursor::new(DynReadAt(&*reader)),
+                            total_len,
+                        )?;
+                        Ok((ob, total_len, fingerprint))
+                    },
+                )
+                .await??
+            }
+        };
         let outboard = Arc::new(outboard);
         let chunks = TransferChunks::new(spec.chunk_size, total_len)?;
         let manifest = Manifest {
@@ -983,12 +1045,19 @@ impl BlobClient {
         }
         zdebug!(id = %manifest.id, total = count, to_send, "push offer accepted");
 
-        // Stream the wanted slices, one acknowledged query each.
+        // Stream the wanted slices, one acknowledged query each. One reader
+        // (the source's second and last open) serves the whole loop, shuttled
+        // in and out of each blocking encode.
         let mut sent = count - to_send;
         let mut bytes_sent: u64 = 0;
-        let mut reader = tokio::task::spawn_blocking({
-            let path = path.clone();
-            move || std::fs::File::open(path)
+        let mut reader: Box<dyn ReadAtSize> = tokio::task::spawn_blocking({
+            let src = src.clone();
+            move || -> std::io::Result<Box<dyn ReadAtSize>> {
+                match &src {
+                    UploadSrc::Path(path) => Ok(Box::new(std::fs::File::open(path)?)),
+                    UploadSrc::Source(source) => source.open(),
+                }
+            }
         })
         .await??;
         for (start, end) in wanted {
@@ -1006,8 +1075,9 @@ impl BlobClient {
                 let ob = outboard.clone();
                 let byte_range = chunks.byte_range(index);
                 let (r, slice) = tokio::task::spawn_blocking(
-                    move || -> (std::fs::File, std::io::Result<Vec<u8>>) {
-                        let slice = verify::encode_slice(&reader, &*ob, chunk_range(byte_range));
+                    move || -> (Box<dyn ReadAtSize>, std::io::Result<Vec<u8>>) {
+                        let slice =
+                            verify::encode_slice(DynReadAt(&*reader), &*ob, chunk_range(byte_range));
                         (reader, slice)
                     },
                 )
@@ -1086,7 +1156,28 @@ impl BlobClient {
                 });
             }
         }
-        sink.emit(Progress::Completed { path });
+        match &src {
+            // `Completed` names the final path of an assembled artifact; a
+            // source upload has none, so its completion signal is the
+            // returned manifest (see `upload_source`).
+            UploadSrc::Path(path) => sink.emit(Progress::Completed { path: path.clone() }),
+            UploadSrc::Source(source) => {
+                // The hash pass and the slice pass read the source at
+                // different times. If it changed in between, some receivers
+                // now hold slices of bytes that no longer exist under a root
+                // that never described them — fail loudly on the side that
+                // can fix it, exactly like the serve-time check in
+                // `server.rs`.
+                if let (Some(then), Some(now)) = (fingerprint, source.fingerprint())
+                    && then != now
+                {
+                    return Err(BlobError::Protocol(format!(
+                        "the source behind blob {:?} changed during the upload (was {} bytes, now {}); the receiver holds slices hashed from bytes that no longer exist — re-upload it",
+                        manifest.id, then.len, now.len
+                    )));
+                }
+            }
+        }
         Ok(manifest)
     }
 
@@ -1874,12 +1965,31 @@ where
     }
 }
 
-/// A configured upload, awaited to run it. See [`BlobClient::upload_file`].
+/// What an upload reads from: the two entry points' single meeting point.
+#[derive(Clone)]
+enum UploadSrc {
+    /// [`BlobClient::upload_file`] — opened as a plain `std::fs::File`.
+    Path(PathBuf),
+    /// [`BlobClient::upload_source`] — opened through the trait.
+    Source(Arc<dyn BlobSource>),
+}
+
+impl std::fmt::Debug for UploadSrc {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            UploadSrc::Path(path) => f.debug_tuple("Path").field(path).finish(),
+            UploadSrc::Source(_) => f.write_str("Source"),
+        }
+    }
+}
+
+/// A configured upload, awaited to run it. See [`BlobClient::upload_file`]
+/// and [`BlobClient::upload_source`].
 #[must_use = "an upload does nothing until it is awaited"]
 pub struct Upload<'a> {
     client: &'a BlobClient,
     spec: BlobSpec,
-    path: PathBuf,
+    src: UploadSrc,
     token: Option<Vec<u8>>,
     sink: Option<&'a dyn ProgressSink>,
     cancel: Option<&'a CancelToken>,
@@ -1889,7 +1999,7 @@ impl std::fmt::Debug for Upload<'_> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Upload")
             .field("spec", &self.spec)
-            .field("path", &self.path)
+            .field("src", &self.src)
             .field("token", &self.token.as_ref().map(Vec::len))
             .finish_non_exhaustive()
     }
@@ -1934,7 +2044,7 @@ impl<'a> std::future::IntoFuture for Upload<'a> {
                 }
             };
             self.client
-                .run_upload_file(self.spec, self.path, self.token, sink, cancel)
+                .run_upload(self.spec, self.src, self.token, sink, cancel)
                 .await
         })
     }

@@ -76,7 +76,8 @@ backoff); every reply is a self-verifying bao slice checked against the
 (pinnable) root *before* hitting the `.part` — no final hash pass, tampered
 slices are dropped alone. The server also answers `…/have` availability
 bitfields and (opt-in via `accept_push` + `PushPolicy`) verified resumable
-uploads spooled server-side. The caller always chooses the destination
+uploads spooled server-side; the uploader reads from a file (`upload_file`)
+or any `BlobSource` (`upload_source`, no staging file). The caller always chooses the destination
 (`download_to`); the manifest filename is advisory only.
 
 **Tier 2 — content-addressed directory trees** (`tree.rs`, `store.rs`,

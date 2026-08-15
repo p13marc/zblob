@@ -523,3 +523,241 @@ async fn upload_refuses_a_wildcard_prefix() {
 
     session.close().await.unwrap();
 }
+
+/// `upload_source` is `upload_file` without the file: an in-memory source
+/// pushes, registers, and round-trips — and, per its contract, emits no
+/// `Completed` event (the returned manifest is the completion signal) while
+/// still emitting per-chunk progress.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn upload_source_lands_and_serves() {
+    let session = open_session().await;
+    let prefix = unique_prefix();
+    let spool = tempfile::tempdir().unwrap();
+
+    let server = BlobServer::builder(&session, common::serve(prefix.clone()))
+        .accept_push(PushConfig::new(Arc::new(TokenPolicy), spool.path()))
+        .build();
+    let handle = server.spawn().await.unwrap();
+
+    let data = pseudo_random(MIN_CHUNK_SIZE as usize * 3 + 777, 41);
+    let chunks_seen = Arc::new(std::sync::atomic::AtomicU32::new(0));
+    let completed_seen = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let (chunks_flag, completed_flag) = (chunks_seen.clone(), completed_seen.clone());
+    let sink = move |p: Progress| match p {
+        Progress::Chunk { .. } => {
+            chunks_flag.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        }
+        Progress::Completed { .. } => {
+            completed_flag.store(true, std::sync::atomic::Ordering::SeqCst);
+        }
+        _ => {}
+    };
+
+    let client = test_client(&session, &prefix);
+    let manifest = tokio::time::timeout(
+        Duration::from_secs(20),
+        client
+            .upload_source(
+                BlobSpec::new("from-memory").chunk_size(MIN_CHUNK_SIZE),
+                Arc::new(MemoryBlobSource::new(data.clone())),
+            )
+            .token(b"secret".to_vec())
+            .progress(&sink),
+    )
+    .await
+    .expect("timed out")
+    .expect("upload from source");
+    assert_eq!(manifest.root, content_hash(&data));
+    assert!(
+        chunks_seen.load(std::sync::atomic::Ordering::SeqCst) >= 4,
+        "per-chunk progress must still be emitted"
+    );
+    assert!(
+        !completed_seen.load(std::sync::atomic::Ordering::SeqCst),
+        "a source upload has no final path, so it must not emit Completed"
+    );
+
+    let dl = tempfile::tempdir().unwrap();
+    let dest = dl.path().join("down.bin");
+    client
+        .download_to(&DownloadRequest::pinned("from-memory", manifest.root), &dest)
+        .await
+        .expect("download pushed blob");
+    assert_eq!(std::fs::read(&dest).unwrap(), data);
+
+    handle.shutdown().await.unwrap();
+    session.close().await.unwrap();
+}
+
+/// The zero-length source: finalized at the offer like the file path, and
+/// `MemoryBlobSource::new(vec![])` reports `Some(0)`, not "unknown".
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_empty_source_upload_finalizes_at_offer() {
+    let session = open_session().await;
+    let prefix = unique_prefix();
+    let spool = tempfile::tempdir().unwrap();
+
+    let server = BlobServer::builder(&session, common::serve(prefix.clone()))
+        .accept_push(PushConfig::new(Arc::new(TokenPolicy), spool.path()))
+        .build();
+    let handle = server.spawn().await.unwrap();
+
+    let client = test_client(&session, &prefix);
+    let manifest = client
+        .upload_source(
+            BlobSpec::new("void-src"),
+            Arc::new(MemoryBlobSource::new(Vec::new())),
+        )
+        .token(b"secret".to_vec())
+        .await
+        .expect("empty source upload");
+    assert_eq!(manifest.total_len, 0);
+
+    let dl = tempfile::tempdir().unwrap();
+    let dest = dl.path().join("void.bin");
+    client
+        .download_to(&DownloadRequest::pinned("void-src", manifest.root), &dest)
+        .await
+        .expect("download empty pushed blob");
+    assert_eq!(std::fs::read(&dest).unwrap(), b"");
+
+    handle.shutdown().await.unwrap();
+    session.close().await.unwrap();
+}
+
+/// The wildcard-prefix refusal is shared between both upload entry points.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn upload_source_refuses_a_wildcard_prefix() {
+    let session = open_session().await;
+    let wildcard = format!("{}/*/blob", unique_prefix());
+    let err = test_client(&session, &wildcard)
+        .upload_source(
+            BlobSpec::new("nope").chunk_size(MIN_CHUNK_SIZE),
+            Arc::new(MemoryBlobSource::new(b"payload".to_vec())),
+        )
+        .await
+        .expect_err("a wildcard upload prefix must be refused");
+    assert!(matches!(err, BlobError::Usage(_)), "{err}");
+    session.close().await.unwrap();
+}
+
+/// A source whose reader cannot state its size fails before any network
+/// traffic with a clear error, mirroring `register_source`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_sizeless_source_fails_with_a_clear_error() {
+    use zblob::{BlobSource, ReadAt, ReadAtSize, Size};
+
+    struct Endless;
+    impl ReadAt for Endless {
+        fn read_at(&self, _pos: u64, buf: &mut [u8]) -> std::io::Result<usize> {
+            buf.fill(0);
+            Ok(buf.len())
+        }
+    }
+    impl Size for Endless {
+        fn size(&self) -> std::io::Result<Option<u64>> {
+            Ok(None)
+        }
+    }
+    struct SizelessSource;
+    impl BlobSource for SizelessSource {
+        fn open(&self) -> std::io::Result<Box<dyn ReadAtSize>> {
+            Ok(Box::new(Endless))
+        }
+    }
+
+    let session = open_session().await;
+    let prefix = unique_prefix();
+    let err = test_client(&session, &prefix)
+        .upload_source(BlobSpec::new("endless"), Arc::new(SizelessSource))
+        .await
+        .expect_err("a sizeless source cannot be hashed");
+    assert!(
+        err.to_string().contains("no known size"),
+        "the error must name the problem: {err}"
+    );
+    session.close().await.unwrap();
+}
+
+/// The fingerprint guard: a source whose identity changes between the hash
+/// pass and completion fails loudly on the uploader, instead of leaving the
+/// receiver holding slices hashed from bytes that no longer exist. The bytes
+/// themselves stay constant here — only the fingerprint lies — so every
+/// slice verifies and the guard is the *only* thing that can catch it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_source_that_mutates_mid_upload_fails_loudly() {
+    use std::sync::atomic::{AtomicI64, Ordering};
+    use zblob::{BlobSource, ReadAtSize, SourceFingerprint};
+
+    struct VersionedSource {
+        data: Arc<Vec<u8>>,
+        version: AtomicI64,
+    }
+    impl BlobSource for VersionedSource {
+        fn open(&self) -> std::io::Result<Box<dyn ReadAtSize>> {
+            MemoryBlobSource::from_arc(self.data.clone()).open()
+        }
+        fn fingerprint(&self) -> Option<SourceFingerprint> {
+            Some(SourceFingerprint {
+                len: self.data.len() as u64,
+                mtime_ns: Some(self.version.load(Ordering::SeqCst) as i128),
+            })
+        }
+    }
+
+    let session = open_session().await;
+    let prefix = unique_prefix();
+    let spool = tempfile::tempdir().unwrap();
+    let server = BlobServer::builder(&session, common::serve(prefix.clone()))
+        .accept_push(PushConfig::new(Arc::new(TokenPolicy), spool.path()))
+        .build();
+    let handle = server.spawn().await.unwrap();
+
+    let data = pseudo_random(MIN_CHUNK_SIZE as usize * 4, 42);
+    let source = Arc::new(VersionedSource {
+        data: Arc::new(data),
+        version: AtomicI64::new(0),
+    });
+
+    // "Mutate" deterministically mid-transfer: the first chunk ack bumps the
+    // version, so the post-transfer re-check must see a changed fingerprint.
+    let bump = source.clone();
+    let sink = move |p: Progress| {
+        if matches!(p, Progress::Chunk { .. }) {
+            bump.version.store(1, Ordering::SeqCst);
+        }
+    };
+
+    let client = test_client(&session, &prefix);
+    let err = client
+        .upload_source(
+            BlobSpec::new("mutant").chunk_size(MIN_CHUNK_SIZE),
+            source.clone(),
+        )
+        .token(b"secret".to_vec())
+        .progress(&sink)
+        .await
+        .expect_err("a mutated source must fail the upload");
+    assert!(
+        err.to_string().contains("changed during the upload"),
+        "the error must diagnose the mutation: {err}"
+    );
+
+    // Discriminating power: the identical harness with a stable fingerprint
+    // succeeds — the failure above is the guard, not the harness.
+    let stable = Arc::new(VersionedSource {
+        data: source.data.clone(),
+        version: AtomicI64::new(7),
+    });
+    client
+        .upload_source(
+            BlobSpec::new("stable").chunk_size(MIN_CHUNK_SIZE),
+            stable,
+        )
+        .token(b"secret".to_vec())
+        .await
+        .expect("a stable source through the same harness must succeed");
+
+    handle.shutdown().await.unwrap();
+    session.close().await.unwrap();
+}

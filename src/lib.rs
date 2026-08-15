@@ -176,7 +176,10 @@ pub use zenoh::qos::Priority;
 /// supertraits live in `bao_tree` — so a caller wanting a [`BlobSource`] over
 /// something that is not a file or a `Vec` had to add `bao-tree` as a direct
 /// dependency and match this crate's version of it exactly. That made a
-/// documented extension point reachable only by accident.
+/// documented extension point reachable only by accident. The same trait now
+/// feeds both directions: servers register from it
+/// ([`BlobServer::register_source`]) and clients push from it
+/// ([`BlobClient::upload_source`]).
 #[doc(no_inline)]
 pub use bao_tree::io::sync::{ReadAt, Size};
 

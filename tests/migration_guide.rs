@@ -256,10 +256,20 @@ fn s11_observable(mut a: TransferStats, b: TransferStats) {
 async fn s12_new_capabilities(
     tree: &TreeClient,
     server: &BlobServer,
+    client: &BlobClient,
     req: &DownloadRequest,
     store: &Arc<dyn ContentStore>,
     index: &TreeIndex,
+    spec: BlobSpec,
+    bytes: Vec<u8>,
+    token: Vec<u8>,
 ) -> zblob::Result<()> {
+    // Push from anything positional — no staging file.
+    let _: Manifest = client
+        .upload_source(spec, Arc::new(zblob::MemoryBlobSource::new(bytes)))
+        .token(token)
+        .await?;
+
     // One file out of a snapshot, no tree materialized.
     let _: Vec<u8> = tree.fetch_file(req, "etc/app.conf", store).await?;
 

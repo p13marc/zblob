@@ -286,6 +286,16 @@ match err.kind() {
   on a synchronous `emit` inside the transfer and has to reach a widget on
   another task. The crate now ships it, and it drops events rather than
   blocking, so a slow repaint cannot stall a download.
+- **`upload_source`.** The push counterpart of `register_source`: anything
+  implementing `BlobSource` (an in-memory buffer, a generated report) uploads
+  without being staged in a file first. Same builder as `upload_file`:
+
+  ```rust,ignore
+  client
+      .upload_source(spec, Arc::new(MemoryBlobSource::new(bytes)))
+      .token(token)
+      .await?;
+  ```
 - **Server introspection.** `registered()`, `manifest(id)`, `serves(id)` on
   both servers, so a caller no longer keeps a shadow copy of the registry.
 - **`TreeIndex` navigation.** `entry`/`entries`/`files`/`file_chunks`, for

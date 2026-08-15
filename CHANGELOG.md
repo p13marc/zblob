@@ -116,12 +116,14 @@ unpublished.
 - **`WireTag`** replaces the `ENC_*` `&str` constants: the old comparison
   allocated a `String` per reply and related two values nothing typed.
 - **New capabilities**: `TreeClient::fetch_file` (one path out of a snapshot
-  without materializing the tree), server introspection
-  (`registered`/`manifest`/`index`/`serves`), `TreeIndex` navigation
-  (`entry`/`entries`/`files`/`file_chunks`), `progress_channel`,
-  `BlobClient::priority`, `TransferStats: Add + AddAssign + Sum`, and
-  `bao_tree::{ReadAt, Size}` re-exported so `ReadAtSize` is implementable
-  downstream at all.
+  without materializing the tree), `BlobClient::upload_source` (push any
+  `BlobSource` — an in-memory buffer, a generated artifact — without staging
+  it in a file; detects a source whose fingerprint changed mid-upload),
+  server introspection (`registered`/`manifest`/`index`/`serves`),
+  `TreeIndex` navigation (`entry`/`entries`/`files`/`file_chunks`),
+  `progress_channel`, `BlobClient::priority`,
+  `TransferStats: Add + AddAssign + Sum`, and `bao_tree::{ReadAt, Size}`
+  re-exported so `ReadAtSize` is implementable downstream at all.
 - Sessions are `&zenoh::Session`, not `Arc<zenoh::Session>` (which was an
   `Arc<Arc<..>>`); `#[must_use]` on every builder method; `Debug` on the 17
   public types that lacked it; `#[non_exhaustive]` on the output structs.

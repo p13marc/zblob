@@ -71,9 +71,10 @@ let stats = client
 
 Tier 1 also supports **push** (verified uploads gated by a `PushPolicy`
 authorization hook), **availability introspection** (`…/have` bitfields per
-responder), replicated servers answering one download cooperatively, and
-`download_to_writer` for filling any seekable async writer without touching
-the filesystem.
+responder), replicated servers answering one download cooperatively, and a
+filesystem-free path in both directions: `download_to_writer` fills any
+seekable async writer, and `upload_source` pushes any `BlobSource` (an
+in-memory buffer, a generated artifact) without staging it in a file.
 
 **Tier 2 — content-addressed directories** (the [casync] model). A snapshot is
 a [`TreeIndex`] (a depth-first entry list; files reference their chunks by

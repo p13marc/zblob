@@ -35,9 +35,13 @@ pub trait ReadAtSize: ReadAt + Size + Send + Sync {}
 impl<T: ReadAt + Size + Send + Sync> ReadAtSize for T {}
 
 /// Opens a fresh reader over a blob's bytes. Called once per registration (to
-/// hash) and once per query (to serve), so the source can be reopened many
-/// times. Opening is synchronous — implementations should be cheap (an
-/// `open(2)`, not a download) and are always invoked on the blocking pool.
+/// hash) and once per query (to serve) — and, on the client side, once to
+/// hash and once to send per [`BlobClient::upload_source`][us] — so the
+/// source can be reopened many times. Opening is synchronous —
+/// implementations should be cheap (an `open(2)`, not a download) and are
+/// always invoked on the blocking pool.
+///
+/// [us]: crate::BlobClient::upload_source
 pub trait BlobSource: Send + Sync {
     /// Open a new positional reader over the blob.
     fn open(&self) -> std::io::Result<Box<dyn ReadAtSize>>;
@@ -137,8 +141,10 @@ impl BlobSource for MemoryBlobSource {
     }
 }
 
-/// Borrow a boxed source as a [`ReadAt`] for bao encoding.
-struct DynReadAt<'a>(&'a dyn ReadAtSize);
+/// Borrow a boxed source as a [`ReadAt`] for bao encoding. `dyn ReadAtSize`
+/// does not itself implement its supertrait, so both the serving path here
+/// and the client's `upload_source` need this shim.
+pub(crate) struct DynReadAt<'a>(pub(crate) &'a dyn ReadAtSize);
 impl ReadAt for DynReadAt<'_> {
     fn read_at(&self, pos: u64, buf: &mut [u8]) -> std::io::Result<usize> {
         self.0.read_at(pos, buf)
@@ -759,7 +765,7 @@ async fn serve_one(inner: &Inner, query: zenoh::query::Query) -> Result<()> {
         && then != now
     {
         let e = BlobError::Protocol(format!(
-            "the source behind blob {id:?} changed after registration              (was {} bytes, now {}); re-register it — every slice served from              the stale outboard would fail the client's verification",
+            "the source behind blob {id:?} changed after registration (was {} bytes, now {}); re-register it — every slice served from the stale outboard would fail the client's verification",
             then.len, now.len
         ));
         let _ = query.reply_err(e.to_string()).await;
