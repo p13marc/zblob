@@ -96,7 +96,7 @@ sequenceDiagram
     participant C as TreeClient
     participant Sv as TreeServer
     participant St as router storage
-    Note over C: GET the batch key with a want-list; accept_replies(ReplyKeyExpr::Any)
+    Note over C: GET the batch key with a want-list, accept_replies(ReplyKeyExpr::Any)
     C->>Sv: batched fetch (want-list)
     Note over Sv: replies come back on each chunk's OWN key, disjoint from the batch key
     Sv-->>C: chunks by their own keys

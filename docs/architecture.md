@@ -139,7 +139,7 @@ sequenceDiagram
     participant S as BlobServer
     C->>S: GET the manifest key
     S-->>C: Manifest (root, total_len, chunk_size)
-    Note over C: validate; derive holes from the .part bitfield
+    Note over C: validate, then derive holes from the .part bitfield
     loop until no holes (resume == retry)
         C->>S: GET the range-set selector for its holes
         S-->>C: one bao slice per index (own key, ENC_SLICE)
