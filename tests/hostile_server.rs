@@ -21,13 +21,13 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
 use common::{content_hash, open_session, pseudo_random, unique_prefix};
-use zenoh::query::ConsolidationMode;
 use zblob::keys::{push_offer_key, push_slice_key, slice_selector};
 use zblob::wire::{self, ENC_PUSH, ENC_SLICE};
 use zblob::{
     BlobClient, BlobId, BlobServer, BlobSpec, DownloadRequest, Hash, MIN_CHUNK_SIZE, Manifest,
     MemoryBlobSource, Overwrite, PushConfig, PushPolicy, RetryPolicy,
 };
+use zenoh::query::ConsolidationMode;
 
 /// Allows pushes carrying the byte token `"secret"`.
 struct TokenPolicy;
@@ -176,25 +176,31 @@ async fn malformed_range_selectors_reply_err_and_keep_serving() {
 
     let base = format!("{prefix}/blob/**");
     let bad = [
-        format!("{base}?ranges=garbage"),        // unparseable
-        format!("{base}?ranges="),               // empty span
-        format!("{base}?ranges=3-1"),            // inverted
-        format!("{base}?ranges=2-2"),            // empty
-        format!("{base}?ranges=2-1,0-1"),        // unsorted
-        format!("{base}?ranges=0-2,1-3"),        // overlapping
-        format!("{base}?ranges=0-9999"),         // out of bounds
-        format!("{base}?other=1"),               // missing ranges param
-        format!("{base}?ranges=0-3"),            // over the 2-chunk cap
+        format!("{base}?ranges=garbage"), // unparseable
+        format!("{base}?ranges="),        // empty span
+        format!("{base}?ranges=3-1"),     // inverted
+        format!("{base}?ranges=2-2"),     // empty
+        format!("{base}?ranges=2-1,0-1"), // unsorted
+        format!("{base}?ranges=0-2,1-3"), // overlapping
+        format!("{base}?ranges=0-9999"),  // out of bounds
+        format!("{base}?other=1"),        // missing ranges param
+        format!("{base}?ranges=0-3"),     // over the 2-chunk cap
     ];
     for selector in &bad {
         let (slices, err) = raw_get(&session, selector).await;
         assert_eq!(slices, 0, "{selector}: a bad selector served slices");
-        assert!(err.is_some(), "{selector}: a bad selector got no error reply");
+        assert!(
+            err.is_some(),
+            "{selector}: a bad selector got no error reply"
+        );
     }
 
     // (c) The honest range still serves — the refusals were of the requests.
     let (slices, err) = raw_get(&session, &slice_selector(&prefix, "blob", &[0..2])).await;
-    assert_eq!(slices, 2, "the honest 2-chunk range must serve: err={err:?}");
+    assert_eq!(
+        slices, 2,
+        "the honest 2-chunk range must serve: err={err:?}"
+    );
 
     handle.shutdown().await.unwrap();
     session.close().await.unwrap();
@@ -209,7 +215,10 @@ async fn ranges_against_a_registered_empty_blob_reply_err() {
 
     let server = BlobServer::new(&session, common::serve(prefix.clone()));
     server
-        .register_source(BlobSpec::new("void"), Arc::new(MemoryBlobSource::new(Vec::new())))
+        .register_source(
+            BlobSpec::new("void"),
+            Arc::new(MemoryBlobSource::new(Vec::new())),
+        )
         .await
         .unwrap();
     let handle = server.spawn().await.unwrap();
@@ -285,56 +294,96 @@ async fn push_offer_error_arms_are_survivable() {
     let small = pseudo_random(1000, 60);
 
     // no payload
-    assert!(raw_offer(&session, &prefix, "a", None, Some(b"secret")).await.is_err());
+    assert!(
+        raw_offer(&session, &prefix, "a", None, Some(b"secret"))
+            .await
+            .is_err()
+    );
 
     // undecodable manifest
     assert!(
-        raw_offer(&session, &prefix, "a", Some(vec![0xFF; 40]), Some(b"secret"))
-            .await
-            .is_err()
+        raw_offer(
+            &session,
+            &prefix,
+            "a",
+            Some(vec![0xFF; 40]),
+            Some(b"secret")
+        )
+        .await
+        .is_err()
     );
 
     // bad wire version
     let mut m = manifest_for("a", &small);
     m.version = 99;
     assert!(
-        raw_offer(&session, &prefix, "a", Some(wire::encode(&m).unwrap()), Some(b"secret"))
-            .await
-            .is_err()
+        raw_offer(
+            &session,
+            &prefix,
+            "a",
+            Some(wire::encode(&m).unwrap()),
+            Some(b"secret")
+        )
+        .await
+        .is_err()
     );
 
     // bad chunk size (not aligned / below MIN)
     let mut m = manifest_for("a", &small);
     m.chunk_size = 3;
     assert!(
-        raw_offer(&session, &prefix, "a", Some(wire::encode(&m).unwrap()), Some(b"secret"))
-            .await
-            .is_err()
+        raw_offer(
+            &session,
+            &prefix,
+            "a",
+            Some(wire::encode(&m).unwrap()),
+            Some(b"secret")
+        )
+        .await
+        .is_err()
     );
 
     // lying size: declares far more than max_blob_size
     let mut m = manifest_for("a", &small);
     m.total_len = 1 << 30;
     assert!(
-        raw_offer(&session, &prefix, "a", Some(wire::encode(&m).unwrap()), Some(b"secret"))
-            .await
-            .is_err()
+        raw_offer(
+            &session,
+            &prefix,
+            "a",
+            Some(wire::encode(&m).unwrap()),
+            Some(b"secret")
+        )
+        .await
+        .is_err()
     );
 
     // id ≠ offer-key id
     let m = manifest_for("elsewhere", &small);
     assert!(
-        raw_offer(&session, &prefix, "here", Some(wire::encode(&m).unwrap()), Some(b"secret"))
-            .await
-            .is_err()
+        raw_offer(
+            &session,
+            &prefix,
+            "here",
+            Some(wire::encode(&m).unwrap()),
+            Some(b"secret")
+        )
+        .await
+        .is_err()
     );
 
     // wrong token → policy denial
     let m = manifest_for("a", &small);
     assert!(
-        raw_offer(&session, &prefix, "a", Some(wire::encode(&m).unwrap()), Some(b"wrong"))
-            .await
-            .is_err()
+        raw_offer(
+            &session,
+            &prefix,
+            "a",
+            Some(wire::encode(&m).unwrap()),
+            Some(b"wrong")
+        )
+        .await
+        .is_err()
     );
 
     // Nothing above registered anything.
@@ -378,9 +427,15 @@ async fn push_not_enabled_offer_and_slice_reply_err() {
 
     let m = manifest_for("x", b"hi");
     assert!(
-        raw_offer(&session, &prefix, "x", Some(wire::encode(&m).unwrap()), None)
-            .await
-            .is_err()
+        raw_offer(
+            &session,
+            &prefix,
+            "x",
+            Some(wire::encode(&m).unwrap()),
+            None
+        )
+        .await
+        .is_err()
     );
     assert!(
         raw_slice(&session, &prefix, "x", 0, Some(vec![0u8; 4]), None)
@@ -409,9 +464,15 @@ async fn a_conflicting_reoffer_for_an_inflight_push_is_refused() {
     let m = manifest_for("job", &data);
 
     // Open the push and leave it in-flight (no slices yet).
-    let wanted = raw_offer(&session, &prefix, "job", Some(wire::encode(&m).unwrap()), Some(b"secret"))
-        .await
-        .expect("offer accepted");
+    let wanted = raw_offer(
+        &session,
+        &prefix,
+        "job",
+        Some(wire::encode(&m).unwrap()),
+        Some(b"secret"),
+    )
+    .await
+    .expect("offer accepted");
     assert_eq!(wanted, vec![(0, 2)]);
 
     // A conflicting re-offer (different content) is refused…
@@ -430,20 +491,42 @@ async fn a_conflicting_reoffer_for_an_inflight_push_is_refused() {
     assert!(err.contains("conflicting"), "{err}");
 
     // …while an identical re-offer is acked (idempotent resume).
-    let again = raw_offer(&session, &prefix, "job", Some(wire::encode(&m).unwrap()), Some(b"secret"))
-        .await
-        .expect("identical re-offer acked");
+    let again = raw_offer(
+        &session,
+        &prefix,
+        "job",
+        Some(wire::encode(&m).unwrap()),
+        Some(b"secret"),
+    )
+    .await
+    .expect("identical re-offer acked");
     assert_eq!(again, vec![(0, 2)], "resume names the still-missing chunks");
 
     // (c) The original push still completes with honest slices.
-    raw_slice(&session, &prefix, "job", 0, Some(honest_slice(&data, 0)), Some(b"secret"))
-        .await
-        .expect("slice 0");
-    let remaining =
-        raw_slice(&session, &prefix, "job", 1, Some(honest_slice(&data, 1)), Some(b"secret"))
-            .await
-            .expect("slice 1");
-    assert_eq!(remaining, 0, "the push completes despite the conflicting offer");
+    raw_slice(
+        &session,
+        &prefix,
+        "job",
+        0,
+        Some(honest_slice(&data, 0)),
+        Some(b"secret"),
+    )
+    .await
+    .expect("slice 0");
+    let remaining = raw_slice(
+        &session,
+        &prefix,
+        "job",
+        1,
+        Some(honest_slice(&data, 1)),
+        Some(b"secret"),
+    )
+    .await
+    .expect("slice 1");
+    assert_eq!(
+        remaining, 0,
+        "the push completes despite the conflicting offer"
+    );
     assert!(server_serves(&session, &prefix, "job").await.is_some());
 
     handle.shutdown().await.unwrap();
@@ -460,17 +543,22 @@ async fn an_idle_push_is_evicted_on_the_next_offer() {
 
     let server = BlobServer::builder(&session, common::serve(prefix.clone()))
         .accept_push(
-            PushConfig::new(Arc::new(TokenPolicy), spool.path())
-                .idle_timeout(Duration::ZERO),
+            PushConfig::new(Arc::new(TokenPolicy), spool.path()).idle_timeout(Duration::ZERO),
         )
         .build();
     let handle = server.spawn().await.unwrap();
 
     let data_a = pseudo_random(MIN_CHUNK_SIZE as usize * 2, 63);
     let a = manifest_for("aaaa", &data_a);
-    raw_offer(&session, &prefix, "aaaa", Some(wire::encode(&a).unwrap()), Some(b"secret"))
-        .await
-        .expect("offer A");
+    raw_offer(
+        &session,
+        &prefix,
+        "aaaa",
+        Some(wire::encode(&a).unwrap()),
+        Some(b"secret"),
+    )
+    .await
+    .expect("offer A");
     assert!(
         spool.path().join("aaaa.push.part").exists(),
         "A's spool must exist after its offer"
@@ -480,9 +568,15 @@ async fn an_idle_push_is_evicted_on_the_next_offer() {
     // timeout) so its spool is swept.
     let data_b = pseudo_random(MIN_CHUNK_SIZE as usize * 2, 64);
     let b = manifest_for("bbbb", &data_b);
-    raw_offer(&session, &prefix, "bbbb", Some(wire::encode(&b).unwrap()), Some(b"secret"))
-        .await
-        .expect("offer B");
+    raw_offer(
+        &session,
+        &prefix,
+        "bbbb",
+        Some(wire::encode(&b).unwrap()),
+        Some(b"secret"),
+    )
+    .await
+    .expect("offer B");
     assert!(
         !spool.path().join("aaaa.push.part").exists(),
         "A's spool must be evicted on B's offer"
@@ -509,9 +603,15 @@ async fn a_spool_that_is_a_regular_file_fails_the_offer() {
 
     let data = pseudo_random(MIN_CHUNK_SIZE as usize * 2, 65);
     let m = manifest_for("blocked", &data);
-    let err = raw_offer(&session, &prefix, "blocked", Some(wire::encode(&m).unwrap()), Some(b"secret"))
-        .await
-        .expect_err("a file-as-spool must fail the offer");
+    let err = raw_offer(
+        &session,
+        &prefix,
+        "blocked",
+        Some(wire::encode(&m).unwrap()),
+        Some(b"secret"),
+    )
+    .await
+    .expect_err("a file-as-spool must fail the offer");
     assert!(!err.is_empty());
 
     // (c) The serve loop is still alive: an unknown-id manifest fetch returns a
@@ -537,23 +637,47 @@ async fn push_slice_error_arms_are_survivable() {
 
     let data = pseudo_random(MIN_CHUNK_SIZE as usize * 2, 66);
     let m = manifest_for("push", &data);
-    raw_offer(&session, &prefix, "push", Some(wire::encode(&m).unwrap()), Some(b"secret"))
-        .await
-        .expect("offer");
+    raw_offer(
+        &session,
+        &prefix,
+        "push",
+        Some(wire::encode(&m).unwrap()),
+        Some(b"secret"),
+    )
+    .await
+    .expect("offer");
 
     // slice for a never-offered id
     assert!(
-        raw_slice(&session, &prefix, "ghost", 0, Some(honest_slice(&data, 0)), Some(b"secret"))
+        raw_slice(
+            &session,
+            &prefix,
+            "ghost",
+            0,
+            Some(honest_slice(&data, 0)),
+            Some(b"secret")
+        )
+        .await
+        .is_err()
+    );
+    // no payload
+    assert!(
+        raw_slice(&session, &prefix, "push", 0, None, Some(b"secret"))
             .await
             .is_err()
     );
-    // no payload
-    assert!(raw_slice(&session, &prefix, "push", 0, None, Some(b"secret")).await.is_err());
     // index out of range
     assert!(
-        raw_slice(&session, &prefix, "push", 99, Some(honest_slice(&data, 0)), Some(b"secret"))
-            .await
-            .is_err()
+        raw_slice(
+            &session,
+            &prefix,
+            "push",
+            99,
+            Some(honest_slice(&data, 0)),
+            Some(b"secret")
+        )
+        .await
+        .is_err()
     );
     // tampered / truncated / garbage bytes at a valid index — none may mark it
     for tamper in ["flip", "truncate", "garbage"] {
@@ -576,13 +700,26 @@ async fn push_slice_error_arms_are_survivable() {
 
     // (c) The honest slices still complete the push — none of the refusals
     // above corrupted its spool state.
-    raw_slice(&session, &prefix, "push", 0, Some(honest_slice(&data, 0)), Some(b"secret"))
-        .await
-        .expect("honest slice 0");
-    let remaining =
-        raw_slice(&session, &prefix, "push", 1, Some(honest_slice(&data, 1)), Some(b"secret"))
-            .await
-            .expect("honest slice 1");
+    raw_slice(
+        &session,
+        &prefix,
+        "push",
+        0,
+        Some(honest_slice(&data, 0)),
+        Some(b"secret"),
+    )
+    .await
+    .expect("honest slice 0");
+    let remaining = raw_slice(
+        &session,
+        &prefix,
+        "push",
+        1,
+        Some(honest_slice(&data, 1)),
+        Some(b"secret"),
+    )
+    .await
+    .expect("honest slice 1");
     assert_eq!(remaining, 0);
 
     let dl = tempfile::tempdir().unwrap();
@@ -615,7 +752,9 @@ async fn a_flipping_policy_that_denies_mid_push_is_survivable() {
     let session = open_session().await;
     let prefix = unique_prefix();
     let spool = tempfile::tempdir().unwrap();
-    let policy = Arc::new(FlippingPolicy { calls: AtomicUsize::new(0) });
+    let policy = Arc::new(FlippingPolicy {
+        calls: AtomicUsize::new(0),
+    });
 
     let server = BlobServer::builder(&session, common::serve(prefix.clone()))
         .accept_push(PushConfig::new(policy.clone(), spool.path()))
@@ -624,13 +763,26 @@ async fn a_flipping_policy_that_denies_mid_push_is_survivable() {
 
     let data = pseudo_random(MIN_CHUNK_SIZE as usize * 2, 67);
     let m = manifest_for("flip", &data);
-    raw_offer(&session, &prefix, "flip", Some(wire::encode(&m).unwrap()), None)
-        .await
-        .expect("offer allowed on the first policy call");
+    raw_offer(
+        &session,
+        &prefix,
+        "flip",
+        Some(wire::encode(&m).unwrap()),
+        None,
+    )
+    .await
+    .expect("offer allowed on the first policy call");
 
-    let err = raw_slice(&session, &prefix, "flip", 0, Some(honest_slice(&data, 0)), None)
-        .await
-        .expect_err("the slice must be denied by the flipped policy");
+    let err = raw_slice(
+        &session,
+        &prefix,
+        "flip",
+        0,
+        Some(honest_slice(&data, 0)),
+        None,
+    )
+    .await
+    .expect_err("the slice must be denied by the flipped policy");
     assert!(err.contains("denied"), "{err}");
     assert!(
         policy.calls.load(Ordering::SeqCst) >= 2,
@@ -660,14 +812,27 @@ async fn finalize_root_mismatch_removes_the_spool() {
 
     let data = pseudo_random(MIN_CHUNK_SIZE as usize * 2, 68);
     let m = manifest_for("corrupt", &data);
-    raw_offer(&session, &prefix, "corrupt", Some(wire::encode(&m).unwrap()), Some(b"secret"))
-        .await
-        .expect("offer");
+    raw_offer(
+        &session,
+        &prefix,
+        "corrupt",
+        Some(wire::encode(&m).unwrap()),
+        Some(b"secret"),
+    )
+    .await
+    .expect("offer");
 
     // Send the first slice honestly (verifies + marks + writes chunk 0).
-    raw_slice(&session, &prefix, "corrupt", 0, Some(honest_slice(&data, 0)), Some(b"secret"))
-        .await
-        .expect("slice 0");
+    raw_slice(
+        &session,
+        &prefix,
+        "corrupt",
+        0,
+        Some(honest_slice(&data, 0)),
+        Some(b"secret"),
+    )
+    .await
+    .expect("slice 0");
 
     // Corrupt the spool on disk between the verified write and finalize. The
     // per-slice check can't catch this — only finalize's whole-blob rehash.
@@ -677,13 +842,23 @@ async fn finalize_root_mismatch_removes_the_spool() {
     std::fs::write(&part, &bytes).unwrap();
 
     // The final honest slice triggers finalize → root mismatch.
-    let err = raw_slice(&session, &prefix, "corrupt", 1, Some(honest_slice(&data, 1)), Some(b"secret"))
-        .await
-        .expect_err("finalize must reject a tampered spool");
+    let err = raw_slice(
+        &session,
+        &prefix,
+        "corrupt",
+        1,
+        Some(honest_slice(&data, 1)),
+        Some(b"secret"),
+    )
+    .await
+    .expect_err("finalize must reject a tampered spool");
     assert!(err.contains("root mismatch"), "{err}");
 
     // The blob file is gone and the id is not registered.
-    assert!(!spool.path().join("corrupt.blob").exists(), "the blob must be removed");
+    assert!(
+        !spool.path().join("corrupt.blob").exists(),
+        "the blob must be removed"
+    );
     assert!(server_serves(&session, &prefix, "corrupt").await.is_none());
 
     // (c) The server still accepts a fresh honest push.

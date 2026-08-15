@@ -923,14 +923,13 @@ impl BlobClient {
         let (outboard, total_len, fingerprint) = match &src {
             UploadSrc::Path(path) => {
                 let hash_path = path.clone();
-                let (ob, len) = tokio::task::spawn_blocking(
-                    move || -> std::io::Result<(MemOutboard, u64)> {
+                let (ob, len) =
+                    tokio::task::spawn_blocking(move || -> std::io::Result<(MemOutboard, u64)> {
                         let file = std::fs::File::open(&hash_path)?;
                         let total_len = file.metadata()?.len();
                         Ok((verify::compute_outboard(file)?, total_len))
-                    },
-                )
-                .await??;
+                    })
+                    .await??;
                 (ob, len, None)
             }
             UploadSrc::Source(source) => {
@@ -1076,8 +1075,11 @@ impl BlobClient {
                 let byte_range = chunks.byte_range(index);
                 let (r, slice) = tokio::task::spawn_blocking(
                     move || -> (Box<dyn ReadAtSize>, std::io::Result<Vec<u8>>) {
-                        let slice =
-                            verify::encode_slice(DynReadAt(&*reader), &*ob, chunk_range(byte_range));
+                        let slice = verify::encode_slice(
+                            DynReadAt(&*reader),
+                            &*ob,
+                            chunk_range(byte_range),
+                        );
                         (reader, slice)
                     },
                 )

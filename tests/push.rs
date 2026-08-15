@@ -580,7 +580,10 @@ async fn upload_source_lands_and_serves() {
     let dl = tempfile::tempdir().unwrap();
     let dest = dl.path().join("down.bin");
     client
-        .download_to(&DownloadRequest::pinned("from-memory", manifest.root), &dest)
+        .download_to(
+            &DownloadRequest::pinned("from-memory", manifest.root),
+            &dest,
+        )
         .await
         .expect("download pushed blob");
     assert_eq!(std::fs::read(&dest).unwrap(), data);
@@ -750,10 +753,7 @@ async fn a_source_that_mutates_mid_upload_fails_loudly() {
         version: AtomicI64::new(7),
     });
     client
-        .upload_source(
-            BlobSpec::new("stable").chunk_size(MIN_CHUNK_SIZE),
-            stable,
-        )
+        .upload_source(BlobSpec::new("stable").chunk_size(MIN_CHUNK_SIZE), stable)
         .token(b"secret".to_vec())
         .await
         .expect("a stable source through the same harness must succeed");
