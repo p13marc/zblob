@@ -196,7 +196,8 @@ async fn malformed_range_selectors_reply_err_and_keep_serving() {
     }
 
     // (c) The honest range still serves — the refusals were of the requests.
-    let (slices, err) = raw_get(&session, &slice_selector(&prefix, "blob", &[0..2])).await;
+    let honest = slice_selector(&prefix, "blob", std::slice::from_ref(&(0u32..2)));
+    let (slices, err) = raw_get(&session, &honest).await;
     assert_eq!(
         slices, 2,
         "the honest 2-chunk range must serve: err={err:?}"
