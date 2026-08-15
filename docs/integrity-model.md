@@ -55,7 +55,7 @@ flowchart TB
     P0["parent hash"]
     P1["parent hash"]
     G0["group 0<br/>16 KiB"]
-    G1["group 1 ✅ requested"]
+    G1["group 1 (requested)"]
     G2["group 2"]
     G3["group 3"]
     ROOT --- P0

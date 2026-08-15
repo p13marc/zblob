@@ -23,28 +23,27 @@ bookkeeping around that fact.
 
 ```mermaid
 flowchart TB
-    subgraph T1["Tier 1 — single blob by id"]
-        direction LR
-        BS["BlobServer<br/>(one queryable on prefix/**)"]
-        BC["BlobClient<br/>manifest GET → range-set slice GETs"]
-        BC -->|"?ranges=0-5,9"| BS
+    subgraph T1["Tier 1 - single blob by id"]
+        BC["BlobClient"]
+        BS["BlobServer (one queryable on prefix/**)"]
+        BC -->|"manifest GET, then ?ranges= slice GETs"| BS
         BS -->|"bao slices"| BC
     end
-    subgraph T2["Tier 2 — content-addressed directory trees"]
-        direction LR
-        TS["TreeServer / router storage<br/>chunks keyed by hash"]
-        TC["TreeClient<br/>fetch index → fetch (needed − have)"]
-        TC -->|"GET by hash"| TS
+    subgraph T2["Tier 2 - content-addressed directory trees"]
+        TC["TreeClient"]
+        TS["TreeServer (in the producer) or a router storage"]
+        TC -->|"fetch index, then missing chunks by hash"| TS
         TS -->|"chunks"| TC
     end
-    subgraph TF["Fanout tier (feature) — one-to-many"]
-        direction LR
-        FP["fanout_file<br/>AdvancedPublisher (cached)"]
-        FR["receive_fanout ×N<br/>every receiver verifies"]
+    subgraph TF["Fanout tier (feature) - one-to-many"]
+        FP["fanout_file (cached AdvancedPublisher)"]
+        FR["receive_fanout xN (every receiver verifies)"]
         FP -->|"manifest + bao slices"| FR
     end
-    T1 -.->|"shared integrity + wire primitives"| T2
-    T2 -.-> TF
+    CORE(["shared integrity + wire primitives"])
+    BS -.-> CORE
+    TS -.-> CORE
+    FP -.-> CORE
 ```
 
 **Tier 1 — a single blob, addressed by id.** One `BlobServer` queryable serves
@@ -84,15 +83,15 @@ core.
 ```mermaid
 flowchart TB
     subgraph Core["shared primitives"]
-        HASH["hash.rs<br/>BLAKE3 Hash / HashAlgo"]
-        VERIFY["verify.rs<br/>bao outboard + verified slice decode"]
-        WIRE["wire.rs<br/>postcard + Encoding tags + WIRE_VERSION"]
-        CHUNK["chunk.rs<br/>fixed-size (T1) · seedable FastCDC (T2)"]
-        KEYS["keys.rs<br/>typed key builders + parsers"]
-        PATHS["paths.rs<br/>traversal-safe path/symlink sanitize"]
-        COMPRESS["compress.rs<br/>self-describing chunk containers (zstd)"]
-        RESUME["resume.rs<br/>crash-safe bitfield sidecar"]
-        MISC["progress.rs · cancel.rs · obs.rs · prefix.rs"]
+        VERIFY["verify.rs - bao outboard + verified decode"]
+        WIRE["wire.rs - postcard + Encoding tags + WIRE_VERSION"]
+        HASH["hash.rs - BLAKE3 Hash / HashAlgo"]
+        CHUNK["chunk.rs - fixed-size T1, FastCDC T2"]
+        KEYS["keys.rs - typed key builders + parsers"]
+        PATHS["paths.rs - traversal-safe sanitize"]
+        COMPRESS["compress.rs - chunk containers (zstd)"]
+        RESUME["resume.rs - crash-safe bitfield sidecar"]
+        MISC["progress.rs / cancel.rs / obs.rs / prefix.rs"]
     end
 
     subgraph Tier1["Tier 1"]
@@ -109,9 +108,11 @@ flowchart TB
     end
     FANOUT["fanout.rs (feature)"]
 
-    Tier1 --> Core
-    Tier2 --> Core
-    FANOUT --> Core
+    SERVER --> VERIFY
+    CLIENT --> WIRE
+    TREE --> VERIFY
+    STORE --> WIRE
+    FANOUT --> VERIFY
 ```
 
 - **`hash.rs`** — a BLAKE3-only `Hash` and the `HashAlgo` tag that names it on
@@ -142,7 +143,7 @@ sequenceDiagram
     loop until no holes (resume == retry)
         C->>S: GET the range-set selector for its holes
         S-->>C: one bao slice per index (own key, ENC_SLICE)
-        Note over C: verify each slice vs the pinned root,<br/>before writing the .part
+        Note over C: verify each slice vs the pinned root before writing .part
     end
     Note over C: bitfield full, rename .part to dest
 ```
@@ -178,8 +179,13 @@ hard to see. They are stated here and enforced in code and tests.
 
 ## Where to run it
 
-The default tier-2 model runs a `TreeServer` inside the producer. Pointing the
-store at a **router-hosted Zenoh storage** instead makes transfers serverless
-(the producer PUTs and exits), dedups fleet-wide, and survives producer
-restarts — see [router-storage.md](router-storage.md). Migrating a consumer
-from wire v2 to v3 is [migration-v3.md](MIGRATION-v3.md).
+**No external storage is required.** Tier 1 needs only a `BlobServer` and a
+`BlobClient`. Tier 2 by default runs a `TreeServer` *inside the producer*
+(`TreeServer::new(...).register(index).spawn()`) — the producer serves its own
+chunks over Zenoh, with nothing else deployed.
+
+A **router-hosted Zenoh storage** is an *optional* alternative for tier 2:
+pointing the store at one makes transfers serverless (the producer PUTs and
+exits), dedups fleet-wide, and survives producer restarts — see
+[router-storage.md](router-storage.md). Migrating a consumer from wire v2 to
+v3 is [migration-v3.md](MIGRATION-v3.md).
