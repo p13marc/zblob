@@ -664,6 +664,19 @@ async fn a_readonly_destination_dir_fails_cleanly() {
     std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o555)).unwrap();
     let dest = locked.join("out.bin");
 
+    // Root ignores directory permission bits (CI containers routinely run as
+    // root), so 0o555 does not actually deny the write there. Probe it: if the
+    // directory is writable despite the mode, the premise doesn't hold and the
+    // test would wrongly expect a failure — skip it.
+    let probe = locked.join(".probe");
+    if std::fs::write(&probe, b"x").is_ok() {
+        let _ = std::fs::remove_file(&probe);
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o755)).unwrap();
+        eprintln!("skipping: 0o555 is not enforced here (running as root?)");
+        session.close().await.unwrap();
+        return;
+    }
+
     let done = Arc::new(AtomicBool::new(false));
     let task = {
         let (session, prefix, done) = (session.clone(), prefix.clone(), done.clone());
