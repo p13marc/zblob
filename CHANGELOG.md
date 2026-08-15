@@ -3,7 +3,7 @@
 All notable changes to `zblob` are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/); versions follow SemVer.
 
-## [0.3.0] — unreleased "wire v3"
+## [0.3.0] — 2026-08-15 "wire v3"
 
 **Breaking throughout.** v2 and v3 peers do not interoperate: every `ENC_*`
 tag is re-spelled and `WIRE_VERSION` is 3, so a mixed deployment fails closed
