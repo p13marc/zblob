@@ -219,3 +219,62 @@ async fn the_same_hand_rolled_frames_succeed_when_honest() {
 
     session.close().await.unwrap();
 }
+
+/// `fanout_file` validates its inputs before declaring a publisher: a missing
+/// path, a malformed chunk size, and an invalid id each fail early rather than
+/// spawning a serving task that can never work.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn fanout_file_rejects_bad_inputs() {
+    let session = open_session().await;
+    let prefix = unique_prefix();
+
+    // Nonexistent source path.
+    let missing = fanout_file(
+        &session,
+        &common::serve(prefix.clone()),
+        BlobSpec::new("x").chunk_size(MIN_CHUNK_SIZE),
+        "/definitely/not/here.bin",
+        FanoutConfig::default(),
+    )
+    .await;
+    assert!(missing.is_err(), "a missing source path must fail");
+
+    // A real file, but a malformed chunk size.
+    let src = tempfile::tempdir().unwrap();
+    let path = src.path().join("f.bin");
+    std::fs::write(&path, b"hello").unwrap();
+    let bad_chunk = fanout_file(
+        &session,
+        &common::serve(prefix.clone()),
+        BlobSpec::new("x").chunk_size(3),
+        &path,
+        FanoutConfig::default(),
+    )
+    .await;
+    assert!(bad_chunk.is_err(), "a malformed chunk size must fail");
+
+    // A reserved/invalid id.
+    let bad_id = fanout_file(
+        &session,
+        &common::serve(prefix.clone()),
+        BlobSpec::new("bad/id").chunk_size(MIN_CHUNK_SIZE),
+        &path,
+        FanoutConfig::default(),
+    )
+    .await;
+    assert!(bad_id.is_err(), "an invalid id must fail");
+
+    // Discriminating power: a well-formed call succeeds through the same path.
+    let (_m, handle) = fanout_file(
+        &session,
+        &common::serve(prefix.clone()),
+        BlobSpec::new("good").chunk_size(MIN_CHUNK_SIZE),
+        &path,
+        FanoutConfig::default(),
+    )
+    .await
+    .expect("a well-formed fanout must succeed");
+    handle.shutdown().await.unwrap();
+
+    session.close().await.unwrap();
+}
