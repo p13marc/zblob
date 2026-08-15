@@ -35,11 +35,22 @@ cargo test --locked
 cargo test --all-features --locked
 RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --all-features --locked
 cargo publish --dry-run
+./scripts/check-docs.sh   # markdown + mermaid diagrams
 ```
+
+`scripts/check-docs.sh` runs an offline mermaid gotcha-linter
+(`scripts/mermaid_lint.py`, no deps — catches `;` in a sequence diagram,
+`direction` inside a subgraph, edges pointing at a subgraph, unbalanced
+quotes) and, when `mmdc` is installed, renders every ```mermaid block for
+real. The `docs-mermaid` CI job installs `@mermaid-js/mermaid-cli` so the
+render check always runs there; locally the offline lint runs regardless.
+**Author mermaid through the check, not by eye** — two diagram bugs shipped
+before it existed.
 
 CI (`.forgejo/workflows/ci.yml`) runs build + test (default and all-features)
 with `--locked`, fmt, clippy `-D warnings`, MSRV 1.97 check, docs, cargo-audit,
-llvm-cov, bench compile, and a `cargo publish --dry-run` — keep `Cargo.lock`
+llvm-cov, bench compile, a `cargo publish --dry-run`, and a `docs-mermaid`
+job (offline lint + `mmdc` render of every diagram) — keep `Cargo.lock`
 committed and the crate publishable. A weekly fuzz workflow runs the `fuzz/`
 targets. MSRV stays **1.97** (fleet policy).
 

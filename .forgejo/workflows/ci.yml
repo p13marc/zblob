@@ -153,3 +153,28 @@ jobs:
             echo "RUSTC_WRAPPER=/srv/cache/bin/sccache" >> "$GITHUB_ENV"
           fi
       - run: cargo publish --dry-run
+
+  docs-mermaid:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: https://data.forgejo.org/actions/checkout@v7.0.1
+      # Offline lint first — no browser, catches the common mermaid mistakes
+      # fast and always runs even if the render step below has trouble.
+      - name: Offline mermaid lint
+        run: python3 scripts/mermaid_lint.py $(git ls-files '*.md')
+      - uses: https://github.com/actions/setup-node@v4
+        with:
+          node-version: "20"
+      - name: Install mermaid-cli
+        run: npm install -g @mermaid-js/mermaid-cli@11
+      - name: Install headless-chromium runtime deps
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            libnss3 libnspr4 libatk1.0-0t64 libatk-bridge2.0-0t64 \
+            libcups2t64 libdrm2 libxkbcommon0 libxcomposite1 libxdamage1 \
+            libxfixes3 libxrandr2 libgbm1 libpango-1.0-0 libcairo2 \
+            libasound2t64 fonts-liberation
+      # Authoritative check: render every mermaid block through mmdc.
+      - name: Render-check every mermaid block
+        run: ./scripts/check-docs.sh
