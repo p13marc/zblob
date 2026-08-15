@@ -182,19 +182,29 @@ Three layers, because the first one alone is what let real defects through:
    through, and the bao core (a slice decodes to exactly its byte range; any
    mutation is caught; a slice cannot be replayed at another index).
 3. **Adversarial + contract suites** (`tests/hostile_peer.rs`,
-   `tests/hostile_store.rs`, `tests/store_contract.rs`, `tests/minifuzz.rs`)
-   — peers that mutate every reply against a fixed oracle ("succeed with
-   exactly the right bytes, or fail cleanly") for tier 1 and tier 2, and one
-   contract executed against *every* `ContentStore` configuration. These found
-   bugs the scenario tests could not — including, while being written, a
-   fanout receiver a hostile publisher could hold open forever. They are where
-   new invariants belong.
+   `tests/hostile_store.rs`, `tests/hostile_server.rs`,
+   `tests/hostile_fanout.rs`, `tests/store_contract.rs`,
+   `tests/minifuzz.rs`) — the first two mutate every reply against a fixed
+   oracle ("succeed with exactly the right bytes, or fail cleanly") pointed
+   at *clients* (tier 1 and tier 2); `hostile_server.rs` and
+   `hostile_fanout.rs` point the same oracle the other way, at the
+   `BlobServer`'s refusal paths and the fanout receiver — the honest client
+   discards error replies, so these use raw `session.get()`s to observe
+   `reply_err`; and `store_contract.rs` runs one contract against *every*
+   `ContentStore` configuration. These found bugs the scenario tests could
+   not — including, while being written, a fanout receiver a hostile
+   publisher could hold open forever, and a fanout phase-B frame filter a
+   co-publisher could bypass. They are where new invariants belong.
 
 **Coverage is ~89% of lines** (`cargo llvm-cov --all-features --summary-only`,
-2026-08-13). It is a floor to hold, not a target to game: the number went from
+2026-08-15). It is a floor to hold, not a target to game: the number went from
 77% to 89% during the 0.3 pre-release review, and the tests that moved it
-found five real defects. The weakest files are `server.rs` (81%) and
-`fanout.rs` (77%), both dominated by error-reply paths.
+found five real defects. The server- and receiver-facing adversarial suites
+then lifted the three weakest files — `fanout.rs` 77%→92%, `server.rs`
+81%→86%, `publish.rs` 77%→85% (line coverage) — and found a sixth defect on
+the way (the fanout phase-B frame filter). What remains uncovered in
+`server.rs`/`publish.rs` is mostly genuine-fault I/O paths (spool renames,
+storage read failures) that need fault injection rather than a hostile peer.
 
 **When adding a defence, add it at layer 2 or 3.** A scenario test for the one
 input that motivated the fix is not coverage — it is a regression pin. Also
