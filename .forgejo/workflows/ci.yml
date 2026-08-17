@@ -162,7 +162,7 @@ jobs:
       # fast and always runs even if the render step below has trouble.
       - name: Offline mermaid lint
         run: python3 scripts/mermaid_lint.py $(git ls-files '*.md')
-      - uses: https://github.com/actions/setup-node@v4
+      - uses: https://github.com/actions/setup-node@v7
         with:
           node-version: "20"
       - name: Install mermaid-cli
