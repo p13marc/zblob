@@ -2,7 +2,9 @@ name: CI
 on:
   push:
     branches: [main]
+    paths-ignore: ['**.md', 'docs/**', 'LICENSE*']
   pull_request:
+    paths-ignore: ['**.md', 'docs/**', 'LICENSE*']
 
 concurrency:
   group: ci-${{ github.ref }}
@@ -12,6 +14,9 @@ env:
   CARGO_TERM_COLOR: always
   RUSTFLAGS: -D warnings
   CARGO_INCREMENTAL: "0"
+  # Cap build parallelism: cargo otherwise defaults to nproc (6 on
+  # vm-runner-01) per job, against a lane capacity of 2.
+  CARGO_BUILD_JOBS: "2"
 
 jobs:
   fmt:
