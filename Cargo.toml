@@ -22,7 +22,7 @@ categories = ["network-programming", "filesystem"]
 exclude = ["fuzz/", ".forgejo/", "scripts/"]
 
 [dependencies]
-zenoh = { version = "1.9", features = ["unstable"] }
+zenoh = { version = "1.10", features = ["unstable"] }
 tokio = { version = "1", features = ["fs", "io-util", "rt", "sync", "macros", "time"] }
 # For `CancellationToken` only: its `sync` module is not feature-gated, and
 # zenoh already pulls the crate in, so this costs no extra compilation.
@@ -43,7 +43,7 @@ postcard = { version = "1.1", features = ["use-std"] }
 tempfile = "3"
 zstd = { version = "0.13", optional = true }
 tracing = { version = "0.1", optional = true }
-zenoh-ext = { version = "1.9", features = ["unstable"], optional = true }
+zenoh-ext = { version = "1.10", features = ["unstable"], optional = true }
 chacha20poly1305 = { version = "0.11", optional = true }
 zeroize = { version = "1.9", features = ["zeroize_derive"], optional = true }
 
