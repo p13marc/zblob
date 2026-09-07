@@ -21,7 +21,7 @@ jobs:
       # action is GitHub-only, so this installs the tool directly — a
       # prebuilt binary, since building it from source takes longer than the
       # rest of the job.
-      - uses: https://github.com/taiki-e/install-action@v2.85.11
+      - uses: https://github.com/taiki-e/install-action@v2.87.7
         with:
           tool: cargo-semver-checks
       - name: Check for unintended breaking changes
