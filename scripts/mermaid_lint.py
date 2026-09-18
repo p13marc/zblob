@@ -8,7 +8,8 @@ that have actually broken zblob's diagrams:
 
   * a `;` inside a sequenceDiagram line (mermaid treats it as a statement
     separator, so the text after it parses as a new statement and throws
-    "expecting arrow, got NEWLINE");
+    "expecting arrow, got NEWLINE").  Semicolons inside HTML entities
+    (`&lt;`, `&#39;`) are not separators and are excluded;
   * `direction` inside a subgraph (unsupported on older mermaid builds);
   * an edge whose endpoint is a *subgraph* id rather than a node (renders
     wrong or errors — link nodes, not subgraphs);
@@ -19,7 +20,21 @@ Usage: mermaid_lint.py <file.md> [more.md ...]   # exit 1 on any error
 import re
 import sys
 
-ARROW = re.compile(r"-\.?-+>|-\.?->|==+>|--[xo]|<-->|x--x|o--o")
+# Mermaid arrows, flowchart AND sequence.  Every alternative here used to
+# require at least two dashes, so the single-dash SEQUENCE forms -- `A->>B`,
+# `A->B`, `A-)B`, `A-xB` -- never matched.  `->>` is the arrow a
+# sequenceDiagram actually uses, so the ";" check below (the rule this linter
+# exists for) was silently off on the common case.
+ARROW = re.compile(
+    r"--?\.?-*>>?"      # -> --> ->> -->> -.-> -.->>
+    r"|==+>"            # ==>
+    r"|--?[xo]"         # -x -o --x --o
+    r"|--?\)"           # -) --)
+    r"|<-->|x--x|o--o"
+)
+# `&lt;` / `&gt;` / `&#39;` are HTML entities and END IN A SEMICOLON.  Mermaid
+# handles them; a naive `";" in s` reads every one as a statement separator.
+ENTITY = re.compile(r"&(?:[A-Za-z][A-Za-z0-9]*|#[0-9]+|#[xX][0-9A-Fa-f]+);")
 EDGE_LABEL = re.compile(r"\|[^|]*\|")
 NODE_DECL = re.compile(r"\b(\w+)\s*[\[\(\{]")
 SUBGRAPH = re.compile(r"^\s*subgraph\s+([A-Za-z0-9_]+)")
@@ -73,7 +88,8 @@ def lint_block(path, first_line, body):
                 "Note ", "loop ", "alt ", "opt ", "par ", "and ",
                 "else ", "rect ", "critical ", "break ",
             )) or ARROW.search(s) or "-)" in s
-            if stmt and ";" in s:
+            bare = ENTITY.sub("", s)          # see ENTITY above
+            if stmt and ";" in bare:
                 errs.append(
                     f"{loc}: ';' in a sequenceDiagram line — mermaid splits "
                     f"on it (use ',' or 'then'): {s!r}"
