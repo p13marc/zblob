@@ -23,6 +23,9 @@ if [[ ${#MD[@]} -eq 0 ]]; then
 fi
 
 echo "== offline mermaid lint (${#MD[@]} markdown files) =="
+# The rules before the docs: a rule that has quietly stopped firing looks
+# exactly like a rule with nothing to report, and one did.
+python3 scripts/mermaid_lint.py --self-test
 python3 scripts/mermaid_lint.py "${MD[@]}"
 
 # --- authoritative render check via mermaid-cli, when available -------------

@@ -42,7 +42,9 @@ cargo publish --dry-run
 (`scripts/mermaid_lint.py`, no deps — catches `;` in a sequence diagram,
 `direction` inside a subgraph, edges pointing at a subgraph, unbalanced
 quotes) and, when `mmdc` is installed, renders every ```mermaid block for
-real. The `docs-mermaid` CI job installs `@mermaid-js/mermaid-cli` so the
+real. The linter checks **its own rules first** (`--self-test`, 16 fixtures):
+CI otherwise only ever runs them over docs that pass, which is how the `;` rule
+came to be off on `->>` for months without anyone noticing. The `docs-mermaid` CI job installs `@mermaid-js/mermaid-cli` so the
 render check always runs there; locally the offline lint runs regardless.
 **Author mermaid through the check, not by eye** — two diagram bugs shipped
 before it existed.

@@ -139,6 +139,10 @@ jobs:
       - uses: https://data.forgejo.org/actions/checkout@v7.0.1
       # Offline lint first — no browser, catches the common mermaid mistakes
       # fast and always runs even if the render step below has trouble.
+      # The linter's own rules first: CI otherwise only ever runs them over
+      # docs that pass, so a rule that stops firing is invisible.
+      - name: Mermaid linter self-test
+        run: python3 scripts/mermaid_lint.py --self-test
       - name: Offline mermaid lint
         run: python3 scripts/mermaid_lint.py $(git ls-files '*.md')
       - uses: https://github.com/actions/setup-node@v4
