@@ -47,7 +47,7 @@ jobs:
       - uses: https://github.com/dtolnay/rust-toolchain@stable
         with:
           components: clippy
-      - uses: https://github.com/Swatinem/rust-cache@v2.9.2
+      - uses: https://github.com/Swatinem/rust-cache@v2.9.3
         with:
           cache-targets: false
       - run: cargo clippy --all-targets --all-features --locked -- -D warnings
@@ -58,7 +58,7 @@ jobs:
     steps:
       - uses: https://data.forgejo.org/actions/checkout@v7.0.1
       - uses: https://github.com/dtolnay/rust-toolchain@stable
-      - uses: https://github.com/Swatinem/rust-cache@v2.9.2
+      - uses: https://github.com/Swatinem/rust-cache@v2.9.3
         with:
           cache-targets: false
       - run: cargo build --all-targets --locked
@@ -75,7 +75,7 @@ jobs:
       - uses: https://github.com/dtolnay/rust-toolchain@master
         with:
           toolchain: "1.97"
-      - uses: https://github.com/Swatinem/rust-cache@v2.9.2
+      - uses: https://github.com/Swatinem/rust-cache@v2.9.3
         with:
           cache-targets: false
       - run: cargo check --all-targets --all-features --locked
@@ -87,7 +87,7 @@ jobs:
     steps:
       - uses: https://data.forgejo.org/actions/checkout@v7.0.1
       - uses: https://github.com/dtolnay/rust-toolchain@stable
-      - uses: https://github.com/Swatinem/rust-cache@v2.9.2
+      - uses: https://github.com/Swatinem/rust-cache@v2.9.3
         with:
           cache-targets: false
       - run: cargo doc --no-deps --all-features --locked
@@ -98,7 +98,7 @@ jobs:
       - uses: https://data.forgejo.org/actions/checkout@v7.0.1
       - uses: https://github.com/dtolnay/rust-toolchain@stable
       # the docker cargo-deny action cannot see deny.toml -> install directly
-      - uses: https://github.com/taiki-e/install-action@v2.85.11
+      - uses: https://github.com/taiki-e/install-action@v2.90.8
         with:
           tool: cargo-deny
       - run: cargo deny check
@@ -110,10 +110,10 @@ jobs:
       - uses: https://github.com/dtolnay/rust-toolchain@stable
         with:
           components: llvm-tools-preview
-      - uses: https://github.com/Swatinem/rust-cache@v2.9.2
+      - uses: https://github.com/Swatinem/rust-cache@v2.9.3
         with:
           cache-targets: false
-      - uses: https://github.com/taiki-e/install-action@v2.85.11
+      - uses: https://github.com/taiki-e/install-action@v2.90.8
         with:
           tool: cargo-llvm-cov
       - run: cargo llvm-cov --all-features --locked --summary-only
@@ -123,7 +123,7 @@ jobs:
     steps:
       - uses: https://data.forgejo.org/actions/checkout@v7.0.1
       - uses: https://github.com/dtolnay/rust-toolchain@stable
-      - uses: https://github.com/Swatinem/rust-cache@v2.9.2
+      - uses: https://github.com/Swatinem/rust-cache@v2.9.3
         with:
           cache-targets: false
       - run: cargo bench --no-run --locked
@@ -133,7 +133,7 @@ jobs:
     steps:
       - uses: https://data.forgejo.org/actions/checkout@v7.0.1
       - uses: https://github.com/dtolnay/rust-toolchain@stable
-      - uses: https://github.com/Swatinem/rust-cache@v2.9.2
+      - uses: https://github.com/Swatinem/rust-cache@v2.9.3
         with:
           cache-targets: false
       - run: cargo publish --dry-run
@@ -150,7 +150,7 @@ jobs:
         run: python3 scripts/mermaid_lint.py --self-test
       - name: Offline mermaid lint
         run: python3 scripts/mermaid_lint.py $(git ls-files '*.md')
-      - uses: https://github.com/actions/setup-node@v4
+      - uses: https://github.com/actions/setup-node@v4.4.0
         with:
           node-version: "20"
       - name: Install mermaid-cli

@@ -38,10 +38,10 @@ thiserror = "2"
 # own rather than backstopped.
 fastcdc = "4.0.1"
 blake3 = "1.8.6"
-bao-tree = { version = "0.16", default-features = false, features = ["fs", "validate"] }
+bao-tree = { version = "0.17", default-features = false, features = ["fs", "validate"] }
 postcard = { version = "1.1", features = ["use-std"] }
 tempfile = "3"
-zstd = { version = "0.13", optional = true }
+zstd = { version = "0.14", optional = true }
 tracing = { version = "0.1", optional = true }
 zenoh-ext = { version = "1.10", features = ["unstable"], optional = true }
 chacha20poly1305 = { version = "0.11", optional = true }
@@ -63,7 +63,7 @@ proptest = "1"
 # Used by tests/chunk_size.rs to encode real bao slices and measure their
 # overhead, rather than asserting a number nobody derived. Same versions the
 # library itself uses.
-bao-tree = { version = "0.16", default-features = false, features = ["fs", "validate"] }
+bao-tree = { version = "0.17", default-features = false, features = ["fs", "validate"] }
 blake3 = "1.8"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "test-util"] }
 criterion = "0.8"
